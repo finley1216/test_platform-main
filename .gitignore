@@ -1,0 +1,50 @@
+####################
+# Secrets / Env
+####################
+.env
+.env.*
+*.pem
+*.crt
+*.key
+*.csr
+*.srl
+
+####################
+# Node / Frontend
+####################
+node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+####################
+# Python / Backend
+####################
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.venv/
+venv/
+
+####################
+# Docker
+####################
+*.log
+
+####################
+# OS / Editor
+####################
+.DS_Store
+.vscode/
+.idea/
+
+# --- project data (do not upload) ---
+backend/rag_store/
+backend/segment/
+# optional: all videos / big media
+*.avi
+*.mp4
+*.mov
+*.mkv
