@@ -1,0 +1,122 @@
+services:
+  # Ollama Service
+  ollama:
+    image: ollama/ollama:latest
+    restart: unless-stopped
+    ports:
+      - "11434:11434"
+    volumes:
+      - ollama_data:/root/.ollama
+    networks:
+      - app-network
+    extra_hosts:
+      - "registry.ollama.ai:104.16.55.3"  # 加這行，直接用 IP
+      - "registry.ollama.ai:104.16.54.3"  # Cloudflare 的備用 IP
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  # OWL API Service
+  owl-api:
+    build:
+      context: ./owl-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    environment:
+      - OWL_MODEL_ID=${OWL_MODEL_ID}
+      - OWL_DEVICE=${OWL_DEVICE}
+      - MEDIA_ROOT=/app/media
+    volumes:
+      - ./owl-service/media:/app/media
+    ports:
+      - "18001:18001"
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    extra_hosts:
+      - "huggingface.co:104.16.132.19"
+    networks:
+      - app-network
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    environment:
+      - PROJECT_ROOT=${PROJECT_ROOT}
+      - HOST=${HOST}
+      - PORT=8080
+      - RELOAD=${RELOAD}
+      - WORKERS=${WORKERS}
+      - LOG_LEVEL=${LOG_LEVEL}
+      - ADMIN_TOKEN=${ADMIN_TOKEN}
+      - SESSION_TTL_SEC=${SESSION_TTL_SEC}
+      - AUTO_RAG_INDEX=true
+      - RAG_DIR=./rag_store
+      - RAG_STORE_DIR=./rag_store
+      - OLLAMA_EMBED_MODEL=bge-m3
+      - OLLAMA_BASE=http://ollama:11434
+      - OWL_API_BASE=http://owl-api:18001
+      - GEMINI_API_KEY=${GEMINI_API_KEY}
+      - MY_API_KEY=${MY_API_KEY}
+    volumes:
+      - ./backend/src:/app/src:delegated
+      - ./backend/segment:/app/segment
+      - ./backend/rag_store:/app/rag_store
+      - ./backend/prompts:/app/prompts
+      - ../video:/app/video:ro
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "8080:8080"
+    networks:
+      - app-network
+    depends_on:
+      - ollama
+      - owl-api
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      network: host
+    restart: unless-stopped
+    environment:
+      - REACT_APP_API_BASE=http://localhost:8080
+      - WDS_SOCKET_HOST=localhost
+      - WDS_SOCKET_PORT=3000
+    volumes:
+      - ./frontend:/app:delegated
+      - node_modules_data:/app/node_modules
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    ports:
+      - "3000:3000"
+    networks:
+      - app-network
+    depends_on:
+      - backend
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  node_modules_data:
+  ollama_data:
+

@@ -1,0 +1,58 @@
+import React from "react";
+
+const Navbar = ({ authenticated, isAdmin, onEventTagClick }) => {
+  return (
+    <nav className="top-nav">
+      <div className="nav-container">
+        <div className="nav-brand">
+          <div className="nav-logo">
+            <span>⬡</span>
+            <span>日月光測試平台</span>
+          </div>
+          <div className="nav-version">v2.4 (Backend Filter)</div>
+        </div>
+        <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {authenticated && isAdmin && (
+            <button
+              onClick={onEventTagClick}
+              style={{
+                padding: "6px 16px",
+                background: "#2a2a2a",
+                border: "1px solid #444",
+                borderRadius: "4px",
+                color: "#fff",
+                fontSize: "13px",
+                cursor: "pointer",
+                fontWeight: "500",
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={(e) => {
+                e.target.style.background = "#3a3a3a";
+                e.target.style.borderColor = "#555";
+              }}
+              onMouseLeave={(e) => {
+                e.target.style.background = "#2a2a2a";
+                e.target.style.borderColor = "#444";
+              }}
+            >
+              事件標籤管理
+            </button>
+          )}
+        <div className="auth-status">
+          <div
+            className={`status-indicator ${
+              authenticated ? "active" : "inactive"
+            }`}
+          ></div>
+          <span className={`status-text ${authenticated ? "active" : ""}`}>
+            {authenticated ? "已驗證" : "未驗證"}
+          </span>
+          </div>
+        </div>
+      </div>
+    </nav>
+  );
+};
+
+export default Navbar;
+
