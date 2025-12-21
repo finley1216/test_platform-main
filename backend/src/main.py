@@ -1702,30 +1702,29 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         # 指定用哪個 LLM 來回答
         llm_model = (payload.get("model") or "qwen2.5vl:latest").strip()
 
-        # [NEW] 步驟 0: 解析查詢條件並進行 PostgreSQL 日期和事件過濾（與 /rag/search 統一）
+        # [簡化] 步驟 0: 解析查詢條件，PostgreSQL 只做日期篩選（與 /rag/search 統一）
         query_filters = {}
         filtered_set = None
-        has_filters = False
+        has_date_filter = False
         
         if HAS_DB and db:
             try:
                 query_filters = _parse_query_filters(question)
-                # [修改] 只有當有日期過濾時，才使用 PostgreSQL 過濾（與 /rag/search 統一）
-                # 如果只有事件或關鍵字而沒有日期，直接使用 RAG 搜尋
-                has_filters = bool(query_filters.get("date_filter"))
+                # [簡化] 只有當有日期過濾時，才使用 PostgreSQL 過濾
+                has_date_filter = bool(query_filters.get("date_filter"))
                 
-                if has_filters:
-                    filtered_segments = _filter_summaries_by_query(db, query_filters, limit=1000)
+                if has_date_filter:
+                    # [簡化] PostgreSQL 只過濾日期，不考慮事件和關鍵字
+                    date_only_filters = {"date_filter": query_filters["date_filter"]}
+                    filtered_segments = _filter_summaries_by_query(db, date_only_filters, limit=1000)
                     filtered_set = set(filtered_segments) if filtered_segments else set()
-                    print(f"--- [DEBUG] PostgreSQL 過濾找到 {len(filtered_set)} 筆記錄 ---")
+                    print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄 ---")
             except Exception as e:
                 print(f"--- [WARNING] PostgreSQL 過濾失敗: {e} ---")
-                # [關鍵修改] 如果 PostgreSQL 過濾失敗（例如表不存在），回退到正常 RAG 搜尋
-                # 不要直接返回空結果，而是繼續使用 RAG 搜尋
                 print(f"--- [INFO] PostgreSQL 過濾失敗，回退到正常 RAG 搜尋 ---")
                 query_filters = {}
                 filtered_set = None
-                has_filters = False  # 重置 has_filters，讓系統使用正常 RAG 搜尋
+                has_date_filter = False
 
         # 1. 搜尋片段 (R) - 使用與 /rag/search 相同的邏輯
         store = RAGStore(store_dir=RAG_DIR)
