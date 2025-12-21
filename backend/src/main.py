@@ -7,6 +7,7 @@ import google.generativeai as genai
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from PIL import Image
+from datetime import datetime, date
 from fastapi import FastAPI, Request, UploadFile,status , File, Form, Depends, Security, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -15,7 +16,16 @@ from fastapi.security import APIKeyHeader
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from rag_store import RAGStore
 from pydantic import BaseModel, ConfigDict
+from sqlalchemy.orm import Session
+from sqlalchemy import and_, or_, func
 from src.config import config
+try:
+    from src.database import get_db
+    from src.models import Summary
+    HAS_DB = True
+except ImportError:
+    HAS_DB = False
+    print("--- [WARNING] 資料庫模組未找到，PostgreSQL 功能將無法使用 ---")
 
 # ================== 環境變數 ==================
 
@@ -618,6 +628,7 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
 def segment_pipeline_multipart(
     request: Request,
     api_key: str = Depends(get_api_key),
+    db: Session = Depends(get_db) if HAS_DB else None,
     model_type: str = Form(...),
     file: UploadFile = File(None),
     video_url: str = Form(None),
@@ -806,6 +817,14 @@ def segment_pipeline_multipart(
             if AUTO_RAG_INDEX:
                 resp["rag_auto_indexed"] = _auto_index_to_rag(resp)
     except Exception: pass
+
+    # 5. 保存分析結果到 PostgreSQL（與 RAG 同步）
+    if HAS_DB and db:
+        try:
+            _save_results_to_postgres(db, results, stem)
+        except Exception as e:
+            print(f"--- [WARNING] 保存到 PostgreSQL 失敗: {e} ---")
+            # 不中斷流程，只記錄警告
 
     if cleanup and os.path.exists(local_path):
         try: os.remove(local_path)
@@ -1505,7 +1524,7 @@ async def move_video_to_category(video_id: str, request: Request):
 
 # 幫你找影片片段，但不負責解釋內容
 @app.post("/rag/search", tags=["RAG 相關 API"])
-async def rag_search(request: Request):
+async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
     try:
         payload = await request.json()
 
@@ -1519,12 +1538,46 @@ async def rag_search(request: Request):
         if not query:
             raise HTTPException(status_code=422, detail="missing query")
 
+        # [簡化] 步驟 0: 解析查詢條件，PostgreSQL 只做日期篩選
+        query_filters = {}
+        filtered_set = None
+        has_date_filter = False
+        
+        if HAS_DB and db:
+            try:
+                query_filters = _parse_query_filters(query)
+                # [簡化] 只有當有日期過濾時，才使用 PostgreSQL 過濾
+                has_date_filter = bool(query_filters.get("date_filter"))
+                
+                if has_date_filter:
+                    # [簡化] PostgreSQL 只過濾日期，不考慮事件和關鍵字
+                    date_only_filters = {"date_filter": query_filters["date_filter"]}
+                    filtered_segments = _filter_summaries_by_query(db, date_only_filters, limit=1000)
+                    filtered_set = set(filtered_segments) if filtered_segments else set()
+                    print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄 ---")
+            except Exception as e:
+                print(f"--- [WARNING] PostgreSQL 過濾失敗: {e} ---")
+                print(f"--- [INFO] PostgreSQL 過濾失敗，回退到正常 RAG 搜尋 ---")
+                query_filters = {}
+                filtered_set = None
+                has_date_filter = False
+
         filters: Dict[str, Any] = {}
 
         # 硬過濾 (Hard Filter)
         req_evt = payload.get("require_event")
         if isinstance(req_evt, list) and req_evt:
             filters["events_true_any"] = req_evt
+        
+        # [簡化] 如果查詢中包含事件類型，自動添加 events_true_any 過濾器（只在沒有日期過濾時）
+        if query_filters.get("event_types") and not has_date_filter:
+            if "events_true_any" not in filters:
+                filters["events_true_any"] = []
+            for event_type in query_filters["event_types"]:
+                if event_type not in filters["events_true_any"]:
+                    filters["events_true_any"].append(event_type)
+            print(f"--- [DEBUG] 自動添加事件過濾器: {filters['events_true_any']} ---")
+        
         if payload.get("video"):
             filters["video"] = str(payload["video"])
         if payload.get("time_contains"):
@@ -1533,10 +1586,45 @@ async def rag_search(request: Request):
         # 2. 初始化 Store 並搜尋
         store = RAGStore(store_dir=RAG_DIR)
 
-        # 搜尋 (這裡通常會多抓一點，以便過濾後還有剩)
-        raw_hits = store.search(query, top_k=top_k, filters=filters)
+        # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
+        if has_date_filter:
+            if filtered_set and len(filtered_set) > 0:
+                # PostgreSQL 已過濾日期，RAG 在這些結果中進行向量搜索
+                print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄，開始 RAG 向量搜索 ---")
+                
+                # RAG 正常搜索（不限制數量，因為後面會過濾）
+                search_top_k = top_k * 50  # 增加搜尋數量以確保能找到所有匹配的記錄
+                raw_hits = store.search(query, top_k=search_top_k, filters=filters)
+                
+                # 只保留在 PostgreSQL 過濾結果中的記錄
+                filtered_hits = []
+                for h in raw_hits:
+                    m = h.get("metadata", {})
+                    seg = m.get("segment")
+                    tr = m.get("time_range")
+                    if seg and tr:
+                        # 寬鬆匹配（處理格式差異）
+                        seg_base = seg.rsplit('.', 1)[0] if '.' in seg else seg
+                        tr_normalized = tr.replace(" - ", "-").replace(" -", "-").replace("- ", "-")
+                        # 檢查是否在 PostgreSQL 過濾結果中
+                        if (seg, tr) in filtered_set or \
+                           (seg, tr_normalized) in filtered_set or \
+                           (seg_base, tr) in filtered_set or \
+                           (seg_base, tr_normalized) in filtered_set:
+                            filtered_hits.append(h)
+                
+                raw_hits = filtered_hits
+                print(f"--- [DEBUG] RAG 向量搜索後，匹配 PostgreSQL 日期過濾的結果: {len(raw_hits)} 筆 ---")
+            else:
+                # PostgreSQL 日期過濾沒有找到匹配結果：返回空結果
+                print(f"--- [DEBUG] PostgreSQL 日期過濾沒有找到匹配結果，返回空結果 ---")
+                raw_hits = []
+        else:
+            # 沒有日期過濾：正常 RAG 搜尋
+            search_top_k = top_k * 20 if filters.get("events_true_any") else top_k
+            raw_hits = store.search(query, top_k=search_top_k, filters=filters)
 
-        # 3. [MODIFIED] 過濾與包裝結果
+        # 3. [MODIFIED] 過濾與包裝結果，並根據事件和關鍵字進行優先排序
         norm_hits = []
         for h in raw_hits:
             score = float(h.get("score", 0.0))
@@ -1546,8 +1634,30 @@ async def rag_search(request: Request):
                 continue
 
             m = h.get("metadata", {})
+            
+            # [新增] 計算優先級：有事件標記或摘要中包含關鍵字的結果優先
+            priority = 0
+            events_true = m.get("events_true", [])
+            summary = str(m.get("summary", "")).lower()
+            message_keywords = query_filters.get("message_keywords", [])
+            
+            # 檢查是否有匹配的事件標記
+            if query_filters.get("event_types"):
+                for event_type in query_filters["event_types"]:
+                    if event_type in events_true:
+                        priority = 2  # 有事件標記，最高優先級
+                        break
+            
+            # 檢查摘要中是否包含關鍵字
+            if priority < 2 and message_keywords:
+                for keyword in message_keywords:
+                    if keyword in summary or keyword.lower() in summary:
+                        priority = 1  # 摘要中包含關鍵字，次高優先級
+                        break
+            
             norm_hits.append({
                 "score": round(score, 4), # 回傳小數點後四位
+                "priority": priority,  # [新增] 優先級，用於排序
                 "video": m.get("video"),
                 "segment": m.get("segment"),
                 "time_range": m.get("time_range"),
@@ -1556,6 +1666,13 @@ async def rag_search(request: Request):
                 "reason": m.get("reason", ""),
                 "doc_id": h.get("id"),
             })
+        
+        # [新增] 根據優先級和分數排序：優先級高的在前，同優先級按分數降序
+        norm_hits.sort(key=lambda x: (-x.get("priority", 0), -x.get("score", 0)))
+        
+        # 移除 priority 欄位（不需要返回給前端）
+        for hit in norm_hits:
+            hit.pop("priority", None)
 
         return {"backend": store.embed_model, "hits": norm_hits}
 
@@ -1570,7 +1687,7 @@ async def rag_search(request: Request):
 
 # 它不僅幫你找資料，還會 「閱讀資料並回答問題」。
 @app.post("/rag/answer", tags=["RAG 相關 API"])
-async def rag_answer(request: Request):
+async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
     try:
         payload = await request.json()
         question = (payload.get("query") or "").strip()
@@ -1585,26 +1702,136 @@ async def rag_answer(request: Request):
         # 指定用哪個 LLM 來回答
         llm_model = (payload.get("model") or "qwen2.5vl:latest").strip()
 
-        # 1. 搜尋片段 (R)
-        store = RAGStore(store_dir=RAG_DIR)
-        raw_hits = store.search(question, top_k=top_k, filters={})
+        # [NEW] 步驟 0: 解析查詢條件並進行 PostgreSQL 日期和事件過濾（與 /rag/search 統一）
+        query_filters = {}
+        filtered_set = None
+        has_filters = False
+        
+        if HAS_DB and db:
+            try:
+                query_filters = _parse_query_filters(question)
+                # [修改] 只有當有日期過濾時，才使用 PostgreSQL 過濾（與 /rag/search 統一）
+                # 如果只有事件或關鍵字而沒有日期，直接使用 RAG 搜尋
+                has_filters = bool(query_filters.get("date_filter"))
+                
+                if has_filters:
+                    filtered_segments = _filter_summaries_by_query(db, query_filters, limit=1000)
+                    filtered_set = set(filtered_segments) if filtered_segments else set()
+                    print(f"--- [DEBUG] PostgreSQL 過濾找到 {len(filtered_set)} 筆記錄 ---")
+            except Exception as e:
+                print(f"--- [WARNING] PostgreSQL 過濾失敗: {e} ---")
+                # [關鍵修改] 如果 PostgreSQL 過濾失敗（例如表不存在），回退到正常 RAG 搜尋
+                # 不要直接返回空結果，而是繼續使用 RAG 搜尋
+                print(f"--- [INFO] PostgreSQL 過濾失敗，回退到正常 RAG 搜尋 ---")
+                query_filters = {}
+                filtered_set = None
+                has_filters = False  # 重置 has_filters，讓系統使用正常 RAG 搜尋
 
-        # [NEW] 過濾結果
-        hits = [h for h in raw_hits if float(h.get("score", 0.0)) >= score_threshold]
+        # 1. 搜尋片段 (R) - 使用與 /rag/search 相同的邏輯
+        store = RAGStore(store_dir=RAG_DIR)
+        
+        # [簡化] 構建 RAG 過濾器（與 /rag/search 統一）
+        filters: Dict[str, Any] = {}
+        
+        # [簡化] 如果查詢中包含事件類型，自動添加 events_true_any 過濾器（只在沒有日期過濾時）
+        if query_filters.get("event_types") and not has_date_filter:
+            filters["events_true_any"] = query_filters["event_types"]
+            print(f"--- [DEBUG] 自動添加事件過濾器: {filters['events_true_any']} ---")
+        
+        # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
+        if has_date_filter:
+            if filtered_set and len(filtered_set) > 0:
+                # PostgreSQL 已過濾日期，RAG 在這些結果中進行向量搜索
+                print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄，開始 RAG 向量搜索 ---")
+                
+                # RAG 正常搜索（不限制數量，因為後面會過濾）
+                search_top_k = top_k * 50  # 增加搜尋數量以確保能找到所有匹配的記錄
+                raw_hits = store.search(question, top_k=search_top_k, filters=filters)
+                
+                # 只保留在 PostgreSQL 過濾結果中的記錄
+                filtered_hits = []
+                for h in raw_hits:
+                    m = h.get("metadata", {})
+                    seg = m.get("segment")
+                    tr = m.get("time_range")
+                    if seg and tr:
+                        # 寬鬆匹配（處理格式差異）
+                        seg_base = seg.rsplit('.', 1)[0] if '.' in seg else seg
+                        tr_normalized = tr.replace(" - ", "-").replace(" -", "-").replace("- ", "-")
+                        # 檢查是否在 PostgreSQL 過濾結果中
+                        if (seg, tr) in filtered_set or \
+                           (seg, tr_normalized) in filtered_set or \
+                           (seg_base, tr) in filtered_set or \
+                           (seg_base, tr_normalized) in filtered_set:
+                            filtered_hits.append(h)
+                
+                raw_hits = filtered_hits
+                print(f"--- [DEBUG] RAG 向量搜索後，匹配 PostgreSQL 日期過濾的結果: {len(raw_hits)} 筆 ---")
+            else:
+                # PostgreSQL 日期過濾沒有找到匹配結果：返回空結果
+                print(f"--- [DEBUG] PostgreSQL 日期過濾沒有找到匹配結果，返回空結果 ---")
+                raw_hits = []
+        else:
+            # 沒有日期過濾：正常 RAG 搜尋
+            search_top_k = top_k * 20 if filters.get("events_true_any") else top_k
+            raw_hits = store.search(question, top_k=search_top_k, filters=filters)
+
+        # [NEW] 過濾結果（分數門檻）並根據事件和關鍵字進行優先排序
+        hits_with_priority = []
+        for h in raw_hits:
+            score = float(h.get("score", 0.0))
+            if score < score_threshold:
+                continue
+            
+            m = h.get("metadata", {})
+            
+            # [新增] 計算優先級：有事件標記或摘要中包含關鍵字的結果優先
+            priority = 0
+            events_true = m.get("events_true", [])
+            summary = str(m.get("summary", "")).lower()
+            message_keywords = query_filters.get("message_keywords", [])
+            
+            # 檢查是否有匹配的事件標記
+            if query_filters.get("event_types"):
+                for event_type in query_filters["event_types"]:
+                    if event_type in events_true:
+                        priority = 2  # 有事件標記，最高優先級
+                        break
+            
+            # 檢查摘要中是否包含關鍵字
+            if priority < 2 and message_keywords:
+                for keyword in message_keywords:
+                    if keyword in summary or keyword.lower() in summary:
+                        priority = 1  # 摘要中包含關鍵字，次高優先級
+                        break
+            
+            hits_with_priority.append({
+                "hit": h,
+                "priority": priority
+            })
+        
+        # [新增] 根據優先級和分數排序：優先級高的在前，同優先級按分數降序
+        hits_with_priority.sort(key=lambda x: (-x["priority"], -float(x["hit"].get("score", 0.0))))
+        hits = [x["hit"] for x in hits_with_priority]
 
         if not hits:
             # 如果因為門檻過濾後導致沒有資料，也視為找不到
-            msgs = [
-                {"role": "system", "content": "你只能根據系統提供的資料回答。現在沒有資料可用，請直接說你找不到答案。"},
-                {"role": "user", "content": question},
-            ]
-            rj = _ollama_chat(llm_model, msgs)
-
-            msg = ""
-            if isinstance(rj, dict):
-                msg = (rj.get("message") or {}).get("content", "").strip()
-            elif isinstance(rj, str):
-                msg = rj
+            # [NEW] 如果 Ollama 失敗，直接返回空結果而不是報錯
+            try:
+                msgs = [
+                    {"role": "system", "content": "你只能根據系統提供的資料回答。現在沒有資料可用，請直接說你找不到答案。"},
+                    {"role": "user", "content": question},
+                ]
+                rj = _ollama_chat(llm_model, msgs, timeout=1800)
+                msg = ""
+                if isinstance(rj, dict):
+                    msg = (rj.get("message") or {}).get("content", "").strip()
+                elif isinstance(rj, str):
+                    msg = rj
+            except Exception as ollama_error:
+                # Ollama 失敗時，返回空結果而不是報錯
+                print(f"--- [WARNING] Ollama 失敗，返回空結果: {ollama_error} ---")
+                msg = "目前索引到的片段裡找不到答案（或是相似度過低）。LLM 服務暫時無法使用。"
 
             return {
                 "backend": {"embed_model": store.embed_model, "llm": llm_model},
@@ -1658,14 +1885,22 @@ async def rag_answer(request: Request):
             {"role": "user", "content": user_prompt},
         ]
 
-        # 3. 呼叫 LLM (G)
-        ans_content = _ollama_chat(llm_model, msgs)
-
-        # 防呆處理
-        if isinstance(ans_content, dict):
-            answer = (ans_content.get("message") or {}).get("content", "").strip()
-        else:
-            answer = str(ans_content).strip()
+        # 3. 呼叫 LLM (G) - 如果失敗，返回搜尋結果
+        try:
+            ans_content = _ollama_chat(llm_model, msgs, timeout=1800)
+            # 防呆處理
+            if isinstance(ans_content, dict):
+                answer = (ans_content.get("message") or {}).get("content", "").strip()
+            else:
+                answer = str(ans_content).strip()
+        except Exception as ollama_error:
+            # [NEW] Ollama 失敗時，返回搜尋結果而不是報錯
+            print(f"--- [WARNING] Ollama 失敗，返回搜尋結果: {ollama_error} ---")
+            answer = f"抱歉，LLM 服務暫時無法使用（錯誤：{str(ollama_error)[:100]}）。以下是根據您的查詢找到的相關片段：\n\n"
+            # 將搜尋結果轉換為文字描述
+            for i, hit in enumerate(norm_hits, 1):
+                answer += f"[{i}] 影片: {hit.get('video', 'N/A')}  時間: {hit.get('time_range', 'N/A')}\n"
+                answer += f"    摘要: {hit.get('summary', 'N/A')[:100]}...\n\n"
 
         return {
             "backend": {"embed_model": store.embed_model, "llm": llm_model},
@@ -1681,6 +1916,378 @@ async def rag_answer(request: Request):
             status_code=500,
             content={"error": f"RAG Answer Failed: {str(e)}", "detail": str(e)}
         )
+
+# ================== PostgreSQL 保存與過濾 ==================
+
+def _parse_time_range(time_range_str: str) -> Tuple[Optional[datetime], Optional[datetime]]:
+    """
+    解析時間範圍字串，例如 "00:00:00 - 00:00:08"
+    返回 (start_time, end_time) 作為 datetime 對象
+    """
+    try:
+        if not time_range_str or not isinstance(time_range_str, str):
+            return None, None
+            
+        if " - " in time_range_str:
+            start_str, end_str = time_range_str.split(" - ", 1)
+            start_str = start_str.strip()
+            end_str = end_str.strip()
+            
+            # 解析 HH:MM:SS 格式
+            start_time_obj = datetime.strptime(start_str, "%H:%M:%S").time()
+            end_time_obj = datetime.strptime(end_str, "%H:%M:%S").time()
+            
+            # 創建 datetime 對象（使用今天的日期作為基準）
+            today = datetime.now().date()
+            
+            start_time = datetime.combine(today, start_time_obj)
+            end_time = datetime.combine(today, end_time_obj)
+            
+            return start_time, end_time
+    except ValueError as e:
+        print(f"Warning: Could not parse time range '{time_range_str}': {e}")
+    except Exception as e:
+        print(f"Warning: Unexpected error parsing time range '{time_range_str}': {e}")
+    
+    return None, None
+
+
+def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_stem: str):
+    """
+    將分析結果保存到 PostgreSQL 資料庫
+    與 migrate_segments_to_db.py 的邏輯一致：影片相同則更新，新的則新增
+    
+    Args:
+        db: 資料庫 session
+        results: 分析結果列表（來自 segment_pipeline_multipart 的 results）
+        video_stem: 影片名稱（用於識別，例如 "fire_1" 或 "火災生成_Video_火災"）
+    """
+    if not HAS_DB:
+        return
+    
+    # [修改] 採用「更新或新增」的邏輯，與 migrate_segments_to_db.py 保持一致
+    # 不再先刪除舊記錄，而是檢查是否存在，存在則更新，不存在則新增
+    saved_count = 0
+    updated_count = 0
+    inserted_count = 0
+    
+    for result in results:
+        # 只處理成功的結果
+        if not result.get("success", False):
+            continue
+        
+        # 獲取摘要文字
+        parsed = result.get("parsed", {})
+        summary_text = parsed.get("summary_independent", "")
+        
+        # 如果沒有摘要，跳過
+        if not summary_text or not summary_text.strip():
+            continue
+        
+        # 解析時間範圍
+        time_range = result.get("time_range", "")
+        start_time, end_time = _parse_time_range(time_range)
+        
+        # 獲取其他欄位
+        segment = result.get("segment", "")
+        duration_sec = result.get("duration_sec")
+        time_sec = result.get("time_sec")
+        
+        # 獲取事件檢測資料
+        frame_analysis = parsed.get("frame_analysis", {})
+        events = frame_analysis.get("events", {})
+        
+        # 檢查記錄是否已存在（根據 segment 和 time_range）
+        # 與 migrate_segments_to_db.py 的邏輯一致：影片相同則更新，新的則新增
+        existing = db.query(Summary).filter(
+            Summary.segment == segment,
+            Summary.time_range == time_range
+        ).first()
+        
+        if existing:
+            # 更新現有記錄（影片相同則更新）
+            existing.start_timestamp = start_time if start_time else datetime.now()
+            existing.end_timestamp = end_time
+            existing.message = summary_text.strip()
+            existing.duration_sec = float(duration_sec) if duration_sec is not None else None
+            existing.time_sec = float(time_sec) if time_sec is not None else None
+            # 更新事件檢測欄位
+            existing.water_flood = bool(events.get("water_flood", False))
+            existing.fire = bool(events.get("fire", False))
+            existing.abnormal_attire_face_cover_at_entry = bool(events.get("abnormal_attire_face_cover_at_entry", False))
+            existing.person_fallen_unmoving = bool(events.get("person_fallen_unmoving", False))
+            existing.double_parking_lane_block = bool(events.get("double_parking_lane_block", False))
+            existing.smoking_outside_zone = bool(events.get("smoking_outside_zone", False))
+            existing.crowd_loitering = bool(events.get("crowd_loitering", False))
+            existing.security_door_tamper = bool(events.get("security_door_tamper", False))
+            existing.event_reason = events.get("reason", "") if events.get("reason") else None
+            # 更新 updated_at 時間戳
+            existing.updated_at = datetime.now()
+            saved_count += 1
+            updated_count += 1
+        else:
+            # 新增記錄（新的則新增）
+            summary = Summary(
+                start_timestamp=start_time if start_time else datetime.now(),
+                end_timestamp=end_time,
+                location=None,  # 之後可以從其他地方填入
+                camera=None,    # 之後可以從其他地方填入
+                message=summary_text.strip(),
+                segment=segment if segment else None,
+                time_range=time_range if time_range else None,
+                duration_sec=float(duration_sec) if duration_sec is not None else None,
+                time_sec=float(time_sec) if time_sec is not None else None,
+                # 事件檢測欄位
+                water_flood=bool(events.get("water_flood", False)),
+                fire=bool(events.get("fire", False)),
+                abnormal_attire_face_cover_at_entry=bool(events.get("abnormal_attire_face_cover_at_entry", False)),
+                person_fallen_unmoving=bool(events.get("person_fallen_unmoving", False)),
+                double_parking_lane_block=bool(events.get("double_parking_lane_block", False)),
+                smoking_outside_zone=bool(events.get("smoking_outside_zone", False)),
+                crowd_loitering=bool(events.get("crowd_loitering", False)),
+                security_door_tamper=bool(events.get("security_door_tamper", False)),
+                event_reason=events.get("reason", "") if events.get("reason") else None,
+                created_at=datetime.now(),
+                updated_at=datetime.now()
+            )
+            
+            try:
+                db.add(summary)
+                saved_count += 1
+                inserted_count += 1
+            except Exception as e:
+                print(f"Warning: Failed to add summary to session: {e}")
+                continue
+    
+    # 批量提交
+    if saved_count > 0:
+        try:
+            db.commit()
+            print(f"--- [PostgreSQL] 成功保存/更新 {saved_count} 筆分析結果到資料庫 (video: {video_stem}, 新增: {inserted_count}, 更新: {updated_count}) ---")
+        except Exception as e:
+            db.rollback()
+            print(f"--- [PostgreSQL ERROR] 提交失敗: {e} ---")
+    else:
+        # 即使沒有新記錄，也要提交（可能只有更新操作）
+        try:
+            db.commit()
+        except Exception as e:
+            db.rollback()
+            print(f"--- [PostgreSQL ERROR] 提交失敗: {e} ---")
+
+
+# ================== Prompt 解析與 PostgreSQL 過濾 ==================
+
+def _parse_query_filters(question: str) -> Dict[str, Any]:
+    """
+    從用戶問題中解析出過濾條件：
+    - 日期/時間（如 "1219" -> 2025-12-19, "給我 1219 的影片" -> 2025-12-19）
+    - 地點（如 "路口" -> location 欄位）
+    - 事件類型（如 "火災"、"水災"、"闖入"）
+    
+    返回一個字典，包含：
+    - date_filter: Optional[date] - 日期過濾
+    - location_keywords: List[str] - 地點關鍵字
+    - event_types: List[str] - 事件類型（對應到資料庫欄位）
+    """
+    filters = {
+        "date_filter": None,
+        "location_keywords": [],
+        "event_types": [],
+    }
+    
+    # 事件類型映射（中文 -> 資料庫欄位）
+    event_mapping = {
+        "火災": "fire",
+        "火": "fire",
+        "水災": "water_flood",
+        "水": "water_flood",
+        "淹水": "water_flood",
+        "積水": "water_flood",
+        "闖入": "security_door_tamper",
+        "突破": "security_door_tamper",
+        "安全門": "security_door_tamper",
+        "遮臉": "abnormal_attire_face_cover_at_entry",
+        "異常著裝": "abnormal_attire_face_cover_at_entry",
+        "倒地": "person_fallen_unmoving",
+        "倒地不起": "person_fallen_unmoving",
+        "併排": "double_parking_lane_block",
+        "停車": "double_parking_lane_block",
+        "阻塞": "double_parking_lane_block",
+        "吸菸": "smoking_outside_zone",
+        "抽菸": "smoking_outside_zone",
+        "聚眾": "crowd_loitering",
+        "逗留": "crowd_loitering",
+    }
+    
+    # 解析日期（格式：MMDD 或 YYYYMMDD）
+    # [FIX] 改進日期解析，支援 "給我 1219 的影片"、"給我 1220 的影片" 這種格式
+    date_patterns = [
+        r'(\d{4})(\d{2})(\d{2})',  # YYYYMMDD
+        r'(\d{2})(\d{2})',          # MMDD (例如 1219, 1220)
+    ]
+    
+    for pattern in date_patterns:
+        matches = list(re.finditer(pattern, question))
+        for match in matches:
+            if len(match.groups()) == 3:  # YYYYMMDD
+                year, month, day = match.groups()
+                try:
+                    filters["date_filter"] = date(int(year), int(month), int(day))
+                    print(f"--- [DEBUG] 解析到日期 (YYYYMMDD): {filters['date_filter']} ---")
+                    break
+                except ValueError:
+                    continue
+            elif len(match.groups()) == 2:  # MMDD
+                month, day = match.groups()
+                try:
+                    # 假設是當前年份
+                    current_year = datetime.now().year
+                    filters["date_filter"] = date(current_year, int(month), int(day))
+                    print(f"--- [DEBUG] 解析到日期 (MMDD): {filters['date_filter']} (年份: {current_year}) ---")
+                    break
+                except ValueError:
+                    continue
+        if filters["date_filter"]:
+            break
+    
+    # [NEW] message 關鍵字過濾：如果查詢中包含事件相關關鍵字，也在 message 中搜尋
+    # 這可以幫助找到 message 中提到相關事件的記錄（例如：火災、倒地、群聚等）
+    event_keywords_in_message = ["火災", "倒地", "群聚", "聚眾", "水災", "淹水", "闖入", "遮臉", "吸菸", "停車", "阻塞"]
+    message_keywords_found = []
+    for keyword in event_keywords_in_message:
+        if keyword in question:
+            message_keywords_found.append(keyword)
+    
+    if message_keywords_found:
+        # 將找到的關鍵字添加到 filters 中，用於後續的 message 過濾
+        filters["message_keywords"] = message_keywords_found
+        print(f"--- [DEBUG] 找到 message 關鍵字: {message_keywords_found} ---")
+    
+    # 解析事件類型
+    question_lower = question.lower()
+    for keyword, db_field in event_mapping.items():
+        if keyword in question_lower:
+            if db_field not in filters["event_types"]:
+                filters["event_types"].append(db_field)
+    
+    # 解析地點關鍵字（簡單關鍵字匹配）
+    location_keywords = ["路口", "入口", "出口", "停車場", "大門", "側門", "後門"]
+    for keyword in location_keywords:
+        if keyword in question:
+            filters["location_keywords"].append(keyword)
+    
+    # [NEW] 如果查詢中包含事件相關關鍵字但沒有明確的事件類型，也在 message 中搜尋
+    # 這可以幫助找到 message 中提到相關事件的記錄（例如：火災、倒地、群聚等）
+    # 注意：這個功能在 _filter_summaries_by_query 中實現，這裡只是記錄
+    event_keywords_in_message = ["火災", "倒地", "群聚", "聚眾", "水災", "淹水", "闖入", "遮臉", "吸菸", "停車", "阻塞"]
+    message_keywords_found = []
+    for keyword in event_keywords_in_message:
+        if keyword in question:
+            message_keywords_found.append(keyword)
+    
+    if message_keywords_found:
+        # 將找到的關鍵字添加到 filters 中，用於後續的 message 過濾
+        filters["message_keywords"] = message_keywords_found
+        print(f"--- [DEBUG] 找到 message 關鍵字: {message_keywords_found} ---")
+    
+    return filters
+
+
+def _filter_summaries_by_query(
+    db: Session,
+    filters: Dict[str, Any],
+    limit: int = 1000
+) -> List[Tuple[str, str]]:
+    """
+    根據過濾條件從 PostgreSQL 查詢 summaries，返回符合條件的 (segment, time_range) 列表
+    用於後續在 RAG 中過濾
+    
+    返回: List[Tuple[segment, time_range]]
+    """
+    if not HAS_DB:
+        return []
+    
+    query = db.query(Summary.segment, Summary.time_range).filter(
+        Summary.message.isnot(None),
+        Summary.message != ""
+    )
+    
+    # [關鍵] 日期過濾 - 使用 updated_at 欄位進行篩選（優先於其他過濾條件）
+    if filters.get("date_filter"):
+        target_date = filters["date_filter"]
+        # 使用 updated_at 而不是 start_timestamp，因為 updated_at 更準確反映資料的日期
+        query = query.filter(
+            func.date(Summary.updated_at) == target_date
+        )
+        print(f"--- [DEBUG] 應用日期過濾 (使用 updated_at): {target_date} ---")
+    
+    # 地點過濾（在 location 或 message 中搜尋）
+    if filters.get("location_keywords"):
+        location_conditions = []
+        for keyword in filters["location_keywords"]:
+            location_conditions.append(
+                or_(
+                    Summary.location.ilike(f"%{keyword}%"),
+                    Summary.message.ilike(f"%{keyword}%")
+                )
+            )
+        if location_conditions:
+            query = query.filter(or_(*location_conditions))
+            print(f"--- [DEBUG] 應用地點過濾: {filters['location_keywords']} ---")
+    
+    # [關鍵] 事件類型過濾 - 必須嚴格匹配事件 t/f 欄位
+    if filters.get("event_types"):
+        event_conditions = []
+        for event_type in filters["event_types"]:
+            if event_type == "fire":
+                event_conditions.append(Summary.fire == True)
+            elif event_type == "water_flood":
+                event_conditions.append(Summary.water_flood == True)
+            elif event_type == "abnormal_attire_face_cover_at_entry":
+                event_conditions.append(Summary.abnormal_attire_face_cover_at_entry == True)
+            elif event_type == "person_fallen_unmoving":
+                event_conditions.append(Summary.person_fallen_unmoving == True)
+            elif event_type == "double_parking_lane_block":
+                event_conditions.append(Summary.double_parking_lane_block == True)
+            elif event_type == "smoking_outside_zone":
+                event_conditions.append(Summary.smoking_outside_zone == True)
+            elif event_type == "crowd_loitering":
+                event_conditions.append(Summary.crowd_loitering == True)
+            elif event_type == "security_door_tamper":
+                event_conditions.append(Summary.security_door_tamper == True)
+        
+        if event_conditions:
+            query = query.filter(or_(*event_conditions))
+            print(f"--- [DEBUG] 應用事件過濾: {filters['event_types']} ---")
+    
+    # [簡化] message 關鍵字過濾 - 如果太難判斷，可以跳過此過濾
+    # 但至少日期過濾必須正確
+    if filters.get("message_keywords"):
+        message_conditions = []
+        for keyword in filters["message_keywords"]:
+            message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
+        if message_conditions:
+            query = query.filter(or_(*message_conditions))
+            print(f"--- [DEBUG] 應用 message 關鍵字過濾: {filters['message_keywords']} ---")
+    
+    # [簡化] 如果沒有日期過濾條件，返回空列表（只做日期過濾）
+    if not filters.get("date_filter"):
+        print(f"--- [DEBUG] 沒有日期過濾條件，返回空列表（只做日期過濾） ---")
+        return []
+    
+    # 執行查詢
+    results = query.limit(limit).all()
+    print(f"--- [DEBUG] PostgreSQL 查詢返回 {len(results)} 筆原始結果 ---")
+    
+    # 轉換為 (segment, time_range) 元組列表，去除 None 值
+    filtered_pairs = [
+        (seg, tr) for seg, tr in results
+        if seg is not None and tr is not None
+    ]
+    
+    print(f"--- [DEBUG] 過濾後的有效結果: {len(filtered_pairs)} 筆 ---")
+    return filtered_pairs
 
 if __name__ == "__main__":
     import uvicorn

@@ -1,4 +1,4 @@
-export const API_BASE = process.env.REACT_APP_API_BASE || "http://127.0.0.1:8080";
+export const API_BASE = process.env.REACT_APP_API_BASE || "http://140.117.176.88:8080";
 
 export const EVENT_MAP = {
   water_flood: "淹水積水",

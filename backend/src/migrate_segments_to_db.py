@@ -173,36 +173,60 @@ def migrate_segments():
         print("No summaries to insert. Exiting.")
         return
     
-    # Insert into database
-    print("\nInserting summaries into database...")
+    # Insert/Update into database (與 RAG 邏輯一致：影片相同則更新，新的則新增)
+    print("\nInserting/Updating summaries into database...")
     db = SessionLocal()
     try:
         inserted_count = 0
+        updated_count = 0
         skipped_count = 0
         
         for summary in all_summaries:
             try:
                 # Check if record already exists (by segment and time_range)
+                # 與 RAG 的 _save_results_to_postgres 邏輯一致
                 existing = db.query(Summary).filter(
                     Summary.segment == summary.segment,
                     Summary.time_range == summary.time_range
                 ).first()
                 
                 if existing:
-                    skipped_count += 1
-                    continue
-                
-                db.add(summary)
-                inserted_count += 1
+                    # 更新現有記錄（與 RAG 邏輯一致：影片相同則更新）
+                    existing.start_timestamp = summary.start_timestamp
+                    existing.end_timestamp = summary.end_timestamp
+                    existing.message = summary.message
+                    existing.segment = summary.segment
+                    existing.time_range = summary.time_range
+                    existing.duration_sec = summary.duration_sec
+                    existing.time_sec = summary.time_sec
+                    # 更新事件檢測欄位
+                    existing.water_flood = summary.water_flood
+                    existing.fire = summary.fire
+                    existing.abnormal_attire_face_cover_at_entry = summary.abnormal_attire_face_cover_at_entry
+                    existing.person_fallen_unmoving = summary.person_fallen_unmoving
+                    existing.double_parking_lane_block = summary.double_parking_lane_block
+                    existing.smoking_outside_zone = summary.smoking_outside_zone
+                    existing.crowd_loitering = summary.crowd_loitering
+                    existing.security_door_tamper = summary.security_door_tamper
+                    existing.event_reason = summary.event_reason
+                    # 更新 updated_at 時間戳
+                    existing.updated_at = datetime.now()
+                    updated_count += 1
+                else:
+                    # 新增記錄（新的則新增）
+                    db.add(summary)
+                    inserted_count += 1
             except Exception as e:
-                print(f"  ✗ Error adding summary: {e}")
+                print(f"  ✗ Error processing summary (segment: {summary.segment}, time_range: {summary.time_range}): {e}")
+                skipped_count += 1
                 continue
         
         db.commit()
         print(f"\n✓ Migration completed!")
-        print(f"  - Inserted: {inserted_count}")
-        print(f"  - Skipped (duplicates): {skipped_count}")
-        print(f"  - Total: {len(all_summaries)}")
+        print(f"  - Inserted (new): {inserted_count}")
+        print(f"  - Updated (existing): {updated_count}")
+        print(f"  - Skipped (errors): {skipped_count}")
+        print(f"  - Total processed: {len(all_summaries)}")
         
     except Exception as e:
         print(f"\n✗ Migration failed: {e}")
