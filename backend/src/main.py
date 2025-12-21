@@ -1714,6 +1714,12 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
             strict_filtered_hits = []
             required_event_types = query_filters.get("event_types", [])
             required_message_keywords = query_filters.get("message_keywords", [])
+            # [新增] 保存 has_date_filter 變數，供事件過濾邏輯使用
+            # 直接使用 has_date_filter（已在函數開始時定義）
+            try:
+                has_date_filter_for_event = has_date_filter
+            except NameError:
+                has_date_filter_for_event = False
             
             # 構建事件關鍵字映射（用於檢查摘要）
             event_keyword_map = {
@@ -1749,20 +1755,74 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
                             has_event_match = True
                             break
                 
-                # 檢查摘要中是否包含關鍵字
+                # 檢查摘要中是否包含關鍵字（更嚴格的匹配）
                 has_keyword_match = False
                 if all_keywords:
                     for keyword in all_keywords:
                         keyword_lower = keyword.lower()
+                        # [修改] 更嚴格的關鍵字匹配：檢查關鍵字是否在摘要中出現
+                        # 對於中文關鍵字（如「火災」），直接檢查是否包含
+                        # 對於英文關鍵字（如「fire」），使用不區分大小寫的匹配
                         if keyword in summary_original or keyword_lower in summary:
-                            has_keyword_match = True
-                            break
+                            # [新增] 額外檢查：確保不是誤匹配
+                            # 例如：避免「無火災」被匹配為「火災」
+                            # 檢查關鍵字前後是否有否定詞
+                            keyword_pos = summary_original.lower().find(keyword_lower)
+                            if keyword_pos >= 0:
+                                # 檢查關鍵字前後的上下文
+                                context_before = summary_original[max(0, keyword_pos-5):keyword_pos].lower()
+                                context_after = summary_original[keyword_pos+len(keyword):min(len(summary_original), keyword_pos+len(keyword)+5)].lower()
+                                
+                                # 如果關鍵字前有否定詞，則不匹配
+                                negation_words = ['無', '沒有', '不', '非', '未', 'no', 'not', 'none', 'without']
+                                has_negation = any(neg in context_before for neg in negation_words)
+                                
+                                if not has_negation:
+                                    has_keyword_match = True
+                                    print(f"--- [DEBUG] 關鍵字匹配: segment={m.get('segment')}, keyword={keyword}, summary片段={summary_original[:100]}... ---")
+                                    break
                 
                 # 如果有事件類型或關鍵字要求，則必須至少匹配其中一個
+                # [修改] 如果沒有找到匹配的結果，但 RAG 搜索返回了結果，可能是因為：
+                # 1. 摘要中沒有明確寫出關鍵字，但語義相關
+                # 2. 向量搜索找到了相關結果，但摘要描述方式不同
+                # 在這種情況下，如果 RAG 分數較高（>0.5），且查詢中只有事件關鍵字（沒有日期），
+                # 可以考慮放寬過濾條件，允許高分數的結果通過
                 if has_event_match or has_keyword_match:
                     strict_filtered_hits.append(h)
+                    print(f"--- [DEBUG] 保留符合事件要求的結果: segment={m.get('segment')}, 事件匹配={has_event_match}, 關鍵字匹配={has_keyword_match}, events_true={events_true} ---")
                 else:
-                    print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true} ---")
+                    # [新增] 如果沒有日期過濾，且 RAG 分數較高，可以考慮保留（但優先級較低）
+                    # 這適用於向量搜索找到了語義相關但摘要中沒有明確關鍵字的情況
+                    score = h.get("score", 0.0)
+                    # [修改] 檢查是否有日期過濾
+                    if not has_date_filter_for_event and score > 0.5:
+                        # 檢查摘要中是否有相關的描述（即使沒有明確的關鍵字）
+                        # 例如：對於「倒地」，檢查是否有「躺」、「臥」、「不動」等相關詞
+                        related_keywords_map = {
+                            "person_fallen_unmoving": ["躺", "臥", "不動", "靜止", "趴", "倒", "fall", "lie", "still"],
+                            "fire": ["燃燒", "燒", "煙", "火光", "burn", "flame"],
+                            "water_flood": ["濕", "水", "積", "淹", "wet", "water"],
+                        }
+                        
+                        has_related_keyword = False
+                        for event_type in required_event_types:
+                            if event_type in related_keywords_map:
+                                for related_kw in related_keywords_map[event_type]:
+                                    if related_kw in summary_original.lower() or related_kw in summary:
+                                        has_related_keyword = True
+                                        print(f"--- [DEBUG] 找到相關關鍵字: segment={m.get('segment')}, related_keyword={related_kw}, score={score:.2f} ---")
+                                        break
+                                if has_related_keyword:
+                                    break
+                        
+                        if has_related_keyword:
+                            strict_filtered_hits.append(h)
+                            print(f"--- [DEBUG] 保留高分數且包含相關關鍵字的結果: segment={m.get('segment')}, score={score:.2f} ---")
+                        else:
+                            print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, score={score:.2f}, summary前100字={summary_original[:100]}... ---")
+                    else:
+                        print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, summary前100字={summary_original[:100]}... ---")
             
             raw_hits = strict_filtered_hits
             print(f"--- [DEBUG] RAG 事件過濾後剩餘 {len(raw_hits)} 筆結果 ---")
@@ -2011,6 +2071,12 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
             strict_filtered_hits = []
             required_event_types = query_filters.get("event_types", [])
             required_message_keywords = query_filters.get("message_keywords", [])
+            # [新增] 保存 has_date_filter 變數，供事件過濾邏輯使用
+            # 直接使用 has_date_filter（已在函數開始時定義）
+            try:
+                has_date_filter_for_event = has_date_filter
+            except NameError:
+                has_date_filter_for_event = False
             
             # 構建事件關鍵字映射（用於檢查摘要）
             event_keyword_map = {
@@ -2046,20 +2112,74 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                             has_event_match = True
                             break
                 
-                # 檢查摘要中是否包含關鍵字
+                # 檢查摘要中是否包含關鍵字（更嚴格的匹配）
                 has_keyword_match = False
                 if all_keywords:
                     for keyword in all_keywords:
                         keyword_lower = keyword.lower()
+                        # [修改] 更嚴格的關鍵字匹配：檢查關鍵字是否在摘要中出現
+                        # 對於中文關鍵字（如「火災」），直接檢查是否包含
+                        # 對於英文關鍵字（如「fire」），使用不區分大小寫的匹配
                         if keyword in summary_original or keyword_lower in summary:
-                            has_keyword_match = True
-                            break
+                            # [新增] 額外檢查：確保不是誤匹配
+                            # 例如：避免「無火災」被匹配為「火災」
+                            # 檢查關鍵字前後是否有否定詞
+                            keyword_pos = summary_original.lower().find(keyword_lower)
+                            if keyword_pos >= 0:
+                                # 檢查關鍵字前後的上下文
+                                context_before = summary_original[max(0, keyword_pos-5):keyword_pos].lower()
+                                context_after = summary_original[keyword_pos+len(keyword):min(len(summary_original), keyword_pos+len(keyword)+5)].lower()
+                                
+                                # 如果關鍵字前有否定詞，則不匹配
+                                negation_words = ['無', '沒有', '不', '非', '未', 'no', 'not', 'none', 'without']
+                                has_negation = any(neg in context_before for neg in negation_words)
+                                
+                                if not has_negation:
+                                    has_keyword_match = True
+                                    print(f"--- [DEBUG] 關鍵字匹配: segment={m.get('segment')}, keyword={keyword}, summary片段={summary_original[:100]}... ---")
+                                    break
                 
                 # 如果有事件類型或關鍵字要求，則必須至少匹配其中一個
+                # [修改] 如果沒有找到匹配的結果，但 RAG 搜索返回了結果，可能是因為：
+                # 1. 摘要中沒有明確寫出關鍵字，但語義相關
+                # 2. 向量搜索找到了相關結果，但摘要描述方式不同
+                # 在這種情況下，如果 RAG 分數較高（>0.5），且查詢中只有事件關鍵字（沒有日期），
+                # 可以考慮放寬過濾條件，允許高分數的結果通過
                 if has_event_match or has_keyword_match:
                     strict_filtered_hits.append(h)
+                    print(f"--- [DEBUG] 保留符合事件要求的結果: segment={m.get('segment')}, 事件匹配={has_event_match}, 關鍵字匹配={has_keyword_match}, events_true={events_true} ---")
                 else:
-                    print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true} ---")
+                    # [新增] 如果沒有日期過濾，且 RAG 分數較高，可以考慮保留（但優先級較低）
+                    # 這適用於向量搜索找到了語義相關但摘要中沒有明確關鍵字的情況
+                    score = h.get("score", 0.0)
+                    # [修改] 檢查是否有日期過濾
+                    if not has_date_filter_for_event and score > 0.5:
+                        # 檢查摘要中是否有相關的描述（即使沒有明確的關鍵字）
+                        # 例如：對於「倒地」，檢查是否有「躺」、「臥」、「不動」等相關詞
+                        related_keywords_map = {
+                            "person_fallen_unmoving": ["躺", "臥", "不動", "靜止", "趴", "倒", "fall", "lie", "still"],
+                            "fire": ["燃燒", "燒", "煙", "火光", "burn", "flame"],
+                            "water_flood": ["濕", "水", "積", "淹", "wet", "water"],
+                        }
+                        
+                        has_related_keyword = False
+                        for event_type in required_event_types:
+                            if event_type in related_keywords_map:
+                                for related_kw in related_keywords_map[event_type]:
+                                    if related_kw in summary_original.lower() or related_kw in summary:
+                                        has_related_keyword = True
+                                        print(f"--- [DEBUG] 找到相關關鍵字: segment={m.get('segment')}, related_keyword={related_kw}, score={score:.2f} ---")
+                                        break
+                                if has_related_keyword:
+                                    break
+                        
+                        if has_related_keyword:
+                            strict_filtered_hits.append(h)
+                            print(f"--- [DEBUG] 保留高分數且包含相關關鍵字的結果: segment={m.get('segment')}, score={score:.2f} ---")
+                        else:
+                            print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, score={score:.2f}, summary前100字={summary_original[:100]}... ---")
+                    else:
+                        print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, summary前100字={summary_original[:100]}... ---")
             
             raw_hits = strict_filtered_hits
             print(f"--- [DEBUG] RAG 事件過濾後剩餘 {len(raw_hits)} 筆結果 ---")
