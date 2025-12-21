@@ -98,12 +98,16 @@ def process_json_file(json_path: Path) -> list:
             frame_analysis = parsed.get("frame_analysis", {})
             events = frame_analysis.get("events", {})
             
+            # Extract video name from JSON file path (e.g., segment/fire_1/fire_1.json -> fire_1)
+            video_name = json_path.parent.name if json_path.parent.name else None
+            
             # Create Summary object
             summary = Summary(
                 start_timestamp=start_time if start_time else datetime.now(),
                 end_timestamp=end_time,
                 location=None,  # Can be filled later
                 camera=None,    # Can be filled later
+                video=video_dir,  # [新增] 保存影片名稱（從目錄名稱提取），用於區分不同影片的相同 segment
                 message=summary_text.strip(),
                 segment=segment if segment else None,
                 time_range=time_range if time_range else None,
@@ -183,9 +187,11 @@ def migrate_segments():
         
         for summary in all_summaries:
             try:
-                # Check if record already exists (by segment and time_range)
+                # Check if record already exists (by video, segment and time_range)
                 # 與 RAG 的 _save_results_to_postgres 邏輯一致
+                # [修改] 加入 video 欄位判斷，避免不同影片的相同 segment 和 time_range 被誤判為同一筆記錄
                 existing = db.query(Summary).filter(
+                    Summary.video == summary.video,
                     Summary.segment == summary.segment,
                     Summary.time_range == summary.time_range
                 ).first()
@@ -194,6 +200,7 @@ def migrate_segments():
                     # 更新現有記錄（與 RAG 邏輯一致：影片相同則更新）
                     existing.start_timestamp = summary.start_timestamp
                     existing.end_timestamp = summary.end_timestamp
+                    existing.video = summary.video  # [新增] 確保 video 欄位也被更新
                     existing.message = summary.message
                     existing.segment = summary.segment
                     existing.time_range = summary.time_range

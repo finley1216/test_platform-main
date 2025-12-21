@@ -18,6 +18,7 @@ class Summary(Base):
     camera = Column(String(50), nullable=True)
     message = Column(Text, nullable=True)
     # Additional fields from segment JSON
+    video = Column(String(255), nullable=True)  # 影片名稱（例如 "fire_1", "fire_2"），用於區分不同影片的相同 segment
     segment = Column(String(255), nullable=True)  # segment filename (e.g., "segment_0000.mp4")
     time_range = Column(String(50), nullable=True)  # Original time range string (e.g., "00:00:00 - 00:00:08")
     duration_sec = Column(Float, nullable=True)  # Segment duration in seconds
