@@ -2072,9 +2072,7 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
         
         # 2. 組裝 Context (A) - 使用 norm_hits 作為上下文
-        hits = norm_hits
-
-        if not hits:
+        if not norm_hits:
             # 如果因為門檻過濾後導致沒有資料，也視為找不到
             # [NEW] 如果 Ollama 失敗，直接返回空結果而不是報錯
             try:
@@ -2099,34 +2097,17 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 "answer": msg or "目前索引到的片段裡找不到答案（或是相似度過低）。",
             }
 
-        # 2. 組裝 Context (A)
+        # 組裝 Context (A) - 使用已經格式化好的 norm_hits
         context_blocks = []
-        norm_hits = []
-
-        # 注意這裡 enumerate 使用過濾後的 hits
-        for i, h in enumerate(hits, start=1):
-            m = h.get("metadata", {})
-            summary = m.get("summary", "")
-            video = m.get("video")
-            time_range = m.get("time_range")
-            score_val = round(float(h.get("score", 0.0)), 4)
-
+        for i, hit in enumerate(norm_hits, start=1):
+            summary = hit.get("summary", "")
+            video = hit.get("video")
+            time_range = hit.get("time_range")
+            
             # 在 context 中加入分數資訊讓 LLM 參考也不錯，但這邊先保持簡潔
             context_blocks.append(
                 f"[{i}] 影片: {video}  時間: {time_range}\n摘要: {summary}"
             )
-
-            norm_hits.append({
-                "score": score_val,
-                "video": video,
-                "segment": m.get("segment"),
-                "time_range": time_range,
-                "events_true": m.get("events_true", []),
-                "summary": summary,
-                "reason": m.get("reason", ""),
-                "persons": m.get("persons", []),
-                "doc_id": h.get("id"),
-            })
 
         context_text = "\n\n".join(context_blocks)
 
