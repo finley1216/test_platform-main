@@ -7,7 +7,7 @@ import google.generativeai as genai
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
 from PIL import Image
-from datetime import datetime, date
+from datetime import datetime, date, timedelta
 from fastapi import FastAPI, Request, UploadFile,status , File, Form, Depends, Security, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
@@ -1538,54 +1538,112 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         if not query:
             raise HTTPException(status_code=422, detail="missing query")
 
-        # [簡化] 步驟 0: 解析查詢條件，PostgreSQL 只做日期篩選
+        # 步驟 1: 解析查詢條件
         query_filters = {}
-        filtered_set = None
-        has_date_filter = False
+        sql_results = {}
         
         if HAS_DB and db:
             try:
                 query_filters = _parse_query_filters(query)
-                # [簡化] 只有當有日期過濾時，才使用 PostgreSQL 過濾
-                has_date_filter = bool(query_filters.get("date_filter"))
-                
-                if has_date_filter:
-                    # [簡化] PostgreSQL 只過濾日期，不考慮事件和關鍵字
-                    date_only_filters = {"date_filter": query_filters["date_filter"]}
-                    filtered_triples = _filter_summaries_by_query(db, date_only_filters, limit=1000)
-                    # [修改] 使用 (video, segment, time_range) 三元組構建過濾集合
-                    filtered_set = set(filtered_triples) if filtered_triples else set()
-                    print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄（包含所有記錄） ---")
+                # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
+                sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
+                print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
             except Exception as e:
-                print(f"--- [WARNING] PostgreSQL 過濾失敗: {e} ---")
-                print(f"--- [INFO] PostgreSQL 過濾失敗，回退到正常 RAG 搜尋 ---")
+                print(f"--- [WARNING] PostgreSQL 查詢失敗: {e} ---")
+                import traceback
+                traceback.print_exc()
                 query_filters = {}
-                filtered_set = None
-                has_date_filter = False
+                sql_results = {}
 
-        filters: Dict[str, Any] = {}
-
-        # 硬過濾 (Hard Filter)
-        req_evt = payload.get("require_event")
-        if isinstance(req_evt, list) and req_evt:
-            filters["events_true_any"] = req_evt
+        # 步驟 2: 對 query 做關鍵字擴展，多 query 搜索後取 union
+        expanded_queries = _expand_query_keywords(query)
+        print(f"--- [DEBUG] 關鍵字擴展後生成 {len(expanded_queries)} 個查詢: {expanded_queries} ---")
         
-        # [簡化] 如果查詢中包含事件類型，自動添加 events_true_any 過濾器（只在沒有日期過濾時）
-        if query_filters.get("event_types") and not has_date_filter:
-            if "events_true_any" not in filters:
-                filters["events_true_any"] = []
-            for event_type in query_filters["event_types"]:
-                if event_type not in filters["events_true_any"]:
-                    filters["events_true_any"].append(event_type)
-            print(f"--- [DEBUG] 自動添加事件過濾器: {filters['events_true_any']} ---")
-        
-        if payload.get("video"):
-            filters["video"] = str(payload["video"])
-        if payload.get("time_contains"):
-            filters["time_contains"] = str(payload["time_contains"])
-
-        # 2. 初始化 Store 並搜尋
+        # 步驟 3: 固定 vec_pool = 400~800，多 query 搜索後取 union
         store = RAGStore(store_dir=RAG_DIR)
+        vec_pool = 600  # 固定向量候選池大小
+        
+        all_vector_hits = []
+        seen_segment_uids = set()
+        
+        for expanded_query in expanded_queries:
+            # 對每個擴展查詢進行搜索
+            vector_hits = store.search(expanded_query, top_k=vec_pool, filters={})
+            
+            # 合併結果（去重）
+            for hit in vector_hits:
+                metadata = hit.get("metadata", {})
+                video = metadata.get("video", "")
+                segment = metadata.get("segment", "")
+                time_range = metadata.get("time_range", "")
+                
+                # 生成 segment_uid
+                video_str = str(video) if video else ""
+                segment_str = str(segment) if segment else ""
+                time_range_str = str(time_range) if time_range else ""
+                segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
+                
+                if segment_uid not in seen_segment_uids:
+                    seen_segment_uids.add(segment_uid)
+                    all_vector_hits.append(hit)
+        
+        print(f"--- [DEBUG] Vector 搜索後合併得到 {len(all_vector_hits)} 筆結果 ---")
+        
+        # 步驟 4: 融合排序（保留三類結果：只在 SQL、只在 Vector、兩邊都命中）
+        message_keywords = query_filters.get("message_keywords", [])
+        merged_results = _merge_and_rank_results(
+            all_vector_hits,
+            sql_results,
+            query_filters,
+            message_keywords
+        )
+        
+        print(f"--- [DEBUG] 融合排序後得到 {len(merged_results)} 筆結果 ---")
+        
+        # 步驟 5: 過濾低於門檻的結果，然後取 top_k
+        filtered_results = [
+            r for r in merged_results
+            if r["final_score"] >= score_threshold
+        ]
+        
+        # 排序後再取 top_k
+        final_results = filtered_results[:top_k]
+        
+        # 步驟 6: 格式化結果
+        norm_hits = []
+        for r in final_results:
+            vector_hit = r.get("vector_hit")
+            sql_data = r.get("sql_data")
+            
+            # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
+            if vector_hit:
+                m = vector_hit.get("metadata", {})
+                norm_hits.append({
+                    "score": round(r["final_score"], 4),
+                    "video": m.get("video"),
+                    "segment": m.get("segment"),
+                    "time_range": m.get("time_range"),
+                    "events_true": m.get("events_true", []),
+                    "summary": m.get("summary", ""),
+                    "reason": m.get("reason", ""),
+                    "doc_id": vector_hit.get("id"),
+                })
+            elif sql_data:
+                # 只在 SQL 命中的結果
+                norm_hits.append({
+                    "score": round(r["final_score"], 4),
+                    "video": sql_data.get("video"),
+                    "segment": sql_data.get("segment"),
+                    "time_range": sql_data.get("time_range"),
+                    "events_true": [],
+                    "summary": sql_data.get("message", ""),
+                    "reason": sql_data.get("event_reason", ""),
+                    "doc_id": None,
+                })
+        
+        print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
+        
+        return {"backend": store.embed_model, "hits": norm_hits}
 
         # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
         if has_date_filter:
@@ -1908,319 +1966,113 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         # 指定用哪個 LLM 來回答
         llm_model = (payload.get("model") or "qwen2.5vl:latest").strip()
 
-        # [簡化] 步驟 0: 解析查詢條件，PostgreSQL 只做日期篩選（與 /rag/search 統一）
+        # 步驟 1: 解析查詢條件（與 /rag/search 統一）
         query_filters = {}
-        filtered_set = None
-        has_date_filter = False
+        sql_results = {}
         
         if HAS_DB and db:
             try:
                 query_filters = _parse_query_filters(question)
-                # [簡化] 只有當有日期過濾時，才使用 PostgreSQL 過濾
-                has_date_filter = bool(query_filters.get("date_filter"))
-                
-                if has_date_filter:
-                    # [簡化] PostgreSQL 只過濾日期，不考慮事件和關鍵字
-                    date_only_filters = {"date_filter": query_filters["date_filter"]}
-                    filtered_triples = _filter_summaries_by_query(db, date_only_filters, limit=1000)
-                    # [修改] 使用 (video, segment, time_range) 三元組構建過濾集合
-                    filtered_set = set(filtered_triples) if filtered_triples else set()
-                    print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄（包含所有記錄） ---")
+                # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
+                sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
+                print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
             except Exception as e:
-                print(f"--- [WARNING] PostgreSQL 過濾失敗: {e} ---")
-                print(f"--- [INFO] PostgreSQL 過濾失敗，回退到正常 RAG 搜尋 ---")
+                print(f"--- [WARNING] PostgreSQL 查詢失敗: {e} ---")
+                import traceback
+                traceback.print_exc()
                 query_filters = {}
-                filtered_set = None
-                has_date_filter = False
+                sql_results = {}
 
-        # 1. 搜尋片段 (R) - 使用與 /rag/search 相同的邏輯
+        # 步驟 2: 對 query 做關鍵字擴展，多 query 搜索後取 union
+        expanded_queries = _expand_query_keywords(question)
+        print(f"--- [DEBUG] 關鍵字擴展後生成 {len(expanded_queries)} 個查詢: {expanded_queries} ---")
+        
+        # 步驟 3: 固定 vec_pool = 400~800，多 query 搜索後取 union
         store = RAGStore(store_dir=RAG_DIR)
+        vec_pool = 600  # 固定向量候選池大小
         
-        # [簡化] 構建 RAG 過濾器（與 /rag/search 統一）
-        filters: Dict[str, Any] = {}
+        all_vector_hits = []
+        seen_segment_uids = set()
         
-        # [簡化] 如果查詢中包含事件類型，自動添加 events_true_any 過濾器（只在沒有日期過濾時）
-        if query_filters.get("event_types") and not has_date_filter:
-            filters["events_true_any"] = query_filters["event_types"]
-            print(f"--- [DEBUG] 自動添加事件過濾器: {filters['events_true_any']} ---")
+        for expanded_query in expanded_queries:
+            # 對每個擴展查詢進行搜索
+            vector_hits = store.search(expanded_query, top_k=vec_pool, filters={})
+            
+            # 合併結果（去重）
+            for hit in vector_hits:
+                metadata = hit.get("metadata", {})
+                video = metadata.get("video", "")
+                segment = metadata.get("segment", "")
+                time_range = metadata.get("time_range", "")
+                
+                # 生成 segment_uid
+                video_str = str(video) if video else ""
+                segment_str = str(segment) if segment else ""
+                time_range_str = str(time_range) if time_range else ""
+                segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
+                
+                if segment_uid not in seen_segment_uids:
+                    seen_segment_uids.add(segment_uid)
+                    all_vector_hits.append(hit)
         
-        # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
-        if has_date_filter:
-            if filtered_set and len(filtered_set) > 0:
-                # PostgreSQL 已過濾日期，RAG 在這些結果中進行向量搜索
-                print(f"--- [DEBUG] PostgreSQL 日期過濾找到 {len(filtered_set)} 筆記錄，開始 RAG 向量搜索 ---")
-                
-                # RAG 正常搜索（不限制數量，因為後面會過濾）
-                search_top_k = top_k * 50  # 增加搜尋數量以確保能找到所有匹配的記錄
-                raw_hits = store.search(question, top_k=search_top_k, filters=filters)
-                
-                # 只保留在 PostgreSQL 過濾結果中的記錄
-                filtered_hits = []
-                # [新增] 構建事件相關關鍵字列表（用於判斷是否相關）
-                event_keyword_map = {
-                    "fire": ["火災", "火", "fire", "smoke", "濃煙", "煙"],
-                    "water_flood": ["水災", "水", "淹水", "積水", "flood", "water"],
-                    "person_fallen_unmoving": ["倒地", "倒地不起", "fallen", "unmoving"],
-                    "crowd_loitering": ["群聚", "聚眾", "逗留", "crowd", "loitering"],
-                    "abnormal_attire_face_cover_at_entry": ["遮臉", "異常著裝", "face", "cover"],
-                    "double_parking_lane_block": ["併排", "停車", "阻塞", "parking", "block"],
-                    "smoking_outside_zone": ["吸菸", "抽菸", "smoking"],
-                    "security_door_tamper": ["闖入", "突破", "安全門", "tamper", "door"],
-                }
-                # 收集所有需要匹配的關鍵字
-                required_keywords = set()
-                if query_filters.get("message_keywords"):
-                    required_keywords.update(query_filters["message_keywords"])
-                if query_filters.get("event_types"):
-                    for event_type in query_filters["event_types"]:
-                        if event_type in event_keyword_map:
-                            required_keywords.update(event_keyword_map[event_type])
-                
-                if required_keywords:
-                    print(f"--- [DEBUG] 需要匹配的關鍵字: {required_keywords} ---")
-                
-                for h in raw_hits:
-                    m = h.get("metadata", {})
-                    seg = m.get("segment")
-                    tr = m.get("time_range")
-                    if seg and tr:
-                        # 寬鬆匹配（處理格式差異）
-                        seg_base = seg.rsplit('.', 1)[0] if '.' in seg else seg
-                        tr_normalized = tr.replace(" - ", "-").replace(" -", "-").replace("- ", "-")
-                        # [修改] 檢查是否在 PostgreSQL 過濾結果中（使用 (video, segment, time_range) 三元組）
-                        # 從 RAG metadata 中提取 video 名稱
-                        video_from_rag = m.get("video", "").replace("/segment/", "").strip("/") if m.get("video") else None
-                        folder_from_rag = m.get("folder", "")
-                        video_name = folder_from_rag if folder_from_rag else video_from_rag
-                        
-                        # 匹配邏輯：檢查 (video, segment, time_range) 是否在過濾集合中
-                        matched = False
-                        for db_video, db_seg, db_tr in filtered_set:
-                            # 檢查 segment 和 time_range 是否匹配（寬鬆匹配）
-                            seg_match = (seg == db_seg) or (seg_base == db_seg) or (seg == (db_seg.rsplit('.', 1)[0] if '.' in db_seg else db_seg))
-                            tr_match = (tr == db_tr) or (tr_normalized == db_tr) or (tr == db_tr.replace(" - ", "-")) or (tr_normalized == db_tr.replace(" - ", "-"))
-                            
-                            if seg_match and tr_match:
-                                # 如果 video 匹配，或者其中一個為 None（舊記錄），則匹配
-                                if (video_name and db_video and video_name == db_video) or \
-                                   (not video_name and not db_video) or \
-                                   (video_name and not db_video) or \
-                                   (not video_name and db_video):
-                                    matched = True
-                                    break
-                        
-                        if matched:
-                            # [修改] 只有當查詢中沒有事件關鍵字時，才給予高分數（1.0）
-                            # 如果有事件關鍵字，則檢查是否有事件標記或摘要中包含關鍵字
-                            original_score = h.get("score", 0.0)
-                            
-                            if not required_keywords:
-                                # 沒有事件關鍵字：給予高分數（因為已經通過日期過濾）
-                                h["score"] = 1.0
-                            else:
-                                # 有事件關鍵字：檢查是否相關
-                                events_true = m.get("events_true", [])
-                                summary = str(m.get("summary", "")).lower()
-                                summary_original = str(m.get("summary", ""))
-                                
-                                has_event_match = False
-                                has_keyword_match = False
-                                
-                                # 檢查是否有匹配的事件標記
-                                if query_filters.get("event_types"):
-                                    for event_type in query_filters["event_types"]:
-                                        if event_type in events_true:
-                                            has_event_match = True
-                                            break
-                                
-                                # 檢查摘要中是否包含關鍵字
-                                if not has_event_match:
-                                    for keyword in required_keywords:
-                                        keyword_lower = keyword.lower()
-                                        if keyword in summary_original or keyword_lower in summary:
-                                            has_keyword_match = True
-                                            break
-                                
-                                # 只有當有事件標記或摘要中包含關鍵字時，才給予高分數
-                                if has_event_match or has_keyword_match:
-                                    h["score"] = 1.0
-                                    print(f"--- [DEBUG] 給予高分數: segment={seg}, 事件匹配={has_event_match}, 關鍵字匹配={has_keyword_match}, events_true={events_true} ---")
-                                else:
-                                    # 保持原始 RAG 分數（不修改）
-                                    print(f"--- [DEBUG] 保持原始分數 {original_score:.4f}: segment={seg}, 無事件標記且摘要中無關鍵字, events_true={events_true}, summary前100字={summary_original[:100]}... ---")
-                            
-                            filtered_hits.append(h)
-                
-                raw_hits = filtered_hits
-                print(f"--- [DEBUG] RAG 向量搜索後，匹配 PostgreSQL 日期過濾的結果: {len(raw_hits)} 筆 ---")
-            else:
-                # PostgreSQL 日期過濾沒有找到匹配結果：返回空結果
-                print(f"--- [DEBUG] PostgreSQL 日期過濾沒有找到匹配結果，返回空結果 ---")
-                raw_hits = []
-        else:
-            # 沒有日期過濾：正常 RAG 搜尋（完全由 RAG 處理）
-            # [修改] 當沒有日期過濾時，不限制搜索數量，讓 RAG 進行全面搜索
-            # 事件過濾會在搜索後進行，而不是在搜索時使用 events_true_any 過濾器
-            # 這樣可以確保即使沒有事件標記，但摘要中包含關鍵字的結果也能被找到
-            search_top_k = top_k * 50 if query_filters.get("event_types") or query_filters.get("message_keywords") else top_k
-            # [修改] 不使用 events_true_any 過濾器，讓 RAG 進行全面搜索，然後在結果中進行事件過濾
-            raw_hits = store.search(question, top_k=search_top_k, filters={})
-
-        # [新增] 如果查詢中有事件關鍵字，進行 RAG 層面的事件過濾（無論是否有日期過濾）
-        if query_filters.get("event_types") or query_filters.get("message_keywords"):
-            strict_filtered_hits = []
-            required_event_types = query_filters.get("event_types", [])
-            required_message_keywords = query_filters.get("message_keywords", [])
-            # [新增] 保存 has_date_filter 變數，供事件過濾邏輯使用
-            # 直接使用 has_date_filter（已在函數開始時定義）
-            try:
-                has_date_filter_for_event = has_date_filter
-            except NameError:
-                has_date_filter_for_event = False
-            
-            # 構建事件關鍵字映射（用於檢查摘要）
-            event_keyword_map = {
-                "fire": ["火災", "火", "fire", "smoke", "濃煙", "煙"],
-                "water_flood": ["水災", "水", "淹水", "積水", "flood", "water"],
-                "person_fallen_unmoving": ["倒地", "倒地不起", "fallen", "unmoving"],
-                "crowd_loitering": ["群聚", "聚眾", "逗留", "crowd", "loitering"],
-                "abnormal_attire_face_cover_at_entry": ["遮臉", "異常著裝", "face", "cover"],
-                "double_parking_lane_block": ["併排", "停車", "阻塞", "parking", "block"],
-                "smoking_outside_zone": ["吸菸", "抽菸", "smoking"],
-                "security_door_tamper": ["闖入", "突破", "安全門", "tamper", "door"],
-            }
-            
-            # 收集所有需要匹配的關鍵字
-            all_keywords = set(required_message_keywords)
-            for event_type in required_event_types:
-                if event_type in event_keyword_map:
-                    all_keywords.update(event_keyword_map[event_type])
-            
-            print(f"--- [DEBUG] RAG 事件過濾: 需要的事件類型={required_event_types}, 關鍵字={all_keywords} ---")
-            
-            for h in raw_hits:
-                m = h.get("metadata", {})
-                events_true = m.get("events_true", [])
-                summary = str(m.get("summary", "")).lower()
-                summary_original = str(m.get("summary", ""))
-                
-                # 檢查是否有匹配的事件標記
-                has_event_match = False
-                if required_event_types:
-                    for event_type in required_event_types:
-                        if event_type in events_true:
-                            has_event_match = True
-                            break
-                
-                # 檢查摘要中是否包含關鍵字（更嚴格的匹配）
-                has_keyword_match = False
-                if all_keywords:
-                    for keyword in all_keywords:
-                        keyword_lower = keyword.lower()
-                        # [修改] 更嚴格的關鍵字匹配：檢查關鍵字是否在摘要中出現
-                        # 對於中文關鍵字（如「火災」），直接檢查是否包含
-                        # 對於英文關鍵字（如「fire」），使用不區分大小寫的匹配
-                        if keyword in summary_original or keyword_lower in summary:
-                            # [新增] 額外檢查：確保不是誤匹配
-                            # 例如：避免「無火災」被匹配為「火災」
-                            # 檢查關鍵字前後是否有否定詞
-                            keyword_pos = summary_original.lower().find(keyword_lower)
-                            if keyword_pos >= 0:
-                                # 檢查關鍵字前後的上下文
-                                context_before = summary_original[max(0, keyword_pos-5):keyword_pos].lower()
-                                context_after = summary_original[keyword_pos+len(keyword):min(len(summary_original), keyword_pos+len(keyword)+5)].lower()
-                                
-                                # 如果關鍵字前有否定詞，則不匹配
-                                negation_words = ['無', '沒有', '不', '非', '未', 'no', 'not', 'none', 'without']
-                                has_negation = any(neg in context_before for neg in negation_words)
-                                
-                                if not has_negation:
-                                    has_keyword_match = True
-                                    print(f"--- [DEBUG] 關鍵字匹配: segment={m.get('segment')}, keyword={keyword}, summary片段={summary_original[:100]}... ---")
-                                    break
-                
-                # 如果有事件類型或關鍵字要求，則必須至少匹配其中一個
-                # [修改] 如果沒有找到匹配的結果，但 RAG 搜索返回了結果，可能是因為：
-                # 1. 摘要中沒有明確寫出關鍵字，但語義相關
-                # 2. 向量搜索找到了相關結果，但摘要描述方式不同
-                # 在這種情況下，如果 RAG 分數較高（>0.5），且查詢中只有事件關鍵字（沒有日期），
-                # 可以考慮放寬過濾條件，允許高分數的結果通過
-                if has_event_match or has_keyword_match:
-                    strict_filtered_hits.append(h)
-                    print(f"--- [DEBUG] 保留符合事件要求的結果: segment={m.get('segment')}, 事件匹配={has_event_match}, 關鍵字匹配={has_keyword_match}, events_true={events_true} ---")
-                else:
-                    # [新增] 如果沒有日期過濾，且 RAG 分數較高，可以考慮保留（但優先級較低）
-                    # 這適用於向量搜索找到了語義相關但摘要中沒有明確關鍵字的情況
-                    score = h.get("score", 0.0)
-                    # [修改] 檢查是否有日期過濾
-                    if not has_date_filter_for_event and score > 0.5:
-                        # 檢查摘要中是否有相關的描述（即使沒有明確的關鍵字）
-                        # 例如：對於「倒地」，檢查是否有「躺」、「臥」、「不動」等相關詞
-                        related_keywords_map = {
-                            "person_fallen_unmoving": ["躺", "臥", "不動", "靜止", "趴", "倒", "fall", "lie", "still"],
-                            "fire": ["燃燒", "燒", "煙", "火光", "burn", "flame"],
-                            "water_flood": ["濕", "水", "積", "淹", "wet", "water"],
-                        }
-                        
-                        has_related_keyword = False
-                        for event_type in required_event_types:
-                            if event_type in related_keywords_map:
-                                for related_kw in related_keywords_map[event_type]:
-                                    if related_kw in summary_original.lower() or related_kw in summary:
-                                        has_related_keyword = True
-                                        print(f"--- [DEBUG] 找到相關關鍵字: segment={m.get('segment')}, related_keyword={related_kw}, score={score:.2f} ---")
-                                        break
-                                if has_related_keyword:
-                                    break
-                        
-                        if has_related_keyword:
-                            strict_filtered_hits.append(h)
-                            print(f"--- [DEBUG] 保留高分數且包含相關關鍵字的結果: segment={m.get('segment')}, score={score:.2f} ---")
-                        else:
-                            print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, score={score:.2f}, summary前100字={summary_original[:100]}... ---")
-                    else:
-                        print(f"--- [DEBUG] 過濾掉不符合事件要求的結果: segment={m.get('segment')}, events_true={events_true}, summary前100字={summary_original[:100]}... ---")
-            
-            raw_hits = strict_filtered_hits
-            print(f"--- [DEBUG] RAG 事件過濾後剩餘 {len(raw_hits)} 筆結果 ---")
-
-        # [NEW] 過濾結果（分數門檻）並根據事件和關鍵字進行優先排序
-        hits_with_priority = []
-        for h in raw_hits:
-            score = float(h.get("score", 0.0))
-            if score < score_threshold:
-                continue
-            
-            m = h.get("metadata", {})
-            
-            # [新增] 計算優先級：有事件標記或摘要中包含關鍵字的結果優先
-            priority = 0
-            events_true = m.get("events_true", [])
-            summary = str(m.get("summary", "")).lower()
-            message_keywords = query_filters.get("message_keywords", [])
-            
-            # 檢查是否有匹配的事件標記
-            if query_filters.get("event_types"):
-                for event_type in query_filters["event_types"]:
-                    if event_type in events_true:
-                        priority = 2  # 有事件標記，最高優先級
-                        break
-            
-            # 檢查摘要中是否包含關鍵字
-            if priority < 2 and message_keywords:
-                for keyword in message_keywords:
-                    if keyword in summary or keyword.lower() in summary:
-                        priority = 1  # 摘要中包含關鍵字，次高優先級
-                        break
-            
-            hits_with_priority.append({
-                "hit": h,
-                "priority": priority
-            })
+        print(f"--- [DEBUG] Vector 搜索後合併得到 {len(all_vector_hits)} 筆結果 ---")
         
-        # [新增] 根據優先級和分數排序：優先級高的在前，同優先級按分數降序
-        hits_with_priority.sort(key=lambda x: (-x["priority"], -float(x["hit"].get("score", 0.0))))
-        hits = [x["hit"] for x in hits_with_priority]
+        # 步驟 4: 融合排序（保留三類結果：只在 SQL、只在 Vector、兩邊都命中）
+        message_keywords = query_filters.get("message_keywords", [])
+        merged_results = _merge_and_rank_results(
+            all_vector_hits,
+            sql_results,
+            query_filters,
+            message_keywords
+        )
+        
+        print(f"--- [DEBUG] 融合排序後得到 {len(merged_results)} 筆結果 ---")
+        
+        # 步驟 5: 過濾低於門檻的結果，然後取 top_k
+        filtered_results = [
+            r for r in merged_results
+            if r["final_score"] >= score_threshold
+        ]
+        
+        # 排序後再取 top_k
+        final_results = filtered_results[:top_k]
+        
+        # 步驟 6: 格式化結果
+        norm_hits = []
+        for r in final_results:
+            vector_hit = r.get("vector_hit")
+            sql_data = r.get("sql_data")
+            
+            # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
+            if vector_hit:
+                m = vector_hit.get("metadata", {})
+                norm_hits.append({
+                    "score": round(r["final_score"], 4),
+                    "video": m.get("video"),
+                    "segment": m.get("segment"),
+                    "time_range": m.get("time_range"),
+                    "events_true": m.get("events_true", []),
+                    "summary": m.get("summary", ""),
+                    "reason": m.get("reason", ""),
+                    "doc_id": vector_hit.get("id"),
+                })
+            elif sql_data:
+                # 只在 SQL 命中的結果
+                norm_hits.append({
+                    "score": round(r["final_score"], 4),
+                    "video": sql_data.get("video"),
+                    "segment": sql_data.get("segment"),
+                    "time_range": sql_data.get("time_range"),
+                    "events_true": [],
+                    "summary": sql_data.get("message", ""),
+                    "reason": sql_data.get("event_reason", ""),
+                    "doc_id": None,
+                })
+        
+        print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
+        
+        # 2. 組裝 Context (A) - 使用 norm_hits 作為上下文
+        hits = norm_hits
 
         if not hits:
             # 如果因為門檻過濾後導致沒有資料，也視為找不到
@@ -2571,6 +2423,30 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         if keyword in question:
             message_keywords_found.append(keyword)
     
+    # [NEW] 添加描述性關鍵字（顏色、衣服、車輛等）
+    descriptive_keywords = [
+        # 顏色 + 衣服
+        "黃色衣服", "黑色衣服", "白色衣服", "紅色衣服", "藍色衣服", "綠色衣服",
+        "深色衣服", "淺色衣服", "灰色衣服",
+        # 顏色 + 車輛
+        "藍色貨車", "白色貨車", "紅色貨車", "黑色貨車", "綠色貨車", "黃色貨車",
+        "藍色卡車", "白色卡車", "紅色卡車", "黑色卡車",
+        "藍色汽車", "白色汽車", "紅色汽車", "黑色汽車",
+        "藍色機車", "白色機車", "紅色機車", "黑色機車",
+        "藍色車", "白色車", "紅色車", "黑色車", "黃色車",
+        # 單獨的顏色（用於匹配摘要中的顏色描述）
+        "黃色", "黑色", "白色", "紅色", "藍色", "綠色", "灰色", "深色", "淺色",
+        # 衣服相關
+        "衣服", "上衣", "褲子", "帽子",
+        # 車輛相關
+        "貨車", "卡車", "汽車", "機車", "車"
+    ]
+    
+    # 先檢查完整的多字關鍵字（如「黃色衣服」、「藍色貨車」）
+    for keyword in descriptive_keywords:
+        if keyword in question and keyword not in message_keywords_found:
+            message_keywords_found.append(keyword)
+    
     if message_keywords_found:
         # 將找到的關鍵字添加到 filters 中，用於後續的 message 過濾
         filters["message_keywords"] = message_keywords_found
@@ -2589,66 +2465,86 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         if keyword in question:
             filters["location_keywords"].append(keyword)
     
-    # [NEW] 如果查詢中包含事件相關關鍵字但沒有明確的事件類型，也在 message 中搜尋
-    # 這可以幫助找到 message 中提到相關事件的記錄（例如：火災、倒地、群聚等）
-    # 注意：這個功能在 _filter_summaries_by_query 中實現，這裡只是記錄
-    event_keywords_in_message = ["火災", "倒地", "群聚", "聚眾", "水災", "淹水", "闖入", "遮臉", "吸菸", "停車", "阻塞"]
-    message_keywords_found = []
-    for keyword in event_keywords_in_message:
-        if keyword in question:
-            message_keywords_found.append(keyword)
-    
-    if message_keywords_found:
-        # 將找到的關鍵字添加到 filters 中，用於後續的 message 過濾
-        filters["message_keywords"] = message_keywords_found
-        print(f"--- [DEBUG] 找到 message 關鍵字: {message_keywords_found} ---")
-    
     return filters
+
+
+def _expand_query_keywords(query: str) -> List[str]:
+    """
+    對 query 做關鍵字擴展（例如：積水 / 水災 / 淹水）
+    返回擴展後的查詢列表
+    """
+    expanded_queries = [query]  # 原始查詢
+    
+    # 關鍵字擴展映射
+    keyword_expansions = {
+        "積水": ["積水", "水災", "淹水", "水"],
+        "水災": ["水災", "積水", "淹水", "水"],
+        "淹水": ["淹水", "積水", "水災", "水"],
+        "火災": ["火災", "火", "煙", "濃煙"],
+        "火": ["火", "火災", "煙", "濃煙"],
+        "倒地": ["倒地", "倒地不起", "躺", "臥"],
+        "群聚": ["群聚", "聚眾", "逗留"],
+        "闖入": ["闖入", "突破", "安全門"],
+        "遮臉": ["遮臉", "異常著裝"],
+        "吸菸": ["吸菸", "抽菸"],
+        "停車": ["停車", "併排", "阻塞"],
+    }
+    
+    # 檢查查詢中是否包含可擴展的關鍵字
+    for keyword, expansions in keyword_expansions.items():
+        if keyword in query:
+            for expanded_keyword in expansions:
+                if expanded_keyword not in query:
+                    # 替換關鍵字生成新的查詢
+                    expanded_query = query.replace(keyword, expanded_keyword)
+                    if expanded_query not in expanded_queries:
+                        expanded_queries.append(expanded_query)
+    
+    return expanded_queries
 
 
 def _filter_summaries_by_query(
     db: Session,
     filters: Dict[str, Any],
     limit: int = 1000
-) -> List[Tuple[str, str]]:
+) -> Dict[str, Dict[str, Any]]:
     """
-    根據過濾條件從 PostgreSQL 查詢 summaries，返回符合條件的 (segment, time_range) 列表
-    用於後續在 RAG 中過濾
+    根據過濾條件從 PostgreSQL 查詢 summaries，返回符合條件的記錄
     
-    返回: List[Tuple[segment, time_range]]
+    返回: Dict[segment_uid] -> sql_payload
+    segment_uid 格式: f"{video}|{segment}|{time_range}"
+    sql_payload 包含: start_timestamp, video, segment, time_range, event_reason, message
     """
     if not HAS_DB:
-        return []
+        return {}
     
-    query = db.query(Summary.segment, Summary.time_range).filter(
+    # 查詢需要的欄位
+    query = db.query(
+        Summary.start_timestamp,
+        Summary.video,
+        Summary.segment,
+        Summary.time_range,
+        Summary.event_reason,
+        Summary.message
+    ).filter(
         Summary.message.isnot(None),
         Summary.message != ""
     )
     
-    # [關鍵] 日期過濾 - 使用 updated_at 欄位進行篩選（優先於其他過濾條件）
+    # [關鍵] 日期過濾 - 使用 start_timestamp 做 range filter
     if filters.get("date_filter"):
         target_date = filters["date_filter"]
-        # 使用 updated_at 而不是 start_timestamp，因為 updated_at 更準確反映資料的日期
+        # 計算時間範圍：從當天 00:00:00 到次日 00:00:00
+        t0 = datetime.combine(target_date, datetime.min.time())
+        next_day = target_date + timedelta(days=1)
+        t1 = datetime.combine(next_day, datetime.min.time())
         query = query.filter(
-            func.date(Summary.updated_at) == target_date
+            Summary.start_timestamp >= t0,
+            Summary.start_timestamp < t1
         )
-        print(f"--- [DEBUG] 應用日期過濾 (使用 updated_at): {target_date} ---")
+        print(f"--- [DEBUG] 應用日期過濾 (使用 start_timestamp range): {target_date} ({t0} ~ {t1}) ---")
     
-    # 地點過濾（在 location 或 message 中搜尋）
-    if filters.get("location_keywords"):
-        location_conditions = []
-        for keyword in filters["location_keywords"]:
-            location_conditions.append(
-                or_(
-                    Summary.location.ilike(f"%{keyword}%"),
-                    Summary.message.ilike(f"%{keyword}%")
-                )
-            )
-        if location_conditions:
-            query = query.filter(or_(*location_conditions))
-            print(f"--- [DEBUG] 應用地點過濾: {filters['location_keywords']} ---")
-    
-    # [關鍵] 事件類型過濾 - 必須嚴格匹配事件 t/f 欄位
+    # [關鍵] 事件類型過濾 - 必須嚴格匹配事件 boolean 欄位
     if filters.get("event_types"):
         event_conditions = []
         for event_type in filters["event_types"]:
@@ -2673,8 +2569,7 @@ def _filter_summaries_by_query(
             query = query.filter(or_(*event_conditions))
             print(f"--- [DEBUG] 應用事件過濾: {filters['event_types']} ---")
     
-    # [簡化] message 關鍵字過濾 - 如果太難判斷，可以跳過此過濾
-    # 但至少日期過濾必須正確
+    # [NEW] message 關鍵字過濾 - 在 SQL 查詢中過濾
     if filters.get("message_keywords"):
         message_conditions = []
         for keyword in filters["message_keywords"]:
@@ -2683,78 +2578,207 @@ def _filter_summaries_by_query(
             query = query.filter(or_(*message_conditions))
             print(f"--- [DEBUG] 應用 message 關鍵字過濾: {filters['message_keywords']} ---")
     
-    # [簡化] 如果沒有日期過濾條件，返回空列表（只做日期過濾）
-    if not filters.get("date_filter"):
-        print(f"--- [DEBUG] 沒有日期過濾條件，返回空列表（只做日期過濾） ---")
-        return []
-    
-    # [修改] 查詢時也包含 video 欄位，用於區分不同影片的相同 segment 和 time_range
-    # 返回所有記錄，包括重複的 (video, segment, time_range) 組合
-    query_with_video = db.query(Summary.video, Summary.segment, Summary.time_range).filter(
-        Summary.message.isnot(None),
-        Summary.message != ""
-    )
-    
-    # 應用相同的過濾條件
-    if filters.get("date_filter"):
-        target_date = filters["date_filter"]
-        query_with_video = query_with_video.filter(
-            func.date(Summary.updated_at) == target_date
-        )
-    
-    if filters.get("location_keywords"):
-        location_conditions = []
-        for keyword in filters["location_keywords"]:
-            location_conditions.append(
-                or_(
-                    Summary.location.ilike(f"%{keyword}%"),
-                    Summary.message.ilike(f"%{keyword}%")
-                )
-            )
-        if location_conditions:
-            query_with_video = query_with_video.filter(or_(*location_conditions))
-    
-    if filters.get("event_types"):
-        event_conditions = []
-        for event_type in filters["event_types"]:
-            if event_type == "fire":
-                event_conditions.append(Summary.fire == True)
-            elif event_type == "water_flood":
-                event_conditions.append(Summary.water_flood == True)
-            elif event_type == "abnormal_attire_face_cover_at_entry":
-                event_conditions.append(Summary.abnormal_attire_face_cover_at_entry == True)
-            elif event_type == "person_fallen_unmoving":
-                event_conditions.append(Summary.person_fallen_unmoving == True)
-            elif event_type == "double_parking_lane_block":
-                event_conditions.append(Summary.double_parking_lane_block == True)
-            elif event_type == "smoking_outside_zone":
-                event_conditions.append(Summary.smoking_outside_zone == True)
-            elif event_type == "crowd_loitering":
-                event_conditions.append(Summary.crowd_loitering == True)
-            elif event_type == "security_door_tamper":
-                event_conditions.append(Summary.security_door_tamper == True)
-        if event_conditions:
-            query_with_video = query_with_video.filter(or_(*event_conditions))
-    
-    if filters.get("message_keywords"):
-        message_conditions = []
-        for keyword in filters["message_keywords"]:
-            message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
-        if message_conditions:
-            query_with_video = query_with_video.filter(or_(*message_conditions))
-    
-    # 執行查詢（返回所有記錄，包括重複的）
-    results = query_with_video.limit(limit).all()
+    # 執行查詢
+    results = query.limit(limit).all()
     print(f"--- [DEBUG] PostgreSQL 查詢返回 {len(results)} 筆原始結果 ---")
     
-    # [修改] 返回 (video, segment, time_range) 三元組，包括所有記錄（不唯一化）
-    filtered_triples = [
-        (video, seg, tr) for video, seg, tr in results
-        if seg is not None and tr is not None
-    ]
+    # 構建 Dict[segment_uid] -> sql_payload
+    sql_results = {}
+    for row in results:
+        start_ts, video, segment, time_range, event_reason, message = row
+        
+        # 生成 segment_uid
+        video_str = str(video) if video else ""
+        segment_str = str(segment) if segment else ""
+        time_range_str = str(time_range) if time_range else ""
+        segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
+        
+        # 構建 sql_payload
+        sql_results[segment_uid] = {
+            "start_timestamp": start_ts,
+            "video": video_str,
+            "segment": segment_str,
+            "time_range": time_range_str,
+            "event_reason": str(event_reason) if event_reason else "",
+            "message": str(message) if message else ""
+        }
     
-    print(f"--- [DEBUG] 過濾後的有效結果: {len(filtered_triples)} 筆（包含所有記錄，不唯一化） ---")
-    return filtered_triples
+    print(f"--- [DEBUG] 過濾後的有效結果: {len(sql_results)} 筆 ---")
+    return sql_results
+
+
+def _calculate_sql_score(
+    sql_data: Dict[str, Any],
+    query_filters: Dict[str, Any],
+    message_keywords: List[str]
+) -> float:
+    """
+    計算 SQL 結果的分數
+    
+    規則：
+    - 符合時間：+0.4
+    - 符合事件 boolean：+0.5
+    - summary / message 命中關鍵字：+0.1
+    """
+    score = 0.0
+    
+    # 符合時間：+0.4（如果有日期過濾，已經在 SQL 查詢中過濾了，所以這裡直接給分）
+    if query_filters.get("date_filter"):
+        score += 0.4
+    
+    # 符合事件 boolean：+0.5
+    # 注意：如果 query_filters 中有 event_types，且 sql_data 存在，
+    # 表示這個記錄已經通過了 SQL 的事件 boolean 過濾，所以直接給分
+    if query_filters.get("event_types"):
+        score += 0.5
+    
+    # summary / message 命中關鍵字：根據匹配程度給予不同分數
+    if message_keywords:
+        message = sql_data.get("message", "") or ""
+        event_reason = sql_data.get("event_reason", "") or ""
+        combined_text = f"{message} {event_reason}".lower()
+        
+        matched_keywords = []
+        for keyword in message_keywords:
+            keyword_lower = keyword.lower()
+            # 檢查關鍵字是否在文本中
+            if keyword_lower in combined_text:
+                matched_keywords.append(keyword)
+                # 精確匹配（完整關鍵字）：+0.4
+                score += 0.4
+            # 檢查關鍵字的部分是否在文本中（例如「黃色衣服」中的「黃色」）
+            elif len(keyword) >= 2:
+                # 對於多字關鍵字，檢查每個字是否在文本中
+                keyword_parts = [part for part in keyword_lower.split() if len(part) >= 2]
+                matched_parts = [part for part in keyword_parts if part in combined_text]
+                if matched_parts:
+                    matched_keywords.append(keyword)
+                    # 部分匹配：+0.1（每個匹配的部分）
+                    score += 0.1 * len(matched_parts)
+        
+        # 如果匹配到多個關鍵字，給予額外分數
+        if len(matched_keywords) > 1:
+            score += 0.15 * (len(matched_keywords) - 1)  # 每多一個關鍵字 +0.15
+        
+        # 如果完全沒有匹配到任何關鍵字，但有關鍵字要求，大幅減分
+        if len(matched_keywords) == 0 and len(message_keywords) > 0:
+            score -= 0.2
+    
+    return score
+
+
+def _merge_and_rank_results(
+    vector_hits: List[Dict[str, Any]],
+    sql_results: Dict[str, Dict[str, Any]],
+    query_filters: Dict[str, Any],
+    message_keywords: List[str]
+) -> List[Dict[str, Any]]:
+    """
+    融合排序：合併 Vector 和 SQL 的結果
+    
+    保留三類結果：
+    1. 只在 SQL 命中
+    2. 只在 Vector 命中（但如果有日期過濾，則不保留）
+    3. 兩邊都命中（加分）
+    
+    最終排序規則：
+    final_score = 0.65 * vector_score + 0.35 * sql_score + 0.15 bonus if in_both
+    """
+    merged = {}
+    has_date_filter = bool(query_filters.get("date_filter"))
+    
+    # 處理 Vector 結果
+    for vector_hit in vector_hits:
+        metadata = vector_hit.get("metadata", {})
+        video = metadata.get("video", "")
+        segment = metadata.get("segment", "")
+        time_range = metadata.get("time_range", "")
+        
+        # 生成 segment_uid（與 SQL 一致）
+        video_str = str(video) if video else ""
+        segment_str = str(segment) if segment else ""
+        time_range_str = str(time_range) if time_range else ""
+        segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
+        
+        vector_score = float(vector_hit.get("score", 0.0))
+        
+        # [NEW] 檢查 Vector 結果中是否包含關鍵字，如果有則提高分數
+        if message_keywords:
+            summary = str(metadata.get("summary", "")).lower()
+            message = str(metadata.get("message", "")).lower()
+            combined_text = f"{summary} {message}".lower()
+            
+            keyword_match_bonus = 0.0
+            matched_count = 0
+            
+            for keyword in message_keywords:
+                keyword_lower = keyword.lower()
+                # 精確匹配（完整關鍵字）
+                if keyword_lower in combined_text:
+                    keyword_match_bonus += 0.3  # 每個精確匹配 +0.3
+                    matched_count += 1
+                # 部分匹配（例如「黃色衣服」中的「黃色」）
+                elif len(keyword) >= 2:
+                    keyword_parts = [part for part in keyword_lower.split() if len(part) >= 2]
+                    matched_parts = [part for part in keyword_parts if part in combined_text]
+                    if matched_parts:
+                        keyword_match_bonus += 0.15 * len(matched_parts)  # 每個部分匹配 +0.15
+                        matched_count += 1
+            
+            # 如果匹配到多個關鍵字，給予額外分數
+            if matched_count > 1:
+                keyword_match_bonus += 0.2 * (matched_count - 1)
+            
+            # 將關鍵字匹配分數加到 vector_score
+            vector_score = min(1.0, vector_score + keyword_match_bonus)  # 限制在 1.0 以內
+        
+        # 檢查是否也在 SQL 結果中
+        sql_data = sql_results.get(segment_uid)
+        if sql_data:
+            # 兩邊都命中：計算 SQL 分數並加分
+            sql_score = _calculate_sql_score(sql_data, query_filters, message_keywords)
+            final_score = 0.65 * vector_score + 0.35 * sql_score + 0.15  # bonus for in_both
+            in_both = True
+        else:
+            # 只在 Vector 命中
+            # [FIX] 如果有日期過濾，則不保留只在 Vector 命中的結果（因為它們不符合日期條件）
+            if has_date_filter:
+                continue  # 跳過不符合日期條件的 Vector 結果
+            
+            sql_score = 0.0
+            final_score = 0.65 * vector_score + 0.35 * sql_score
+            in_both = False
+        
+        merged[segment_uid] = {
+            "segment_uid": segment_uid,
+            "vector_score": vector_score,
+            "sql_score": sql_score,
+            "final_score": final_score,
+            "in_both": in_both,
+            "vector_hit": vector_hit,
+            "sql_data": sql_data
+        }
+    
+    # 處理只在 SQL 命中的結果
+    for segment_uid, sql_data in sql_results.items():
+        if segment_uid not in merged:
+            # 只在 SQL 命中
+            sql_score = _calculate_sql_score(sql_data, query_filters, message_keywords)
+            final_score = 0.65 * 0.0 + 0.35 * sql_score  # vector_score = 0
+            merged[segment_uid] = {
+                "segment_uid": segment_uid,
+                "vector_score": 0.0,
+                "sql_score": sql_score,
+                "final_score": final_score,
+                "in_both": False,
+                "vector_hit": None,
+                "sql_data": sql_data
+            }
+    
+    # 按 final_score 排序
+    sorted_results = sorted(merged.values(), key=lambda x: x["final_score"], reverse=True)
+    
+    return sorted_results
 
 if __name__ == "__main__":
     import uvicorn
