@@ -1618,25 +1618,116 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
             # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
             if vector_hit:
                 m = vector_hit.get("metadata", {})
+                summary = m.get("summary", "")
+                video = m.get("video", "")
+                segment = m.get("segment", "")
+                time_range = m.get("time_range", "")
+                
+                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
+                if (not video or not segment) and summary:
+                    meta_path = Path(RAG_DIR) / "meta.jsonl"
+                    if meta_path.exists():
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        data = json.loads(line.strip())
+                                        meta_summary = data.get("metadata", {}).get("summary", "")
+                                        # 精確匹配 summary
+                                        if meta_summary == summary:
+                                            content = data.get("content", "")
+                                            # 從 content 中解析影片路徑和片段
+                                            import re
+                                            # 解析 "影片：/segment/xxx" 或 "影片：segment/xxx"
+                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
+                                            # 解析 "片段：segment_xxx.xxx（..."
+                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
+                                            
+                                            if video_match:
+                                                found_video = video_match.group(1)
+                                                if not found_video.startswith("/"):
+                                                    found_video = f"/{found_video}"
+                                                if not video:
+                                                    video = found_video
+                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 video: {video} ---")
+                                            
+                                            if segment_match:
+                                                found_segment = segment_match.group(1).strip()
+                                                if not segment:
+                                                    segment = found_segment
+                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
+                                            
+                                            # 如果找到了，就跳出循環
+                                            if video and segment:
+                                                break
+                                    except json.JSONDecodeError:
+                                        continue
+                        except Exception as e:
+                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
+                
                 norm_hits.append({
                     "score": round(r["final_score"], 4),
-                    "video": m.get("video"),
-                    "segment": m.get("segment"),
-                    "time_range": m.get("time_range"),
+                    "video": video,
+                    "segment": segment,
+                    "time_range": time_range,
                     "events_true": m.get("events_true", []),
-                    "summary": m.get("summary", ""),
+                    "summary": summary,
                     "reason": m.get("reason", ""),
                     "doc_id": vector_hit.get("id"),
                 })
             elif sql_data:
                 # 只在 SQL 命中的結果
+                summary = sql_data.get("message", "")
+                video = sql_data.get("video", "")
+                segment = sql_data.get("segment", "")
+                time_range = sql_data.get("time_range", "")
+                
+                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
+                if (not video or not segment) and summary:
+                    meta_path = Path(RAG_DIR) / "meta.jsonl"
+                    if meta_path.exists():
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        data = json.loads(line.strip())
+                                        meta_summary = data.get("metadata", {}).get("summary", "")
+                                        # 精確匹配 summary
+                                        if meta_summary == summary:
+                                            content = data.get("content", "")
+                                            # 從 content 中解析影片路徑和片段
+                                            import re
+                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
+                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
+                                            
+                                            if video_match:
+                                                found_video = video_match.group(1)
+                                                if not found_video.startswith("/"):
+                                                    found_video = f"/{found_video}"
+                                                if not video:
+                                                    video = found_video
+                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 video: {video} ---")
+                                            
+                                            if segment_match:
+                                                found_segment = segment_match.group(1).strip()
+                                                if not segment:
+                                                    segment = found_segment
+                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
+                                            
+                                            if video and segment:
+                                                break
+                                    except json.JSONDecodeError:
+                                        continue
+                        except Exception as e:
+                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
+                
                 norm_hits.append({
                     "score": round(r["final_score"], 4),
-                    "video": sql_data.get("video"),
-                    "segment": sql_data.get("segment"),
-                    "time_range": sql_data.get("time_range"),
+                    "video": video,
+                    "segment": segment,
+                    "time_range": time_range,
                     "events_true": [],
-                    "summary": sql_data.get("message", ""),
+                    "summary": summary,
                     "reason": sql_data.get("event_reason", ""),
                     "doc_id": None,
                 })
@@ -2046,25 +2137,116 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
             # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
             if vector_hit:
                 m = vector_hit.get("metadata", {})
+                summary = m.get("summary", "")
+                video = m.get("video", "")
+                segment = m.get("segment", "")
+                time_range = m.get("time_range", "")
+                
+                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
+                if (not video or not segment) and summary:
+                    meta_path = Path(RAG_DIR) / "meta.jsonl"
+                    if meta_path.exists():
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        data = json.loads(line.strip())
+                                        meta_summary = data.get("metadata", {}).get("summary", "")
+                                        # 精確匹配 summary
+                                        if meta_summary == summary:
+                                            content = data.get("content", "")
+                                            # 從 content 中解析影片路徑和片段
+                                            import re
+                                            # 解析 "影片：/segment/xxx" 或 "影片：segment/xxx"
+                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
+                                            # 解析 "片段：segment_xxx.xxx（..."
+                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
+                                            
+                                            if video_match:
+                                                found_video = video_match.group(1)
+                                                if not found_video.startswith("/"):
+                                                    found_video = f"/{found_video}"
+                                                if not video:
+                                                    video = found_video
+                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 video: {video} ---")
+                                            
+                                            if segment_match:
+                                                found_segment = segment_match.group(1).strip()
+                                                if not segment:
+                                                    segment = found_segment
+                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
+                                            
+                                            # 如果找到了，就跳出循環
+                                            if video and segment:
+                                                break
+                                    except json.JSONDecodeError:
+                                        continue
+                        except Exception as e:
+                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
+                
                 norm_hits.append({
                     "score": round(r["final_score"], 4),
-                    "video": m.get("video"),
-                    "segment": m.get("segment"),
-                    "time_range": m.get("time_range"),
+                    "video": video,
+                    "segment": segment,
+                    "time_range": time_range,
                     "events_true": m.get("events_true", []),
-                    "summary": m.get("summary", ""),
+                    "summary": summary,
                     "reason": m.get("reason", ""),
                     "doc_id": vector_hit.get("id"),
                 })
             elif sql_data:
                 # 只在 SQL 命中的結果
+                summary = sql_data.get("message", "")
+                video = sql_data.get("video", "")
+                segment = sql_data.get("segment", "")
+                time_range = sql_data.get("time_range", "")
+                
+                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
+                if (not video or not segment) and summary:
+                    meta_path = Path(RAG_DIR) / "meta.jsonl"
+                    if meta_path.exists():
+                        try:
+                            with open(meta_path, "r", encoding="utf-8") as f:
+                                for line in f:
+                                    try:
+                                        data = json.loads(line.strip())
+                                        meta_summary = data.get("metadata", {}).get("summary", "")
+                                        # 精確匹配 summary
+                                        if meta_summary == summary:
+                                            content = data.get("content", "")
+                                            # 從 content 中解析影片路徑和片段
+                                            import re
+                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
+                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
+                                            
+                                            if video_match:
+                                                found_video = video_match.group(1)
+                                                if not found_video.startswith("/"):
+                                                    found_video = f"/{found_video}"
+                                                if not video:
+                                                    video = found_video
+                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 video: {video} ---")
+                                            
+                                            if segment_match:
+                                                found_segment = segment_match.group(1).strip()
+                                                if not segment:
+                                                    segment = found_segment
+                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
+                                            
+                                            if video and segment:
+                                                break
+                                    except json.JSONDecodeError:
+                                        continue
+                        except Exception as e:
+                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
+                
                 norm_hits.append({
                     "score": round(r["final_score"], 4),
-                    "video": sql_data.get("video"),
-                    "segment": sql_data.get("segment"),
-                    "time_range": sql_data.get("time_range"),
+                    "video": video,
+                    "segment": segment,
+                    "time_range": time_range,
                     "events_true": [],
-                    "summary": sql_data.get("message", ""),
+                    "summary": summary,
                     "reason": sql_data.get("event_reason", ""),
                     "doc_id": None,
                 })
