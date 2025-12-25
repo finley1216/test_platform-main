@@ -20,6 +20,45 @@ services:
               count: all
               capabilities: [gpu]
 
+  # PostgreSQL Database
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    ports:
+      - "5432:5432"
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # pgAdmin - PostgreSQL 圖形化管理工具
+  pgadmin:
+    image: dpage/pgadmin4:latest
+    restart: unless-stopped
+    environment:
+      - PGADMIN_DEFAULT_EMAIL=admin@admin.com
+      - PGADMIN_DEFAULT_PASSWORD=admin
+      - PGADMIN_CONFIG_SERVER_MODE=False
+      - PGADMIN_CONFIG_MASTER_PASSWORD_REQUIRED=False
+    volumes:
+      - pgadmin_data:/var/lib/pgadmin
+    ports:
+      - "5050:80"
+    networks:
+      - app-network
+    depends_on:
+      postgres:
+        condition: service_healthy
+
   # OWL API Service
   owl-api:
     build:
@@ -72,6 +111,11 @@ services:
       - OWL_API_BASE=http://owl-api:18001
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=postgres
+      - POSTGRES_HOST=postgres
+      - POSTGRES_PORT=5432
     volumes:
       - ./backend/src:/app/src:delegated
       - ./backend/segment:/app/segment
@@ -86,8 +130,12 @@ services:
     networks:
       - app-network
     depends_on:
-      - ollama
-      - owl-api
+      postgres:
+        condition: service_healthy
+      ollama:
+        condition: service_started
+      owl-api:
+        condition: service_started
 
   frontend:
     build:
@@ -119,4 +167,6 @@ networks:
 volumes:
   node_modules_data:
   ollama_data:
+  postgres_data:
+  pgadmin_data:
 
