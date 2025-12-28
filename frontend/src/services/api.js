@@ -119,7 +119,7 @@ class ApiService {
   }
 
   async searchRAG(query, topK, threshold, apiKey) {
-    return this.request("/rag/search", {
+    const data = await this.request("/rag/search", {
       method: "POST",
       body: {
         query,
@@ -128,10 +128,27 @@ class ApiService {
       },
       apiKey,
     });
+    
+    // [NEW] 在控制台輸出日期解析資訊
+    if (data.date_parsed) {
+      const dp = data.date_parsed;
+      console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
+      console.log("%c[日期解析] 查詢: " + query, "color: #60a5fa; font-weight: bold");
+      console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
+      console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
+      if (dp.time_start) {
+        const start = dp.time_start.substring(0, 19);
+        const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
+        console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+      }
+      console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
+    }
+    
+    return data;
   }
 
   async answerRAG(query, topK, threshold, apiKey) {
-    return this.request("/rag/answer", {
+    const data = await this.request("/rag/answer", {
       method: "POST",
       body: {
         query,
@@ -140,6 +157,23 @@ class ApiService {
       },
       apiKey,
     });
+    
+    // [NEW] 在控制台輸出日期解析資訊
+    if (data.date_parsed) {
+      const dp = data.date_parsed;
+      console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
+      console.log("%c[日期解析] 查詢: " + query, "color: #60a5fa; font-weight: bold");
+      console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
+      console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
+      if (dp.time_start) {
+        const start = dp.time_start.substring(0, 19);
+        const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
+        console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+      }
+      console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
+    }
+    
+    return data;
   }
 
   async downloadFile(path, filename, apiKey) {

@@ -9,4 +9,6 @@ google-generativeai==0.3.1
 faiss-cpu==1.7.4
 pydantic==2.5.0
 python-multipart==0.0.6
+pyyaml==6.0.1  # MCP 配置檔案支援
+# date-extractor==0.7.0  # 暫時註解：網路問題時無法安裝，前兩個優先級（相對日期和 MMDD）已足夠
 

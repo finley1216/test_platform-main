@@ -1541,10 +1541,39 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         # 步驟 1: 解析查詢條件
         query_filters = {}
         sql_results = {}
+        date_info = None  # 用於返回日期解析資訊
         
         if HAS_DB and db:
             try:
                 query_filters = _parse_query_filters(query)
+                
+                # [NEW] 提取日期解析資訊，用於返回給前端
+                if query_filters.get("date_filter") or query_filters.get("time_start"):
+                    date_filter = query_filters.get("date_filter")
+                    # 處理 date_filter（可能是 date 對象或字串）
+                    if date_filter:
+                        if hasattr(date_filter, 'isoformat'):
+                            picked_date_str = date_filter.isoformat()
+                        else:
+                            picked_date_str = str(date_filter)
+                    else:
+                        picked_date_str = None
+                    
+                    date_info = {
+                        "mode": query_filters.get("date_mode", "NONE"),
+                        "picked_date": picked_date_str,
+                        "time_start": query_filters.get("time_start"),
+                        "time_end": query_filters.get("time_end"),
+                    }
+                    # 在控制台輸出明顯的日期解析資訊
+                    print(f"\n{'='*60}")
+                    print(f"[日期解析] 查詢: {query}")
+                    print(f"[日期解析] 模式: {date_info['mode']}")
+                    print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
+                    if date_info['time_start']:
+                        print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
+                    print(f"{'='*60}\n")
+                
                 # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
                 sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
                 print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
@@ -1734,7 +1763,11 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         
         print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
         
-        return {"backend": store.embed_model, "hits": norm_hits}
+        # [NEW] 在響應中包含日期解析資訊
+        response = {"backend": store.embed_model, "hits": norm_hits}
+        if date_info:
+            response["date_parsed"] = date_info
+        return response
 
         # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
         if has_date_filter:
@@ -2029,7 +2062,11 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         
         print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
 
-        return {"backend": store.embed_model, "hits": norm_hits}
+        # [NEW] 在響應中包含日期解析資訊
+        response = {"backend": store.embed_model, "hits": norm_hits}
+        if date_info:
+            response["date_parsed"] = date_info
+        return response
 
     except Exception as e:
         print(f"--- [RAG Search Error] ---")
@@ -2060,10 +2097,39 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         # 步驟 1: 解析查詢條件（與 /rag/search 統一）
         query_filters = {}
         sql_results = {}
+        date_info = None  # 用於返回日期解析資訊
         
         if HAS_DB and db:
             try:
                 query_filters = _parse_query_filters(question)
+                
+                # [NEW] 提取日期解析資訊，用於返回給前端
+                if query_filters.get("date_filter") or query_filters.get("time_start"):
+                    date_filter = query_filters.get("date_filter")
+                    # 處理 date_filter（可能是 date 對象或字串）
+                    if date_filter:
+                        if hasattr(date_filter, 'isoformat'):
+                            picked_date_str = date_filter.isoformat()
+                        else:
+                            picked_date_str = str(date_filter)
+                    else:
+                        picked_date_str = None
+                    
+                    date_info = {
+                        "mode": query_filters.get("date_mode", "NONE"),
+                        "picked_date": picked_date_str,
+                        "time_start": query_filters.get("time_start"),
+                        "time_end": query_filters.get("time_end"),
+                    }
+                    # 在控制台輸出明顯的日期解析資訊
+                    print(f"\n{'='*60}")
+                    print(f"[日期解析] 查詢: {question}")
+                    print(f"[日期解析] 模式: {date_info['mode']}")
+                    print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
+                    if date_info['time_start']:
+                        print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
+                    print(f"{'='*60}\n")
+                
                 # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
                 sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
                 print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
@@ -2325,11 +2391,15 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 answer += f"[{i}] 影片: {hit.get('video', 'N/A')}  時間: {hit.get('time_range', 'N/A')}\n"
                 answer += f"    摘要: {hit.get('summary', 'N/A')[:100]}...\n\n"
 
-        return {
+        # [NEW] 在響應中包含日期解析資訊
+        response = {
             "backend": {"embed_model": store.embed_model, "llm": llm_model},
             "hits": norm_hits,
             "answer": answer,
         }
+        if date_info:
+            response["date_parsed"] = date_info
+        return response
 
     except Exception as e:
         print(f"--- [RAG Answer Error] ---")
@@ -2508,20 +2578,56 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
 def _parse_query_filters(question: str) -> Dict[str, Any]:
     """
     從用戶問題中解析出過濾條件：
-    - 日期/時間（如 "1219" -> 2025-12-19, "給我 1219 的影片" -> 2025-12-19）
+    - 日期/時間（支援多種格式：今天/昨天/本週/MMDD/YYYYMMDD/自然語言日期）
     - 地點（如 "路口" -> location 欄位）
     - 事件類型（如 "火災"、"水災"、"闖入"）
     
     返回一個字典，包含：
-    - date_filter: Optional[date] - 日期過濾
+    - date_filter: Optional[date] - 日期過濾（向後兼容）
+    - time_start: Optional[datetime] - 開始時間（ISO 字串）
+    - time_end: Optional[datetime] - 結束時間（ISO 字串）
+    - date_mode: str - 日期解析模式
     - location_keywords: List[str] - 地點關鍵字
     - event_types: List[str] - 事件類型（對應到資料庫欄位）
     """
+    # [NEW] 使用 MCP 客戶端進行日期解析
+    from mcp_client import parse_date_via_mcp
+    
     filters = {
         "date_filter": None,
+        "time_start": None,
+        "time_end": None,
+        "date_mode": "NONE",
         "location_keywords": [],
         "event_types": [],
     }
+    
+    # [NEW] 通過 MCP 調用日期解析工具
+    try:
+        date_result = parse_date_via_mcp(question)
+    except Exception as e:
+        print(f"--- [WARNING] MCP 日期解析失敗，回退到直接調用: {e} ---")
+        # 回退到直接調用
+        try:
+            from mcp.tools.parse_time import parse_query_time_window
+        except ImportError:
+            from src.mcp.tools.parse_time import parse_query_time_window
+        date_result = parse_query_time_window(question)
+    
+    # 處理 date_filter（可能是字串或 date 對象）
+    if date_result.get("date_filter"):
+        date_filter_value = date_result["date_filter"]
+        # 如果是字串，轉換為 date 對象
+        if isinstance(date_filter_value, str):
+            from datetime import date as date_type
+            filters["date_filter"] = date_type.fromisoformat(date_filter_value)
+        else:
+            filters["date_filter"] = date_filter_value
+        
+        filters["time_start"] = date_result.get("time_start")
+        filters["time_end"] = date_result.get("time_end")
+        filters["date_mode"] = date_result.get("mode", "NONE")
+        print(f"--- [DEBUG] 日期解析成功 (模式: {date_result.get('mode', 'NONE')}): {filters['date_filter']} ({date_result.get('time_start', '')} ~ {date_result.get('time_end', '')}) ---")
     
     # 事件類型映射（中文 -> 資料庫欄位）
     event_mapping = {
@@ -2546,37 +2652,6 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         "聚眾": "crowd_loitering",
         "逗留": "crowd_loitering",
     }
-    
-    # 解析日期（格式：MMDD 或 YYYYMMDD）
-    # [FIX] 改進日期解析，支援 "給我 1219 的影片"、"給我 1220 的影片" 這種格式
-    date_patterns = [
-        r'(\d{4})(\d{2})(\d{2})',  # YYYYMMDD
-        r'(\d{2})(\d{2})',          # MMDD (例如 1219, 1220)
-    ]
-    
-    for pattern in date_patterns:
-        matches = list(re.finditer(pattern, question))
-        for match in matches:
-            if len(match.groups()) == 3:  # YYYYMMDD
-                year, month, day = match.groups()
-                try:
-                    filters["date_filter"] = date(int(year), int(month), int(day))
-                    print(f"--- [DEBUG] 解析到日期 (YYYYMMDD): {filters['date_filter']} ---")
-                    break
-                except ValueError:
-                    continue
-            elif len(match.groups()) == 2:  # MMDD
-                month, day = match.groups()
-                try:
-                    # 假設是當前年份
-                    current_year = datetime.now().year
-                    filters["date_filter"] = date(current_year, int(month), int(day))
-                    print(f"--- [DEBUG] 解析到日期 (MMDD): {filters['date_filter']} (年份: {current_year}) ---")
-                    break
-                except ValueError:
-                    continue
-        if filters["date_filter"]:
-            break
     
     # [NEW] message 關鍵字過濾：如果查詢中包含事件相關關鍵字，也在 message 中搜尋
     # 這可以幫助找到 message 中提到相關事件的記錄（例如：火災、倒地、群聚等）
@@ -2694,8 +2769,53 @@ def _filter_summaries_by_query(
         Summary.message != ""
     )
     
-    # [關鍵] 日期過濾 - 使用 start_timestamp 做 range filter
-    if filters.get("date_filter"):
+    # [關鍵] 日期/時間範圍過濾 - 使用 start_timestamp 做 range filter
+    # 優先使用 time_start/time_end（支援週範圍等），否則使用 date_filter（向後兼容）
+    if filters.get("time_start") and filters.get("time_end"):
+        # 使用新的時間範圍過濾（支援相對日期、週範圍等）
+        try:
+            # 解析 ISO 格式的時間字串
+            time_start_str = filters["time_start"]
+            time_end_str = filters["time_end"]
+            
+            # 處理 ISO 格式（可能包含時區資訊）
+            if "T" in time_start_str:
+                t0 = datetime.fromisoformat(time_start_str.replace("Z", "+00:00"))
+            else:
+                # 如果只是日期，加上時間部分
+                t0 = datetime.fromisoformat(time_start_str)
+            
+            if "T" in time_end_str:
+                t1 = datetime.fromisoformat(time_end_str.replace("Z", "+00:00"))
+            else:
+                t1 = datetime.fromisoformat(time_end_str)
+            
+            # 轉換為 naive datetime（資料庫存的是 naive datetime）
+            if t0.tzinfo:
+                t0 = t0.astimezone().replace(tzinfo=None)
+            if t1.tzinfo:
+                t1 = t1.astimezone().replace(tzinfo=None)
+            
+            query = query.filter(
+                Summary.start_timestamp >= t0,
+                Summary.start_timestamp < t1
+            )
+            print(f"--- [DEBUG] 應用時間範圍過濾 (模式: {filters.get('date_mode', 'UNKNOWN')}): {t0} ~ {t1} ---")
+        except Exception as e:
+            print(f"--- [WARNING] 時間範圍解析失敗: {e}，回退到 date_filter ---")
+            # 回退到 date_filter
+            if filters.get("date_filter"):
+                target_date = filters["date_filter"]
+                t0 = datetime.combine(target_date, datetime.min.time())
+                next_day = target_date + timedelta(days=1)
+                t1 = datetime.combine(next_day, datetime.min.time())
+                query = query.filter(
+                    Summary.start_timestamp >= t0,
+                    Summary.start_timestamp < t1
+                )
+                print(f"--- [DEBUG] 應用日期過濾 (回退): {target_date} ({t0} ~ {t1}) ---")
+    elif filters.get("date_filter"):
+        # 向後兼容：使用單一日期過濾
         target_date = filters["date_filter"]
         # 計算時間範圍：從當天 00:00:00 到次日 00:00:00
         t0 = datetime.combine(target_date, datetime.min.time())

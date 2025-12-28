@@ -1,0 +1,27 @@
+# MCP 服務器配置檔案
+
+# 時區設定
+timezone: "Asia/Taipei"
+
+# 預設年份策略（當解析 MMDD 格式時）
+default_year_strategy: "current"  # "current" 或 "previous" 或 "next"
+
+# 日誌等級
+log_level: "INFO"  # DEBUG, INFO, WARNING, ERROR
+
+# 日期解析設定
+date_parser:
+  # 是否啟用 date-extractor fallback
+  enable_date_extractor: false
+  
+  # 年份範圍驗證（YYYYMMDD 格式）
+  year_range:
+    min: 2000
+    max: 2100
+
+# 服務器設定
+server:
+  name: "date-parser-mcp-server"
+  version: "1.0.0"
+  protocol_version: "2024-11-05"
+

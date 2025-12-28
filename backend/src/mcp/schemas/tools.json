@@ -1,0 +1,53 @@
+{
+  "tools": [
+    {
+      "name": "parse_date",
+      "description": "解析中文查詢中的日期時間範圍，支援相對日期（今天/昨天/本週）、MMDD格式（1220/12/20）、YYYYMMDD格式（20251220）等",
+      "inputSchema": {
+        "type": "object",
+        "properties": {
+          "query": {
+            "type": "string",
+            "description": "用戶查詢文字，例如：'給我今天的影片'、'給我 1220 的影片'、'給我 20251220 的影片'"
+          },
+          "timezone": {
+            "type": "string",
+            "description": "時區名稱（可選），默認為 'Asia/Taipei'",
+            "default": "Asia/Taipei"
+          }
+        },
+        "required": ["query"]
+      },
+      "outputSchema": {
+        "type": "object",
+        "properties": {
+          "mode": {
+            "type": "string",
+            "description": "解析模式：RELATIVE_TODAY, RELATIVE_YESTERDAY, MMDD_RULE, YYYYMMDD_RULE, DATE_EXTRACTOR, NONE"
+          },
+          "picked_date": {
+            "type": "string",
+            "format": "date",
+            "description": "解析到的日期（ISO 格式），如果無法解析則為 null"
+          },
+          "time_start": {
+            "type": "string",
+            "format": "date-time",
+            "description": "開始時間（ISO 格式），如果無法解析則為 null"
+          },
+          "time_end": {
+            "type": "string",
+            "format": "date-time",
+            "description": "結束時間（ISO 格式），如果無法解析則為 null"
+          },
+          "date_filter": {
+            "type": "string",
+            "format": "date",
+            "description": "日期過濾器（向後兼容），如果無法解析則為 null"
+          }
+        }
+      }
+    }
+  ]
+}
+
