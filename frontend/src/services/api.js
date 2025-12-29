@@ -1,9 +1,16 @@
-import { API_BASE } from "../utils/constants";
+import { getApiBaseUrl } from "../utils/constants";
 
 class ApiService {
   constructor() {
-    this.baseUrl = API_BASE;
+    // 在運行時動態獲取 API base URL
+    this.baseUrl = getApiBaseUrl();
     console.log("API Service initialized with base URL:", this.baseUrl);
+  }
+  
+  // 提供方法讓外部可以更新 base URL（如果需要）
+  updateBaseUrl() {
+    this.baseUrl = getApiBaseUrl();
+    console.log("API Service base URL updated to:", this.baseUrl);
   }
 
   async request(endpoint, options = {}) {

@@ -145,7 +145,8 @@ services:
       network: host
     restart: unless-stopped
     environment:
-      - REACT_APP_API_BASE=http://localhost:8080
+      # 不設置 REACT_APP_API_BASE，讓前端根據 hostname 自動選擇
+      # - REACT_APP_API_BASE=http://localhost:8080  # 已移除，改為自動檢測
       - WDS_SOCKET_HOST=localhost
       - WDS_SOCKET_PORT=3000
     volumes:
