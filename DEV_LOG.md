@@ -148,6 +148,71 @@ docker exec test_platform-main-backend-1 python3 /app/src/migrate_segments_to_db
 
 ## 開發日誌
 
+### 2025-12-29
+
+#### Backend
+- **資料庫架構重構：從 FAISS 遷移到 PostgreSQL + pgvector**
+  - 修改 `backend/src/models.py`：在 `Summary` 表中添加 `embedding` 欄位（Vector(384)）
+  - 修改 `backend/src/database.py`：添加 `ensure_pgvector_extension()` 函數，自動啟用 pgvector 擴展
+  - 更新 `docker-compose.yml`：PostgreSQL 服務改用 `ankane/pgvector:v0.5.0-pg15` 映像
+  - 執行資料庫遷移：為現有的 `summaries` 表添加 `embedding` 欄位
+
+- **搜索邏輯重寫：實現單一查詢混合搜尋（Single-query Hybrid Search）**
+  - 修改 `backend/src/main.py`：
+    - 移除 `_merge_and_rank_results` 和 `_calculate_sql_score` 函數（不再需要複雜的合併邏輯）
+    - 移除對 `RAGStore` (FAISS) 的所有呼叫
+    - 重寫 `rag_search` 和 `rag_answer`：使用 SQLAlchemy + pgvector 進行單一查詢混合搜尋
+    - 實現時間範圍硬篩選（`start_timestamp.between()`）+ 向量相似度排序（`embedding.cosine_distance()`）
+    - 使用 `SentenceTransformer` 模型（paraphrase-multilingual-MiniLM-L12-v2）生成查詢向量
+
+- **查詢功能增強：日期解析和關鍵字提取**
+  - 修改 `_parse_query_filters` 函數：
+    - 實現日期解析（支援相對日期、MMDD 格式、絕對日期）
+    - 實現關鍵字提取（從查詢中提取關鍵詞）
+    - 實現事件類型檢測（從查詢中識別事件類型）
+    - 生成「clean query」（去除日期相關詞彙後的查詢文本）用於 embedding 生成
+  - 回應格式更新：添加 `date_parsed`、`keywords_found`、`event_types_found`、`embedding_query` 欄位
+
+- **自動 Embedding 生成**
+  - 修改 `_save_results_to_postgres` 函數：新資料或更新資料時自動生成並保存 embedding
+  - 創建 `backend/src/generate_embeddings.py`：為現有資料補生成 embedding（處理 410 筆缺少 embedding 的記錄）
+  - 實現 GPU/CPU 自動檢測和回退機制：
+    - 自動檢測 GPU 可用性
+    - GPU 記憶體不足時自動回退到 CPU 模式
+    - 添加詳細的設備使用日誌
+
+- **依賴更新**
+  - 更新 `backend/requirements.txt`：
+    - 添加 `pgvector==0.3.0`、`psycopg2-binary==2.9.9`
+    - 標記 `faiss-cpu==1.7.4` 為 DEPRECATED（已註解）
+    - 更新 `sentence-transformers>=2.3.0,<3.0.0` 和 `huggingface-hub>=0.20.0,<0.37.0` 以確保兼容性
+  - 更新 `backend/Dockerfile`：在構建時預下載 embedding 模型，避免運行時網路問題
+
+- **標記舊代碼為 DEPRECATED**
+  - 修改 `backend/src/rag_store.py`：標記為 DEPRECATED，保留向後兼容性（允許模組載入但不使用）
+
+#### Frontend
+- **修復前端後端連接問題：實現動態 API base URL 檢測**
+  - 修改 `frontend/src/utils/constants.js`：根據訪問的 hostname 自動選擇對應的後端 API
+    - `localhost:3000` → `localhost:8080`
+    - `140.117.176.88:3000` → `140.117.176.88:8080`
+  - 修改 `frontend/src/services/api.js`：使用動態獲取的 API base URL，而非靜態值
+  - 修改 `frontend/Dockerfile`：移除 `REACT_APP_API_BASE` 環境變數，改為運行時動態檢測
+  - 添加詳細的調試日誌，方便排查 API 連接問題
+
+- **顯示查詢解析資訊**
+  - 修改 `frontend/src/services/api.js`：
+    - 在 `searchRAG` 和 `answerRAG` 函數中添加控制台輸出
+    - 顯示日期解析結果（模式、解析到的日期、時間範圍）
+    - 顯示提取的關鍵字和事件類型
+    - 顯示用於向量搜索的 clean query（embedding_query）
+  - 使用彩色控制台輸出，方便開發者查看查詢解析結果
+
+#### 備註
+- 已部署到 140.117.176.88
+- 所有端口已開放並可正常訪問
+- 前端現在會根據訪問的 hostname 自動選擇對應的後端 API，無需手動配置
+
 ### 2025-12-25
 
 #### Backend
