@@ -129,18 +129,45 @@ class ApiService {
       apiKey,
     });
     
-    // [NEW] 在控制台輸出日期解析資訊
-    if (data.date_parsed) {
-      const dp = data.date_parsed;
+    // [NEW] 在控制台輸出日期解析資訊、關鍵字資訊和 embedding 查詢資訊
+    if (data.date_parsed || data.keywords_found || data.event_types_found || data.embedding_query) {
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
-      console.log("%c[日期解析] 查詢: " + query, "color: #60a5fa; font-weight: bold");
-      console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
-      console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
-      if (dp.time_start) {
-        const start = dp.time_start.substring(0, 19);
-        const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
-        console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+      console.log("%c[查詢解析] 原始查詢: " + query, "color: #60a5fa; font-weight: bold");
+      
+      if (data.embedding_query) {
+        console.log("%c[向量搜索] Embedding 查詢文本: " + data.embedding_query, "color: #a78bfa; font-weight: bold");
+        console.log("%c[向量搜索] 說明: 此文本用於生成 embedding 向量進行語義搜索", "color: #a78bfa; font-size: 11px");
       }
+      
+      if (data.date_parsed) {
+        const dp = data.date_parsed;
+        console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
+        console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
+        if (dp.time_start) {
+          const start = dp.time_start.substring(0, 19);
+          const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
+          console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+        }
+      }
+      
+      if (data.keywords_found && data.keywords_found.length > 0) {
+        console.log("%c[關鍵字匹配] " + data.keywords_found.join(", "), "color: #34d399; font-weight: bold");
+      }
+      
+      if (data.event_types_found && data.event_types_found.length > 0) {
+        console.log("%c[事件類型] " + data.event_types_found.join(", "), "color: #fbbf24; font-weight: bold");
+      }
+      
+      if (data.hits && data.hits.length > 0) {
+        console.log("%c[搜索結果] 找到 " + data.hits.length + " 筆匹配記錄", "color: #10b981; font-weight: bold");
+        // 顯示前 3 筆的摘要片段
+        data.hits.slice(0, 3).forEach((hit, idx) => {
+          const summary = hit.summary || "";
+          const preview = summary.length > 50 ? summary.substring(0, 50) + "..." : summary;
+          console.log("%c  結果 " + (idx + 1) + ": " + preview, "color: #6b7280; font-size: 12px");
+        });
+      }
+      
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
     }
     
@@ -158,18 +185,45 @@ class ApiService {
       apiKey,
     });
     
-    // [NEW] 在控制台輸出日期解析資訊
-    if (data.date_parsed) {
-      const dp = data.date_parsed;
+    // [NEW] 在控制台輸出日期解析資訊、關鍵字資訊和 embedding 查詢資訊
+    if (data.date_parsed || data.keywords_found || data.event_types_found || data.embedding_query) {
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
-      console.log("%c[日期解析] 查詢: " + query, "color: #60a5fa; font-weight: bold");
-      console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
-      console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
-      if (dp.time_start) {
-        const start = dp.time_start.substring(0, 19);
-        const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
-        console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+      console.log("%c[查詢解析] 原始查詢: " + query, "color: #60a5fa; font-weight: bold");
+      
+      if (data.embedding_query) {
+        console.log("%c[向量搜索] Embedding 查詢文本: " + data.embedding_query, "color: #a78bfa; font-weight: bold");
+        console.log("%c[向量搜索] 說明: 此文本用於生成 embedding 向量進行語義搜索", "color: #a78bfa; font-size: 11px");
       }
+      
+      if (data.date_parsed) {
+        const dp = data.date_parsed;
+        console.log("%c[日期解析] 模式: " + dp.mode, "color: #60a5fa");
+        console.log("%c[日期解析] 解析到的日期: " + (dp.picked_date || "N/A"), "color: #60a5fa");
+        if (dp.time_start) {
+          const start = dp.time_start.substring(0, 19);
+          const end = dp.time_end ? dp.time_end.substring(0, 19) : "N/A";
+          console.log("%c[日期解析] 時間範圍: " + start + " ~ " + end, "color: #60a5fa");
+        }
+      }
+      
+      if (data.keywords_found && data.keywords_found.length > 0) {
+        console.log("%c[關鍵字匹配] " + data.keywords_found.join(", "), "color: #34d399; font-weight: bold");
+      }
+      
+      if (data.event_types_found && data.event_types_found.length > 0) {
+        console.log("%c[事件類型] " + data.event_types_found.join(", "), "color: #fbbf24; font-weight: bold");
+      }
+      
+      if (data.hits && data.hits.length > 0) {
+        console.log("%c[搜索結果] 找到 " + data.hits.length + " 筆匹配記錄", "color: #10b981; font-weight: bold");
+        // 顯示前 3 筆的摘要片段
+        data.hits.slice(0, 3).forEach((hit, idx) => {
+          const summary = hit.summary || "";
+          const preview = summary.length > 50 ? summary.substring(0, 50) + "..." : summary;
+          console.log("%c  結果 " + (idx + 1) + ": " + preview, "color: #6b7280; font-size: 12px");
+        });
+      }
+      
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
     }
     

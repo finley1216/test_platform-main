@@ -14,11 +14,26 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-from rag_store import RAGStore
+# [DEPRECATED] RAGStore 僅用於 /rag/answer 和 /rag/index，導入改為可選
+try:
+    from rag_store import RAGStore
+    HAS_RAG_STORE = True
+except ImportError:
+    HAS_RAG_STORE = False
+    RAGStore = None
+    print("--- [WARNING] RAGStore 不可用（faiss-cpu 未安裝），/rag/answer 和 /rag/index 可能無法使用 ---")
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
-from sqlalchemy import and_, or_, func
+from sqlalchemy import and_, or_, func, select
 from src.config import config
+
+# Import SentenceTransformer for embedding generation
+try:
+    from sentence_transformers import SentenceTransformer
+    HAS_SENTENCE_TRANSFORMER = True
+except ImportError:
+    HAS_SENTENCE_TRANSFORMER = False
+    print("--- [WARNING] sentence-transformers not installed, embedding search will not work ---")
 try:
     from src.database import get_db
     from src.models import Summary
@@ -53,6 +68,33 @@ GEMINI_API_KEY = config.GEMINI_API_KEY
 RAG_DIR = config.RAG_DIR
 RAG_INDEX_PATH = config.RAG_INDEX_PATH
 OLLAMA_EMBED_MODEL = config.OLLAMA_EMBED_MODEL
+
+# Initialize SentenceTransformer for embedding generation
+# Model: paraphrase-multilingual-MiniLM-L12-v2 (384 dimensions)
+_embedding_model = None
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+def get_embedding_model():
+    """Get or initialize the SentenceTransformer model (CPU mode only)"""
+    global _embedding_model
+    if _embedding_model is None and HAS_SENTENCE_TRANSFORMER:
+        try:
+            # 強制使用 CPU 模式，避免 GPU 資源競爭
+            import os
+            os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 隱藏 GPU，強制使用 CPU
+            # 嘗試使用本地緩存路徑
+            local_model_path = "/root/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/86741b4e3f5cb7765a600d3a3d55a0f6a6cb443d"
+            if os.path.exists(local_model_path) and os.path.exists(os.path.join(local_model_path, "modules.json")):
+                # 使用本地路徑載入
+                _embedding_model = SentenceTransformer(local_model_path, device='cpu')
+            else:
+                # 使用模型名稱載入（會嘗試從緩存讀取）
+                _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
+            print(f"✓ SentenceTransformer model loaded: {EMBEDDING_MODEL_NAME} (CPU Mode)")
+        except Exception as e:
+            print(f"⚠️  Failed to load SentenceTransformer model: {e}")
+            raise RuntimeError(f"無法載入 SentenceTransformer 模型: {e}")
+    return _embedding_model
 
 # Video library directory (歷史影片分類存放位置)
 VIDEO_LIB_DIR = config.VIDEO_LIB_DIR
@@ -1091,6 +1133,8 @@ async def rag_index(request: Request):
     target_video_id = docs[0]["metadata"]["video"]
     removed = _remove_old_rag_records(target_video_id)
 
+    if not HAS_RAG_STORE or RAGStore is None:
+        raise HTTPException(status_code=503, detail="RAGStore not available (faiss-cpu not installed)")
     store = RAGStore(store_dir=RAG_DIR)
     added = store.add_docs(docs)
 
@@ -1525,6 +1569,11 @@ async def move_video_to_category(video_id: str, request: Request):
 # 幫你找影片片段，但不負責解釋內容
 @app.post("/rag/search", tags=["RAG 相關 API"])
 async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+    """
+    使用 PostgreSQL + pgvector 進行混合搜索
+    - Filter 1 (Hard Filter): 時間範圍、事件類型、關鍵字過濾
+    - Filter 2 (Vector Search): 使用 embedding 的 cosine_distance 進行語義搜索
+    """
     try:
         payload = await request.json()
 
@@ -1538,236 +1587,255 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         if not query:
             raise HTTPException(status_code=422, detail="missing query")
 
+        if not HAS_DB or not db:
+            raise HTTPException(status_code=503, detail="Database not available")
+
         # 步驟 1: 解析查詢條件
         query_filters = {}
-        sql_results = {}
-        date_info = None  # 用於返回日期解析資訊
+        date_info = None
         
-        if HAS_DB and db:
-            try:
-                query_filters = _parse_query_filters(query)
-                
-                # [NEW] 提取日期解析資訊，用於返回給前端
-                if query_filters.get("date_filter") or query_filters.get("time_start"):
-                    date_filter = query_filters.get("date_filter")
-                    # 處理 date_filter（可能是 date 對象或字串）
-                    if date_filter:
-                        if hasattr(date_filter, 'isoformat'):
-                            picked_date_str = date_filter.isoformat()
-                        else:
-                            picked_date_str = str(date_filter)
+        try:
+            query_filters = _parse_query_filters(query)
+            
+            # 提取日期解析資訊，用於返回給前端
+            if query_filters.get("date_filter") or query_filters.get("time_start"):
+                date_filter = query_filters.get("date_filter")
+                if date_filter:
+                    if hasattr(date_filter, 'isoformat'):
+                        picked_date_str = date_filter.isoformat()
                     else:
-                        picked_date_str = None
-                    
-                    date_info = {
-                        "mode": query_filters.get("date_mode", "NONE"),
-                        "picked_date": picked_date_str,
-                        "time_start": query_filters.get("time_start"),
-                        "time_end": query_filters.get("time_end"),
-                    }
-                    # 在控制台輸出明顯的日期解析資訊
-                    print(f"\n{'='*60}")
-                    print(f"[日期解析] 查詢: {query}")
-                    print(f"[日期解析] 模式: {date_info['mode']}")
-                    print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
-                    if date_info['time_start']:
-                        print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
-                    print(f"{'='*60}\n")
+                        picked_date_str = str(date_filter)
+                else:
+                    picked_date_str = None
                 
-                # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
-                sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
-                print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
-            except Exception as e:
-                print(f"--- [WARNING] PostgreSQL 查詢失敗: {e} ---")
-                import traceback
-                traceback.print_exc()
-                query_filters = {}
-                sql_results = {}
+                date_info = {
+                    "mode": query_filters.get("date_mode", "NONE"),
+                    "picked_date": picked_date_str,
+                    "time_start": query_filters.get("time_start"),
+                    "time_end": query_filters.get("time_end"),
+                }
+                print(f"\n{'='*60}")
+                print(f"[日期解析] 查詢: {query}")
+                print(f"[日期解析] 模式: {date_info['mode']}")
+                print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
+                if date_info['time_start']:
+                    print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
+                print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"--- [WARNING] 查詢解析失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+            query_filters = {}
 
-        # 步驟 2: 對 query 做關鍵字擴展，多 query 搜索後取 union
-        expanded_queries = _expand_query_keywords(query)
-        print(f"--- [DEBUG] 關鍵字擴展後生成 {len(expanded_queries)} 個查詢: {expanded_queries} ---")
-        
-        # 步驟 3: 固定 vec_pool = 400~800，多 query 搜索後取 union
-        store = RAGStore(store_dir=RAG_DIR)
-        vec_pool = 600  # 固定向量候選池大小
-        
-        all_vector_hits = []
-        seen_segment_uids = set()
-        
-        for expanded_query in expanded_queries:
-            # 對每個擴展查詢進行搜索
-            vector_hits = store.search(expanded_query, top_k=vec_pool, filters={})
-            
-            # 合併結果（去重）
-            for hit in vector_hits:
-                metadata = hit.get("metadata", {})
-                video = metadata.get("video", "")
-                segment = metadata.get("segment", "")
-                time_range = metadata.get("time_range", "")
-                
-                # 生成 segment_uid
-                video_str = str(video) if video else ""
-                segment_str = str(segment) if segment else ""
-                time_range_str = str(time_range) if time_range else ""
-                segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
-                
-                if segment_uid not in seen_segment_uids:
-                    seen_segment_uids.add(segment_uid)
-                    all_vector_hits.append(hit)
-        
-        print(f"--- [DEBUG] Vector 搜索後合併得到 {len(all_vector_hits)} 筆結果 ---")
-        
-        # 步驟 4: 融合排序（保留三類結果：只在 SQL、只在 Vector、兩邊都命中）
-        message_keywords = query_filters.get("message_keywords", [])
-        merged_results = _merge_and_rank_results(
-            all_vector_hits,
-            sql_results,
-            query_filters,
-            message_keywords
-        )
-        
-        print(f"--- [DEBUG] 融合排序後得到 {len(merged_results)} 筆結果 ---")
-        
-        # 步驟 5: 過濾低於門檻的結果，然後取 top_k
-        filtered_results = [
-            r for r in merged_results
-            if r["final_score"] >= score_threshold
+        # 步驟 2: 生成查詢向量（去除日期後的 clean query）
+        # 從查詢中移除日期相關文字，保留語義查詢部分
+        clean_query = query
+        # 簡單的日期文字移除（可以根據需要改進）
+        date_patterns = [
+            r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',
+            r'\d{1,2}[-/]\d{1,2}',
+            r'今天|昨天|明天|本週|上週|下週',
+            r'\d{4}年\d{1,2}月\d{1,2}日',
         ]
+        for pattern in date_patterns:
+            clean_query = re.sub(pattern, '', clean_query)
+        clean_query = clean_query.strip()
         
-        # 排序後再取 top_k
-        final_results = filtered_results[:top_k]
+        # 如果 clean_query 為空，使用原始查詢
+        if not clean_query:
+            clean_query = query
+
+        # 生成 embedding
+        embedding_model = get_embedding_model()
+        if not embedding_model:
+            raise HTTPException(status_code=503, detail="Embedding model not available")
         
-        # 步驟 6: 格式化結果
-        norm_hits = []
-        for r in final_results:
-            vector_hit = r.get("vector_hit")
-            sql_data = r.get("sql_data")
+        query_embedding = embedding_model.encode(clean_query, normalize_embeddings=True)
+        print(f"--- [DEBUG] 查詢向量生成完成 (維度: {len(query_embedding)}) ---")
+
+        # 步驟 3: 構建 PostgreSQL + pgvector 混合查詢
+        # Filter 1: Hard filters (時間、事件、關鍵字)
+        stmt = select(Summary).filter(
+            Summary.message.isnot(None),
+            Summary.message != "",
+            Summary.embedding.isnot(None)  # 只查詢有 embedding 的記錄
+        )
+
+        # 時間範圍過濾（最高優先級）
+        if query_filters.get("time_start") and query_filters.get("time_end"):
+            try:
+                time_start_str = query_filters["time_start"]
+                time_end_str = query_filters["time_end"]
+                
+                if "T" in time_start_str:
+                    t0 = datetime.fromisoformat(time_start_str.replace("Z", "+00:00"))
+                else:
+                    t0 = datetime.fromisoformat(time_start_str)
+                
+                if "T" in time_end_str:
+                    t1 = datetime.fromisoformat(time_end_str.replace("Z", "+00:00"))
+                else:
+                    t1 = datetime.fromisoformat(time_end_str)
+                
+                if t0.tzinfo:
+                    t0 = t0.astimezone().replace(tzinfo=None)
+                if t1.tzinfo:
+                    t1 = t1.astimezone().replace(tzinfo=None)
+                
+                stmt = stmt.filter(
+                    Summary.start_timestamp >= t0,
+                    Summary.start_timestamp < t1
+                )
+                print(f"--- [DEBUG] 應用時間範圍過濾: {t0} ~ {t1} ---")
+            except Exception as e:
+                print(f"--- [WARNING] 時間範圍解析失敗: {e} ---")
+        elif query_filters.get("date_filter"):
+            target_date = query_filters["date_filter"]
+            t0 = datetime.combine(target_date, datetime.min.time())
+            next_day = target_date + timedelta(days=1)
+            t1 = datetime.combine(next_day, datetime.min.time())
+            stmt = stmt.filter(
+                Summary.start_timestamp >= t0,
+                Summary.start_timestamp < t1
+            )
+            print(f"--- [DEBUG] 應用日期過濾: {target_date} ({t0} ~ {t1}) ---")
+
+        # 事件類型過濾
+        if query_filters.get("event_types"):
+            event_conditions = []
+            for event_type in query_filters["event_types"]:
+                if event_type == "fire":
+                    event_conditions.append(Summary.fire == True)
+                elif event_type == "water_flood":
+                    event_conditions.append(Summary.water_flood == True)
+                elif event_type == "abnormal_attire_face_cover_at_entry":
+                    event_conditions.append(Summary.abnormal_attire_face_cover_at_entry == True)
+                elif event_type == "person_fallen_unmoving":
+                    event_conditions.append(Summary.person_fallen_unmoving == True)
+                elif event_type == "double_parking_lane_block":
+                    event_conditions.append(Summary.double_parking_lane_block == True)
+                elif event_type == "smoking_outside_zone":
+                    event_conditions.append(Summary.smoking_outside_zone == True)
+                elif event_type == "crowd_loitering":
+                    event_conditions.append(Summary.crowd_loitering == True)
+                elif event_type == "security_door_tamper":
+                    event_conditions.append(Summary.security_door_tamper == True)
             
-            # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
-            if vector_hit:
-                m = vector_hit.get("metadata", {})
-                summary = m.get("summary", "")
-                video = m.get("video", "")
-                segment = m.get("segment", "")
-                time_range = m.get("time_range", "")
-                
-                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
-                if (not video or not segment) and summary:
-                    meta_path = Path(RAG_DIR) / "meta.jsonl"
-                    if meta_path.exists():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        data = json.loads(line.strip())
-                                        meta_summary = data.get("metadata", {}).get("summary", "")
-                                        # 精確匹配 summary
-                                        if meta_summary == summary:
-                                            content = data.get("content", "")
-                                            # 從 content 中解析影片路徑和片段
-                                            import re
-                                            # 解析 "影片：/segment/xxx" 或 "影片：segment/xxx"
-                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
-                                            # 解析 "片段：segment_xxx.xxx（..."
-                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
-                                            
-                                            if video_match:
-                                                found_video = video_match.group(1)
-                                                if not found_video.startswith("/"):
-                                                    found_video = f"/{found_video}"
-                                                if not video:
-                                                    video = found_video
-                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 video: {video} ---")
-                                            
-                                            if segment_match:
-                                                found_segment = segment_match.group(1).strip()
-                                                if not segment:
-                                                    segment = found_segment
-                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
-                                            
-                                            # 如果找到了，就跳出循環
-                                            if video and segment:
-                                                break
-                                    except json.JSONDecodeError:
-                                        continue
-                        except Exception as e:
-                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
-                
-                norm_hits.append({
-                    "score": round(r["final_score"], 4),
-                    "video": video,
-                    "segment": segment,
-                    "time_range": time_range,
-                    "events_true": m.get("events_true", []),
-                    "summary": summary,
-                    "reason": m.get("reason", ""),
-                    "doc_id": vector_hit.get("id"),
-                })
-            elif sql_data:
-                # 只在 SQL 命中的結果
-                summary = sql_data.get("message", "")
-                video = sql_data.get("video", "")
-                segment = sql_data.get("segment", "")
-                time_range = sql_data.get("time_range", "")
-                
-                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
-                if (not video or not segment) and summary:
-                    meta_path = Path(RAG_DIR) / "meta.jsonl"
-                    if meta_path.exists():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        data = json.loads(line.strip())
-                                        meta_summary = data.get("metadata", {}).get("summary", "")
-                                        # 精確匹配 summary
-                                        if meta_summary == summary:
-                                            content = data.get("content", "")
-                                            # 從 content 中解析影片路徑和片段
-                                            import re
-                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
-                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
-                                            
-                                            if video_match:
-                                                found_video = video_match.group(1)
-                                                if not found_video.startswith("/"):
-                                                    found_video = f"/{found_video}"
-                                                if not video:
-                                                    video = found_video
-                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 video: {video} ---")
-                                            
-                                            if segment_match:
-                                                found_segment = segment_match.group(1).strip()
-                                                if not segment:
-                                                    segment = found_segment
-                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
-                                            
-                                            if video and segment:
-                                                break
-                                    except json.JSONDecodeError:
-                                        continue
-                        except Exception as e:
-                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
-                
-                norm_hits.append({
-                    "score": round(r["final_score"], 4),
-                    "video": video,
-                    "segment": segment,
-                    "time_range": time_range,
-                    "events_true": [],
-                    "summary": summary,
-                    "reason": sql_data.get("event_reason", ""),
-                    "doc_id": None,
-                })
-        
+            if event_conditions:
+                stmt = stmt.filter(or_(*event_conditions))
+                print(f"--- [DEBUG] 應用事件過濾: {query_filters['event_types']} ---")
+
+        # 關鍵字過濾
+        if query_filters.get("message_keywords"):
+            message_conditions = []
+            for keyword in query_filters["message_keywords"]:
+                message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
+            if message_conditions:
+                stmt = stmt.filter(or_(*message_conditions))
+                print(f"--- [DEBUG] 應用關鍵字過濾: {query_filters['message_keywords']} ---")
+
+        # Filter 2: Vector search - 使用 cosine_distance 排序
+        try:
+            from pgvector.sqlalchemy import Vector
+            # 計算 cosine_distance 並作為分數欄位
+            # cosine_distance 範圍是 [0, 2]，我們需要轉換為相似度分數 [0, 1]
+            # cosine_similarity = 1 - cosine_distance
+            # 但為了讓分數在 [0, 1] 範圍內，我們使用: score = 1 - (distance / 2)
+            distance_expr = Summary.embedding.cosine_distance(query_embedding)
+            
+            # 選擇需要的欄位，並計算距離
+            stmt = stmt.add_columns(
+                distance_expr.label('cosine_distance')
+            ).order_by(
+                distance_expr
+            ).limit(top_k * 3)  # 多取一些，後續可以根據分數過濾
+            
+            print(f"--- [DEBUG] 執行 PostgreSQL + pgvector 混合查詢 ---")
+            results = db.execute(stmt).all()
+            print(f"--- [DEBUG] 查詢返回 {len(results)} 筆結果 ---")
+        except ImportError:
+            raise HTTPException(status_code=503, detail="pgvector not available")
+        except Exception as e:
+            print(f"--- [ERROR] pgvector 查詢失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+            results = []
+
+        # 步驟 4: 計算相似度分數並格式化結果
+        norm_hits = []
+        for row in results:
+            result = row[0]  # Summary 對象
+            cosine_distance = row[1]  # cosine_distance 值
+            
+            # 將 cosine_distance 轉換為相似度分數
+            # cosine_distance 範圍: [0, 2]
+            # cosine_similarity 範圍: [-1, 1]
+            # 我們使用: score = 1 - (distance / 2) 來將距離轉換為 [0, 1] 範圍的分數
+            score = max(0.0, min(1.0, 1.0 - (cosine_distance / 2.0)))
+
+            # 過濾低於門檻的結果
+            if score < score_threshold:
+                continue
+
+            # 過濾低於門檻的結果
+            if score < score_threshold:
+                continue
+
+            # 構建事件列表
+            events_true = []
+            if result.fire:
+                events_true.append("fire")
+            if result.water_flood:
+                events_true.append("water_flood")
+            if result.abnormal_attire_face_cover_at_entry:
+                events_true.append("abnormal_attire_face_cover_at_entry")
+            if result.person_fallen_unmoving:
+                events_true.append("person_fallen_unmoving")
+            if result.double_parking_lane_block:
+                events_true.append("double_parking_lane_block")
+            if result.smoking_outside_zone:
+                events_true.append("smoking_outside_zone")
+            if result.crowd_loitering:
+                events_true.append("crowd_loitering")
+            if result.security_door_tamper:
+                events_true.append("security_door_tamper")
+
+            norm_hits.append({
+                "score": round(score, 4),
+                "video": result.video or "",
+                "segment": result.segment or "",
+                "time_range": result.time_range or "",
+                "events_true": events_true,
+                "summary": result.message or "",
+                "reason": result.event_reason or "",
+                "doc_id": None,
+            })
+
+        # 取 top_k
+        norm_hits = norm_hits[:top_k]
         print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
-        
-        # [NEW] 在響應中包含日期解析資訊
-        response = {"backend": store.embed_model, "hits": norm_hits}
+
+        # 構建響應
+        response = {"backend": EMBEDDING_MODEL_NAME, "hits": norm_hits}
         if date_info:
             response["date_parsed"] = date_info
+        # [NEW] 添加關鍵字資訊
+        if query_filters.get("message_keywords"):
+            response["keywords_found"] = query_filters["message_keywords"]
+        if query_filters.get("event_types"):
+            response["event_types_found"] = query_filters["event_types"]
+        # [NEW] 添加 embedding 查詢資訊（用於向量搜索的 clean query）
+        response["embedding_query"] = clean_query
+        print(f"--- [DEBUG] Embedding 查詢文本: '{clean_query}' ---")
         return response
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"--- [ERROR] 搜索失敗: {e} ---")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
         # [簡化] 如果有日期過濾，PostgreSQL 先過濾日期，然後 RAG 在這些結果中進行向量搜索
         if has_date_filter:
@@ -2080,6 +2148,10 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
 # 它不僅幫你找資料，還會 「閱讀資料並回答問題」。
 @app.post("/rag/answer", tags=["RAG 相關 API"])
 async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+    """
+    使用 PostgreSQL + pgvector 進行混合搜索，然後使用 LLM 生成回答
+    搜索邏輯與 /rag/search 完全相同
+    """
     try:
         payload = await request.json()
         question = (payload.get("query") or "").strip()
@@ -2094,229 +2166,211 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         # 指定用哪個 LLM 來回答
         llm_model = (payload.get("model") or "qwen2.5vl:latest").strip()
 
+        if not HAS_DB or not db:
+            raise HTTPException(status_code=503, detail="Database not available")
+
         # 步驟 1: 解析查詢條件（與 /rag/search 統一）
         query_filters = {}
-        sql_results = {}
-        date_info = None  # 用於返回日期解析資訊
+        date_info = None
         
-        if HAS_DB and db:
-            try:
-                query_filters = _parse_query_filters(question)
-                
-                # [NEW] 提取日期解析資訊，用於返回給前端
-                if query_filters.get("date_filter") or query_filters.get("time_start"):
-                    date_filter = query_filters.get("date_filter")
-                    # 處理 date_filter（可能是 date 對象或字串）
-                    if date_filter:
-                        if hasattr(date_filter, 'isoformat'):
-                            picked_date_str = date_filter.isoformat()
-                        else:
-                            picked_date_str = str(date_filter)
+        try:
+            query_filters = _parse_query_filters(question)
+            
+            # 提取日期解析資訊，用於返回給前端
+            if query_filters.get("date_filter") or query_filters.get("time_start"):
+                date_filter = query_filters.get("date_filter")
+                if date_filter:
+                    if hasattr(date_filter, 'isoformat'):
+                        picked_date_str = date_filter.isoformat()
                     else:
-                        picked_date_str = None
-                    
-                    date_info = {
-                        "mode": query_filters.get("date_mode", "NONE"),
-                        "picked_date": picked_date_str,
-                        "time_start": query_filters.get("time_start"),
-                        "time_end": query_filters.get("time_end"),
-                    }
-                    # 在控制台輸出明顯的日期解析資訊
-                    print(f"\n{'='*60}")
-                    print(f"[日期解析] 查詢: {question}")
-                    print(f"[日期解析] 模式: {date_info['mode']}")
-                    print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
-                    if date_info['time_start']:
-                        print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
-                    print(f"{'='*60}\n")
+                        picked_date_str = str(date_filter)
+                else:
+                    picked_date_str = None
                 
-                # 調用 SQL 查詢（包含日期、事件、關鍵字過濾）
-                sql_results = _filter_summaries_by_query(db, query_filters, limit=1000)
-                print(f"--- [DEBUG] PostgreSQL 查詢找到 {len(sql_results)} 筆記錄 ---")
-            except Exception as e:
-                print(f"--- [WARNING] PostgreSQL 查詢失敗: {e} ---")
-                import traceback
-                traceback.print_exc()
-                query_filters = {}
-                sql_results = {}
+                date_info = {
+                    "mode": query_filters.get("date_mode", "NONE"),
+                    "picked_date": picked_date_str,
+                    "time_start": query_filters.get("time_start"),
+                    "time_end": query_filters.get("time_end"),
+                }
+                print(f"\n{'='*60}")
+                print(f"[日期解析] 查詢: {question}")
+                print(f"[日期解析] 模式: {date_info['mode']}")
+                print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
+                if date_info['time_start']:
+                    print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
+                print(f"{'='*60}\n")
+        except Exception as e:
+            print(f"--- [WARNING] 查詢解析失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+            query_filters = {}
 
-        # 步驟 2: 對 query 做關鍵字擴展，多 query 搜索後取 union
-        expanded_queries = _expand_query_keywords(question)
-        print(f"--- [DEBUG] 關鍵字擴展後生成 {len(expanded_queries)} 個查詢: {expanded_queries} ---")
-        
-        # 步驟 3: 固定 vec_pool = 400~800，多 query 搜索後取 union
-        store = RAGStore(store_dir=RAG_DIR)
-        vec_pool = 600  # 固定向量候選池大小
-        
-        all_vector_hits = []
-        seen_segment_uids = set()
-        
-        for expanded_query in expanded_queries:
-            # 對每個擴展查詢進行搜索
-            vector_hits = store.search(expanded_query, top_k=vec_pool, filters={})
-            
-            # 合併結果（去重）
-            for hit in vector_hits:
-                metadata = hit.get("metadata", {})
-                video = metadata.get("video", "")
-                segment = metadata.get("segment", "")
-                time_range = metadata.get("time_range", "")
-                
-                # 生成 segment_uid
-                video_str = str(video) if video else ""
-                segment_str = str(segment) if segment else ""
-                time_range_str = str(time_range) if time_range else ""
-                segment_uid = f"{video_str}|{segment_str}|{time_range_str}"
-                
-                if segment_uid not in seen_segment_uids:
-                    seen_segment_uids.add(segment_uid)
-                    all_vector_hits.append(hit)
-        
-        print(f"--- [DEBUG] Vector 搜索後合併得到 {len(all_vector_hits)} 筆結果 ---")
-        
-        # 步驟 4: 融合排序（保留三類結果：只在 SQL、只在 Vector、兩邊都命中）
-        message_keywords = query_filters.get("message_keywords", [])
-        merged_results = _merge_and_rank_results(
-            all_vector_hits,
-            sql_results,
-            query_filters,
-            message_keywords
-        )
-        
-        print(f"--- [DEBUG] 融合排序後得到 {len(merged_results)} 筆結果 ---")
-        
-        # 步驟 5: 過濾低於門檻的結果，然後取 top_k
-        filtered_results = [
-            r for r in merged_results
-            if r["final_score"] >= score_threshold
+        # 步驟 2: 生成查詢向量（與 /rag/search 相同）
+        clean_query = question
+        date_patterns = [
+            r'\d{4}[-/]\d{1,2}[-/]\d{1,2}',
+            r'\d{1,2}[-/]\d{1,2}',
+            r'今天|昨天|明天|本週|上週|下週',
+            r'\d{4}年\d{1,2}月\d{1,2}日',
         ]
+        for pattern in date_patterns:
+            clean_query = re.sub(pattern, '', clean_query)
+        clean_query = clean_query.strip()
         
-        # 排序後再取 top_k
-        final_results = filtered_results[:top_k]
+        if not clean_query:
+            clean_query = question
+
+        embedding_model = get_embedding_model()
+        if not embedding_model:
+            raise HTTPException(status_code=503, detail="Embedding model not available")
         
-        # 步驟 6: 格式化結果
-        norm_hits = []
-        for r in final_results:
-            vector_hit = r.get("vector_hit")
-            sql_data = r.get("sql_data")
+        query_embedding = embedding_model.encode(clean_query, normalize_embeddings=True)
+        print(f"--- [DEBUG] 查詢向量生成完成 (維度: {len(query_embedding)}) ---")
+
+        # 步驟 3: 構建 PostgreSQL + pgvector 混合查詢（與 /rag/search 相同）
+        stmt = select(Summary).filter(
+            Summary.message.isnot(None),
+            Summary.message != "",
+            Summary.embedding.isnot(None)
+        )
+
+        # 時間範圍過濾
+        if query_filters.get("time_start") and query_filters.get("time_end"):
+            try:
+                time_start_str = query_filters["time_start"]
+                time_end_str = query_filters["time_end"]
+                
+                if "T" in time_start_str:
+                    t0 = datetime.fromisoformat(time_start_str.replace("Z", "+00:00"))
+                else:
+                    t0 = datetime.fromisoformat(time_start_str)
+                
+                if "T" in time_end_str:
+                    t1 = datetime.fromisoformat(time_end_str.replace("Z", "+00:00"))
+                else:
+                    t1 = datetime.fromisoformat(time_end_str)
+                
+                if t0.tzinfo:
+                    t0 = t0.astimezone().replace(tzinfo=None)
+                if t1.tzinfo:
+                    t1 = t1.astimezone().replace(tzinfo=None)
+                
+                stmt = stmt.filter(
+                    Summary.start_timestamp >= t0,
+                    Summary.start_timestamp < t1
+                )
+                print(f"--- [DEBUG] 應用時間範圍過濾: {t0} ~ {t1} ---")
+            except Exception as e:
+                print(f"--- [WARNING] 時間範圍解析失敗: {e} ---")
+        elif query_filters.get("date_filter"):
+            target_date = query_filters["date_filter"]
+            t0 = datetime.combine(target_date, datetime.min.time())
+            next_day = target_date + timedelta(days=1)
+            t1 = datetime.combine(next_day, datetime.min.time())
+            stmt = stmt.filter(
+                Summary.start_timestamp >= t0,
+                Summary.start_timestamp < t1
+            )
+            print(f"--- [DEBUG] 應用日期過濾: {target_date} ({t0} ~ {t1}) ---")
+
+        # 事件類型過濾
+        if query_filters.get("event_types"):
+            event_conditions = []
+            for event_type in query_filters["event_types"]:
+                if event_type == "fire":
+                    event_conditions.append(Summary.fire == True)
+                elif event_type == "water_flood":
+                    event_conditions.append(Summary.water_flood == True)
+                elif event_type == "abnormal_attire_face_cover_at_entry":
+                    event_conditions.append(Summary.abnormal_attire_face_cover_at_entry == True)
+                elif event_type == "person_fallen_unmoving":
+                    event_conditions.append(Summary.person_fallen_unmoving == True)
+                elif event_type == "double_parking_lane_block":
+                    event_conditions.append(Summary.double_parking_lane_block == True)
+                elif event_type == "smoking_outside_zone":
+                    event_conditions.append(Summary.smoking_outside_zone == True)
+                elif event_type == "crowd_loitering":
+                    event_conditions.append(Summary.crowd_loitering == True)
+                elif event_type == "security_door_tamper":
+                    event_conditions.append(Summary.security_door_tamper == True)
             
-            # 優先使用 vector_hit 的 metadata，如果沒有則使用 sql_data
-            if vector_hit:
-                m = vector_hit.get("metadata", {})
-                summary = m.get("summary", "")
-                video = m.get("video", "")
-                segment = m.get("segment", "")
-                time_range = m.get("time_range", "")
-                
-                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
-                if (not video or not segment) and summary:
-                    meta_path = Path(RAG_DIR) / "meta.jsonl"
-                    if meta_path.exists():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        data = json.loads(line.strip())
-                                        meta_summary = data.get("metadata", {}).get("summary", "")
-                                        # 精確匹配 summary
-                                        if meta_summary == summary:
-                                            content = data.get("content", "")
-                                            # 從 content 中解析影片路徑和片段
-                                            import re
-                                            # 解析 "影片：/segment/xxx" 或 "影片：segment/xxx"
-                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
-                                            # 解析 "片段：segment_xxx.xxx（..."
-                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
-                                            
-                                            if video_match:
-                                                found_video = video_match.group(1)
-                                                if not found_video.startswith("/"):
-                                                    found_video = f"/{found_video}"
-                                                if not video:
-                                                    video = found_video
-                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 video: {video} ---")
-                                            
-                                            if segment_match:
-                                                found_segment = segment_match.group(1).strip()
-                                                if not segment:
-                                                    segment = found_segment
-                                                    print(f"--- [DEBUG] 根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
-                                            
-                                            # 如果找到了，就跳出循環
-                                            if video and segment:
-                                                break
-                                    except json.JSONDecodeError:
-                                        continue
-                        except Exception as e:
-                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
-                
-                norm_hits.append({
-                    "score": round(r["final_score"], 4),
-                    "video": video,
-                    "segment": segment,
-                    "time_range": time_range,
-                    "events_true": m.get("events_true", []),
-                    "summary": summary,
-                    "reason": m.get("reason", ""),
-                    "doc_id": vector_hit.get("id"),
-                })
-            elif sql_data:
-                # 只在 SQL 命中的結果
-                summary = sql_data.get("message", "")
-                video = sql_data.get("video", "")
-                segment = sql_data.get("segment", "")
-                time_range = sql_data.get("time_range", "")
-                
-                # [FIX] 如果 video 或 segment 為空，根據 summary 在 meta.jsonl 中查找
-                if (not video or not segment) and summary:
-                    meta_path = Path(RAG_DIR) / "meta.jsonl"
-                    if meta_path.exists():
-                        try:
-                            with open(meta_path, "r", encoding="utf-8") as f:
-                                for line in f:
-                                    try:
-                                        data = json.loads(line.strip())
-                                        meta_summary = data.get("metadata", {}).get("summary", "")
-                                        # 精確匹配 summary
-                                        if meta_summary == summary:
-                                            content = data.get("content", "")
-                                            # 從 content 中解析影片路徑和片段
-                                            import re
-                                            video_match = re.search(r'影片[：:]\s*(/segment/[^\n]+|segment/[^\n]+)', content)
-                                            segment_match = re.search(r'片段[：:]\s*([^\s（]+)', content)
-                                            
-                                            if video_match:
-                                                found_video = video_match.group(1)
-                                                if not found_video.startswith("/"):
-                                                    found_video = f"/{found_video}"
-                                                if not video:
-                                                    video = found_video
-                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 video: {video} ---")
-                                            
-                                            if segment_match:
-                                                found_segment = segment_match.group(1).strip()
-                                                if not segment:
-                                                    segment = found_segment
-                                                    print(f"--- [DEBUG] SQL結果：根據 summary 在 meta.jsonl 中找到 segment: {segment} ---")
-                                            
-                                            if video and segment:
-                                                break
-                                    except json.JSONDecodeError:
-                                        continue
-                        except Exception as e:
-                            print(f"--- [DEBUG] 讀取 meta.jsonl 失敗: {e} ---")
-                
-                norm_hits.append({
-                    "score": round(r["final_score"], 4),
-                    "video": video,
-                    "segment": segment,
-                    "time_range": time_range,
-                    "events_true": [],
-                    "summary": summary,
-                    "reason": sql_data.get("event_reason", ""),
-                    "doc_id": None,
-                })
-        
+            if event_conditions:
+                stmt = stmt.filter(or_(*event_conditions))
+                print(f"--- [DEBUG] 應用事件過濾: {query_filters['event_types']} ---")
+
+        # 關鍵字過濾
+        if query_filters.get("message_keywords"):
+            message_conditions = []
+            for keyword in query_filters["message_keywords"]:
+                message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
+            if message_conditions:
+                stmt = stmt.filter(or_(*message_conditions))
+                print(f"--- [DEBUG] 應用關鍵字過濾: {query_filters['message_keywords']} ---")
+
+        # Vector search
+        try:
+            from pgvector.sqlalchemy import Vector
+            distance_expr = Summary.embedding.cosine_distance(query_embedding)
+            
+            stmt = stmt.add_columns(
+                distance_expr.label('cosine_distance')
+            ).order_by(
+                distance_expr
+            ).limit(top_k * 3)
+            
+            print(f"--- [DEBUG] 執行 PostgreSQL + pgvector 混合查詢 ---")
+            results = db.execute(stmt).all()
+            print(f"--- [DEBUG] 查詢返回 {len(results)} 筆結果 ---")
+        except ImportError:
+            raise HTTPException(status_code=503, detail="pgvector not available")
+        except Exception as e:
+            print(f"--- [ERROR] pgvector 查詢失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+            results = []
+
+        # 步驟 4: 計算相似度分數並格式化結果（與 /rag/search 相同）
+        norm_hits = []
+        for row in results:
+            result = row[0]
+            cosine_distance = row[1]
+            
+            score = max(0.0, min(1.0, 1.0 - (cosine_distance / 2.0)))
+
+            if score < score_threshold:
+                continue
+
+            events_true = []
+            if result.fire:
+                events_true.append("fire")
+            if result.water_flood:
+                events_true.append("water_flood")
+            if result.abnormal_attire_face_cover_at_entry:
+                events_true.append("abnormal_attire_face_cover_at_entry")
+            if result.person_fallen_unmoving:
+                events_true.append("person_fallen_unmoving")
+            if result.double_parking_lane_block:
+                events_true.append("double_parking_lane_block")
+            if result.smoking_outside_zone:
+                events_true.append("smoking_outside_zone")
+            if result.crowd_loitering:
+                events_true.append("crowd_loitering")
+            if result.security_door_tamper:
+                events_true.append("security_door_tamper")
+
+            norm_hits.append({
+                "score": round(score, 4),
+                "video": result.video or "",
+                "segment": result.segment or "",
+                "time_range": result.time_range or "",
+                "events_true": events_true,
+                "summary": result.message or "",
+                "reason": result.event_reason or "",
+                "doc_id": None,
+            })
+
+        norm_hits = norm_hits[:top_k]
         print(f"--- [DEBUG] 最終返回 {len(norm_hits)} 筆結果 ---")
         
         # 2. 組裝 Context (A) - 使用 norm_hits 作為上下文
@@ -2339,11 +2393,20 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 print(f"--- [WARNING] Ollama 失敗，返回空結果: {ollama_error} ---")
                 msg = "目前索引到的片段裡找不到答案（或是相似度過低）。LLM 服務暫時無法使用。"
 
-            return {
-                "backend": {"embed_model": store.embed_model, "llm": llm_model},
+            response = {
+                "backend": {"embed_model": EMBEDDING_MODEL_NAME, "llm": llm_model},
                 "hits": [],
                 "answer": msg or "目前索引到的片段裡找不到答案（或是相似度過低）。",
             }
+            if date_info:
+                response["date_parsed"] = date_info
+            if query_filters.get("message_keywords"):
+                response["keywords_found"] = query_filters["message_keywords"]
+            if query_filters.get("event_types"):
+                response["event_types_found"] = query_filters["event_types"]
+            # [NEW] 添加 embedding 查詢資訊
+            response["embedding_query"] = clean_query
+            return response
 
         # 組裝 Context (A) - 使用已經格式化好的 norm_hits
         context_blocks = []
@@ -2391,14 +2454,21 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 answer += f"[{i}] 影片: {hit.get('video', 'N/A')}  時間: {hit.get('time_range', 'N/A')}\n"
                 answer += f"    摘要: {hit.get('summary', 'N/A')[:100]}...\n\n"
 
-        # [NEW] 在響應中包含日期解析資訊
+        # [NEW] 在響應中包含日期解析資訊和關鍵字資訊
         response = {
-            "backend": {"embed_model": store.embed_model, "llm": llm_model},
+            "backend": {"embed_model": EMBEDDING_MODEL_NAME, "llm": llm_model},
             "hits": norm_hits,
             "answer": answer,
         }
         if date_info:
             response["date_parsed"] = date_info
+        # [NEW] 添加關鍵字資訊
+        if query_filters.get("message_keywords"):
+            response["keywords_found"] = query_filters["message_keywords"]
+        if query_filters.get("event_types"):
+            response["event_types_found"] = query_filters["event_types"]
+        # [NEW] 添加 embedding 查詢資訊
+        response["embedding_query"] = clean_query
         return response
 
     except Exception as e:
@@ -2517,12 +2587,36 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.crowd_loitering = bool(events.get("crowd_loitering", False))
             existing.security_door_tamper = bool(events.get("security_door_tamper", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
+            # [NEW] 如果 message 有變更，重新生成 embedding
+            if existing.message != summary_text.strip() and summary_text.strip():
+                try:
+                    embedding_model = get_embedding_model()
+                    if embedding_model:
+                        existing.embedding = embedding_model.encode(
+                            summary_text.strip(),
+                            normalize_embeddings=True
+                        ).tolist()
+                except Exception as e:
+                    print(f"  ⚠️  更新 embedding 失敗: {e}")
             # 更新 updated_at 時間戳
             existing.updated_at = datetime.now()
             saved_count += 1
             updated_count += 1
         else:
             # 新增記錄（新的則新增）
+            # [NEW] 自動生成 embedding
+            embedding = None
+            if summary_text.strip():
+                try:
+                    embedding_model = get_embedding_model()
+                    if embedding_model:
+                        embedding = embedding_model.encode(
+                            summary_text.strip(),
+                            normalize_embeddings=True
+                        ).tolist()
+                except Exception as e:
+                    print(f"  ⚠️  生成 embedding 失敗: {e}")
+            
             summary = Summary(
                 start_timestamp=start_time if start_time else datetime.now(),
                 end_timestamp=end_time,
@@ -2544,6 +2638,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 crowd_loitering=bool(events.get("crowd_loitering", False)),
                 security_door_tamper=bool(events.get("security_door_tamper", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
+                embedding=embedding,  # [NEW] 自動生成的 embedding
                 created_at=datetime.now(),
                 updated_at=datetime.now()
             )

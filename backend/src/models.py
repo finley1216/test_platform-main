@@ -6,6 +6,18 @@ from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean
 from datetime import datetime
 from src.database import Base
 
+# Import pgvector extension
+try:
+    from pgvector.sqlalchemy import Vector
+    HAS_PGVECTOR = True
+except ImportError:
+    HAS_PGVECTOR = False
+    # Fallback: define a placeholder Vector type if pgvector is not installed
+    from sqlalchemy import TypeDecorator
+    class Vector(TypeDecorator):
+        impl = Text
+        cache_ok = True
+
 
 class Summary(Base):
     """Summary table model"""
@@ -33,6 +45,8 @@ class Summary(Base):
     crowd_loitering = Column(Boolean, default=False, nullable=True)  # 聚眾逗留
     security_door_tamper = Column(Boolean, default=False, nullable=True)  # 突破安全門
     event_reason = Column(Text, nullable=True)  # Event detection reason
+    # Vector embedding for semantic search (384 dimensions for paraphrase-multilingual-MiniLM-L12-v2)
+    embedding = Column(Vector(384), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 

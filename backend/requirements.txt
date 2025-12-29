@@ -6,9 +6,21 @@ numpy==1.24.3
 opencv-python==4.8.1.78
 pillow==10.1.0
 google-generativeai==0.3.1
-faiss-cpu==1.7.4
+# faiss-cpu==1.7.4  # [DEPRECATED] 已改用 PostgreSQL + pgvector
 pydantic==2.5.0
 python-multipart==0.0.6
 pyyaml==6.0.1  # MCP 配置檔案支援
 # date-extractor==0.7.0  # 暫時註解：網路問題時無法安裝，前兩個優先級（相對日期和 MMDD）已足夠
+
+# Database dependencies
+sqlalchemy==2.0.23  # SQLAlchemy ORM for PostgreSQL
+psycopg2-binary==2.9.9  # PostgreSQL adapter
+
+# PostgreSQL + pgvector dependencies
+pgvector==0.3.0  # pgvector extension for PostgreSQL
+
+# Embedding generation
+# 注意：sentence-transformers 2.2.2 需要較舊版本的 huggingface-hub
+# 如果遇到兼容性問題，請使用：sentence-transformers==2.7.0 或更新版本
+sentence-transformers==2.7.0  # For embedding generation (paraphrase-multilingual-MiniLM-L12-v2)
 

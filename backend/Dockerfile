@@ -18,6 +18,9 @@ COPY ./requirements.txt ./
 # Install dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Download embedding model during build (CPU mode only, when network is available)
+RUN CUDA_VISIBLE_DEVICES="" python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('paraphrase-multilingual-MiniLM-L12-v2', device='cpu')" || echo "Warning: Failed to download model, will retry at runtime"
+
 # Set Python path
 ENV PYTHONPATH=/app
 

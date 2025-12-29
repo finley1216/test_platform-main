@@ -20,9 +20,9 @@ services:
               count: all
               capabilities: [gpu]
 
-  # PostgreSQL Database
+  # PostgreSQL Database with pgvector extension
   postgres:
-    image: postgres:15-alpine
+    image: pgvector/pgvector:pg15  # 使用包含 pgvector 的官方映像
     restart: unless-stopped
     environment:
       - POSTGRES_USER=postgres
@@ -122,6 +122,7 @@ services:
       - ./backend/rag_store:/app/rag_store
       - ./backend/prompts:/app/prompts
       - ../video:/app/video:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro  # 掛載 Hugging Face 模型緩存
     dns:
       - 8.8.8.8
       - 8.8.4.4

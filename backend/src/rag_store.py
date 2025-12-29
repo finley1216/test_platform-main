@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-Minimal RAG store using FAISS + Ollama embeddings.
+[DEPRECATED] Minimal RAG store using FAISS + Ollama embeddings.
+
+⚠️  WARNING: This module is deprecated. The search functionality has been migrated to 
+PostgreSQL + pgvector. This file is kept for backward compatibility with /rag/answer 
+and /rag/index endpoints, but /rag/search now uses PostgreSQL + pgvector directly.
+
 - Store dir layout:
     rag_store/
       - index.faiss
@@ -17,13 +22,18 @@ import requests
 import numpy as np
 
 # --- FAISS import (cpu first) ---
+HAS_FAISS = False
+faiss = None
 try:
     import faiss  # type: ignore
+    HAS_FAISS = True
 except Exception:
     try:
         import faiss_cpu as faiss  # type: ignore
-    except Exception as e:
-        raise RuntimeError("Cannot import faiss/faiss_cpu. Please install faiss-cpu: pip install faiss-cpu") from e
+        HAS_FAISS = True
+    except Exception:
+        # 不拋出錯誤，允許模組載入（但 RAGStore 功能將不可用）
+        print("--- [WARNING] faiss/faiss_cpu 未安裝，RAGStore 功能將不可用 ---")
 
 
 def _normed(v: np.ndarray) -> np.ndarray:
