@@ -148,6 +148,43 @@ docker exec test_platform-main-backend-1 python3 /app/src/migrate_segments_to_db
 
 ## 開發日誌
 
+### 2025-12-30
+
+#### Backend
+- **生成 RAG 查詢流程完整說明文件**
+  - 創建 `backend/RAG查詢流程說明.md`：完整的 RAG 查詢流程技術文檔
+  - 說明整體架構：PostgreSQL + pgvector 混合搜尋機制
+  - 詳細說明時間和關鍵字提取方法：
+    - 日期解析：使用正則表達式和負向斷言精準定位數字
+    - 關鍵字提取：使用字符串包含檢查和白名單匹配
+    - 事件類型映射：中文關鍵字 → 資料庫欄位名稱
+  - 說明分數計算機制：cosine_distance 轉換為相似度分數的公式
+  - 說明資料庫混合查詢：硬篩選 + 向量搜尋的單一 SQL 查詢實現
+  - 說明白名單格式：事件類型映射、關鍵字列表、日期解析關鍵字
+  - 提供完整的函式流程圖和 MCP 流程說明
+
+- **MCP 流程說明和優化**
+  - 在文檔中詳細說明 MCP（Model Context Protocol）的實際使用方式
+  - 說明 MCP 與 LLM 的關係：MCP 用於工具封裝，與 AI 模型無直接關係
+  - 說明 MCP 在 `/rag/search` 和 `/rag/answer` 中的使用方式
+  - 提供讓 LLM 直接調用 MCP 工具的實現方案（未來擴展）
+
+#### Frontend
+- **修復影片下載路徑問題**
+  - 修改 `frontend/src/components/RagResults.js`：
+    - 修正 `fullVideoPath` 構建邏輯，確保包含 `/segment/` 前綴
+    - 處理 `videoPath` 已包含 `/segment/` 的情況，避免重複添加
+  - 修改 `frontend/src/services/api.js`：
+    - 修正 `downloadFile` 函數的 URL 構建邏輯
+    - 確保路徑正確處理，避免移除必要的 `/` 前綴
+    - 添加註釋說明 HTTP 頁面上使用 blob URL 的安全警告（預期行為，不影響功能）
+
+#### 備註
+- 已部署到 140.117.176.88
+- 所有端口已開放並可正常訪問
+- 影片下載功能已修復，可正常下載和查看內容
+- RAG 查詢流程說明文件已生成，包含完整的技術文檔和流程圖
+
 ### 2025-12-29
 
 #### Backend
