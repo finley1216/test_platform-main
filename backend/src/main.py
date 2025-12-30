@@ -288,7 +288,8 @@ def _ollama_chat(
     payload = {
         "model": model_name,
         "messages": msgs,
-        "stream": bool(stream),}
+        "stream": bool(stream),
+    }
 
     # 預設給了 600 秒（10 分鐘）。這是因為跑大型模型（例如 70B）或是在沒有 GPU 的機器上跑 AI，生成速度可能非常慢。
     # 如果使用預設的 HTTP timeout，程式很容易中斷報錯。
@@ -2178,28 +2179,31 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
             
             # 提取日期解析資訊，用於返回給前端
             if query_filters.get("date_filter") or query_filters.get("time_start"):
-                date_filter = query_filters.get("date_filter")
-                if date_filter:
-                    if hasattr(date_filter, 'isoformat'):
-                        picked_date_str = date_filter.isoformat()
+                if not date_info:  # 如果 LLM 工具調用已經設置了 date_info，就不需要重複設置
+                    date_filter = query_filters.get("date_filter")
+                    if date_filter:
+                        if hasattr(date_filter, 'isoformat'):
+                            picked_date_str = date_filter.isoformat()
+                        else:
+                            picked_date_str = str(date_filter)
                     else:
-                        picked_date_str = str(date_filter)
-                else:
-                    picked_date_str = None
+                        picked_date_str = None
+                    
+                    date_info = {
+                        "mode": query_filters.get("date_mode", "NONE"),
+                        "picked_date": picked_date_str,
+                        "time_start": query_filters.get("time_start"),
+                        "time_end": query_filters.get("time_end"),
+                    }
                 
-                date_info = {
-                    "mode": query_filters.get("date_mode", "NONE"),
-                    "picked_date": picked_date_str,
-                    "time_start": query_filters.get("time_start"),
-                    "time_end": query_filters.get("time_end"),
-                }
-                print(f"\n{'='*60}")
-                print(f"[日期解析] 查詢: {question}")
-                print(f"[日期解析] 模式: {date_info['mode']}")
-                print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
-                if date_info['time_start']:
-                    print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info['time_end'][:19]}")
-                print(f"{'='*60}\n")
+                if date_info:
+                    print(f"\n{'='*60}")
+                    print(f"[日期解析] 查詢: {question}")
+                    print(f"[日期解析] 模式: {date_info['mode']}")
+                    print(f"[日期解析] 解析到的日期: {date_info['picked_date']}")
+                    if date_info.get('time_start'):
+                        print(f"[日期解析] 時間範圍: {date_info['time_start'][:19]} ~ {date_info.get('time_end', '')[:19]}")
+                    print(f"{'='*60}\n")
         except Exception as e:
             print(f"--- [WARNING] 查詢解析失敗: {e} ---")
             import traceback
@@ -2744,6 +2748,7 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         "阻塞": "double_parking_lane_block",
         "吸菸": "smoking_outside_zone",
         "抽菸": "smoking_outside_zone",
+        "群聚": "crowd_loitering",
         "聚眾": "crowd_loitering",
         "逗留": "crowd_loitering",
     }

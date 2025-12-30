@@ -238,9 +238,15 @@ class ApiService {
   }
 
   async downloadFile(path, filename, apiKey) {
+    // 處理路徑：確保以 / 開頭，並正確構建 URL
+    let normalizedPath = path;
+    if (!normalizedPath.startsWith("/")) {
+      normalizedPath = `/${normalizedPath}`;
+    }
+    
     const targetUrl = path.startsWith("http")
       ? path
-      : `${this.baseUrl}/${path.replace(/^\//, "")}`;
+      : `${this.baseUrl}${normalizedPath}`;
 
     const response = await fetch(targetUrl, {
       headers: {
@@ -268,6 +274,12 @@ class ApiService {
     link.click();
     document.body.removeChild(link);
     window.URL.revokeObjectURL(downloadUrl);
+    
+    // 注意：在 HTTP 頁面上使用 blob URL 會產生瀏覽器安全警告
+    // "The file at 'blob:...' was loaded over an insecure connection"
+    // 這是預期的警告，不影響下載功能。要消除警告，需要：
+    // 1. 使用 HTTPS（推薦，需要配置 SSL 證書）
+    // 2. 或使用直接下載連結（但需要後端支援 CORS 和適當的 Content-Disposition 標頭）
   }
 
   // 影片管理 API

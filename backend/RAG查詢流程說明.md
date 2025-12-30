@@ -780,11 +780,66 @@ _parse_query_filters(question: str)
 
 3. **為什麼沒有讓 LLM 直接調用 MCP？**：
    - 目前的設計是**規則匹配**（MCP 解析）+ **資料庫查詢** + **LLM 生成回答**
-   - 理論上可以讓 LLM 直接調用 MCP 工具（這是 MCP 的原始設計目的），但本系統沒有這樣做
+   - 理論上可以讓 LLM 直接調用 MCP 工具（這是 MCP 的原始設計目的），但本系統目前沒有這樣做
    - 原因可能是：
      - 規則匹配已經足夠準確（日期解析、事件識別）
      - 避免 LLM 的額外延遲和成本
      - 保持查詢邏輯的可預測性
+
+**如何讓 LLM 調用 MCP 工具（實現方案）**：
+
+雖然目前沒有實現，但可以通過以下方式讓 LLM 直接調用 MCP 工具：
+
+1. **修改 `_ollama_chat` 函數**：
+   - 添加 `tools` 參數，支援傳遞工具定義
+   - 在 payload 中添加 `tools` 和 `tool_choice` 欄位
+   - 解析響應中的 `tool_calls`，返回工具調用請求
+
+2. **在 `/rag/answer` 中實現工具調用循環**：
+   ```python
+   # 步驟 1: 讓 LLM 分析查詢，決定是否需要調用工具
+   tools = [{
+       "type": "function",
+       "function": {
+           "name": "parse_date",
+           "description": "解析中文查詢中的日期時間範圍",
+           "parameters": {...}
+       }
+   }]
+   
+   response = _ollama_chat(llm_model, messages, tools=tools)
+   
+   # 步驟 2: 如果 LLM 請求調用工具，執行工具調用
+   if isinstance(response, dict) and "tool_calls" in response:
+       for tool_call in response["tool_calls"]:
+           if tool_call["function"]["name"] == "parse_date":
+               # 調用 MCP 工具
+               date_result = mcp_client.parse_date(tool_call["function"]["arguments"]["query"])
+               
+               # 將工具結果返回給 LLM
+               messages.append({
+                   "role": "assistant",
+                   "tool_calls": response["tool_calls"]
+               })
+               messages.append({
+                   "role": "tool",
+                   "tool_call_id": tool_call["id"],
+                   "content": json.dumps(date_result)
+               })
+   
+   # 步驟 3: 讓 LLM 繼續生成回答（使用工具結果）
+   final_response = _ollama_chat(llm_model, messages)
+   ```
+
+3. **優勢**：
+   - LLM 可以更智能地決定何時需要解析日期
+   - 可以處理更複雜的自然語言查詢
+   - 符合 MCP 的原始設計目的
+
+4. **注意事項**：
+   - 需要確保 LLM 模型支援 function calling（Ollama 的新版本支援）
+   - 會增加延遲（需要多次 LLM 調用）
+   - 需要處理工具調用失敗的情況
 
 **總結**：
 - MCP 和 LLM 在 `/rag/answer` 中是**串聯使用**，但**沒有直接配合**

@@ -91,8 +91,17 @@ const RagResults = ({ data, apiKey }) => {
             .join("、") || "無事件";
         const videoPath = h.video || "";
         const segment = h.segment || "";
-        const fullVideoPath =
-          videoPath && segment ? `${videoPath}/${segment}` : "";
+        // 構建完整路徑：確保包含 /segment/ 前綴
+        let fullVideoPath = "";
+        if (videoPath && segment) {
+          // 如果 videoPath 已經包含 /segment/，直接使用
+          if (videoPath.startsWith("/segment/")) {
+            fullVideoPath = `${videoPath}/${segment}`;
+          } else {
+            // 否則添加 /segment/ 前綴
+            fullVideoPath = `/segment/${videoPath}/${segment}`;
+          }
+        }
 
         if (answer) {
           return (
