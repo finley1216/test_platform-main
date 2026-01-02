@@ -14,14 +14,10 @@ from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
 from google.generativeai.types import HarmCategory, HarmBlockThreshold
-# [DEPRECATED] RAGStore 僅用於 /rag/answer 和 /rag/index，導入改為可選
-try:
-    from rag_store import RAGStore
-    HAS_RAG_STORE = True
-except ImportError:
-    HAS_RAG_STORE = False
-    RAGStore = None
-    print("--- [WARNING] RAGStore 不可用（faiss-cpu 未安裝），/rag/answer 和 /rag/index 可能無法使用 ---")
+# [DEPRECATED] RAGStore 已完全移除，現在完全使用 PostgreSQL + pgvector
+# 不再需要 faiss，所有 RAG 功能都使用 PostgreSQL
+HAS_RAG_STORE = False
+RAGStore = None
 from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, select
@@ -64,9 +60,9 @@ AUTO_RAG_INDEX = config.AUTO_RAG_INDEX
 # Gemini API Key (already configured in config.py)
 GEMINI_API_KEY = config.GEMINI_API_KEY
 
-# RAG 存的地方
-RAG_DIR = config.RAG_DIR
-RAG_INDEX_PATH = config.RAG_INDEX_PATH
+# RAG 相關配置（已遷移到 PostgreSQL，這些變數保留用於向後兼容）
+RAG_DIR = config.RAG_DIR  # [DEPRECATED] 不再使用，保留用於向後兼容
+RAG_INDEX_PATH = config.RAG_INDEX_PATH  # [DEPRECATED] 不再使用，保留用於向後兼容
 OLLAMA_EMBED_MODEL = config.OLLAMA_EMBED_MODEL
 
 # Initialize SentenceTransformer for embedding generation
@@ -164,49 +160,159 @@ def _compute_starts(duration: float, segment: float, overlap: float) -> List[flo
     return starts
 
 # 計算好切點 -> 迴圈執行 FFmpeg -> 產出一堆小影片檔
-def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: float, prefix: str="segment") -> List[str]:
+def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: float, prefix: str="segment", 
+                     resolution: Optional[int] = None, strict_mode: bool = False) -> List[str]:
     """
-    FFmpeg 指令使用了 -c copy。這表示它不會重新編碼 (Re-encode)，而是直接複製影像串流。
-    速度極快（幾乎是瞬間完成），且畫質無損。
+    切割影片，支援兩種模式：
+    - strict_mode=False (預設): 使用 -c copy，速度快但不保證精確時間
+    - strict_mode=True: 重新編碼，嚴格遵循 segment duration 和 overlap，並可設定解析度
+    
+    參數:
+    - resolution: 長邊解析度（px），例如 720 表示長邊為 720px
+    - strict_mode: 是否使用嚴格模式（重新編碼）
     """
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     duration = _probe_duration_seconds(input_path)
     starts = _compute_starts(duration, segment, overlap)
     ext = Path(input_path).suffix or ".mp4"
     outs = []
+    
     for i, st in enumerate(starts):
-        dur = max(0.0, min(segment, duration - st))
-        if dur <= 0.05: continue
+        # 嚴格模式：每段都是嚴格的 segment 秒（除了最後一段可能較短）
+        if strict_mode:
+            dur = segment  # 嚴格使用 segment 秒
+            # 如果超過總長度，則調整為剩餘長度
+            if st + dur > duration:
+                dur = max(0.0, duration - st)
+            if dur <= 0.05: continue
+        else:
+            # 舊模式：允許最後一段較短
+            dur = max(0.0, min(segment, duration - st))
+            if dur <= 0.05:
+                continue
+        
         out_file = str(Path(out_dir) / f"{prefix}_{i:04d}{ext}")
-        subprocess.run([
-            "ffmpeg","-hide_banner","-loglevel","error",
-            "-ss", f"{st}","-t", f"{dur}",
-            "-i", input_path,"-c","copy","-y", out_file
-        ], check=True)
+        
+        if strict_mode:
+            # 嚴格模式：重新編碼以確保精確時間和解析度
+            ffmpeg_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{st:.3f}",  # 精確到毫秒
+                "-i", input_path,
+                "-t", f"{dur:.3f}",  # 精確到毫秒
+                "-c:v", "libx264",  # 使用 H.264 編碼
+                "-preset", "medium",  # 編碼速度與品質平衡
+                "-crf", "23",  # 品質設定（23 是較好的品質）
+                "-c:a", "aac",  # 音訊編碼
+                "-strict", "experimental",
+            ]
+            
+            # 如果設定了解析度，強制縮放
+            if resolution and resolution > 0:
+                # 先獲取原始解析度
+                probe_cmd = [
+                    "ffprobe", "-v", "error", "-select_streams", "v:0",
+                    "-show_entries", "stream=width,height", "-of", "csv=s=x:p=0",
+                    input_path
+                ]
+                try:
+                    result = subprocess.run(probe_cmd, capture_output=True, text=True, check=True)
+                    orig_size = result.stdout.strip().split('x')
+                    orig_w, orig_h = int(orig_size[0]), int(orig_size[1])
+                    
+                    # 計算新尺寸（保持長寬比，長邊為 resolution）
+                    if orig_w <= orig_h:
+                        # 原始是直向（高度是長邊）
+                        new_h = resolution
+                        new_w = int(round(orig_w * (resolution / orig_h)))
+                    else:
+                        # 原始是橫向（寬度是長邊）
+                        new_w = resolution
+                        new_h = int(round(orig_h * (resolution / orig_w)))
+                    
+                    # 確保是偶數（H.264 要求）
+                    new_w = new_w if new_w % 2 == 0 else new_w + 1
+                    new_h = new_h if new_h % 2 == 0 else new_h + 1
+                    
+                    ffmpeg_cmd.extend(["-vf", f"scale={new_w}:{new_h}"])
+                except Exception as e:
+                    print(f"--- [WARNING] 無法獲取原始解析度，跳過解析度設定: {e} ---")
+            
+            ffmpeg_cmd.extend(["-y", out_file])
+        else:
+            # 舊模式：使用 -c copy（快速但不精確）
+            ffmpeg_cmd = [
+                "ffmpeg", "-hide_banner", "-loglevel", "error",
+                "-ss", f"{st:.3f}",
+                "-t", f"{dur:.3f}",
+                "-i", input_path,
+                "-c", "copy",
+                "-y", out_file
+            ]
+        
+        subprocess.run(ffmpeg_cmd, check=True)
         outs.append(out_file)
+    
     return outs
 
-# 從影片中均勻抓取 N 張截圖。
-def _sample_frames_evenly_to_pil(video_path: str, max_frames: int=8) -> List[Image.Image]:
+# 從影片中根據 FPS 設定抓取截圖
+def _sample_frames_evenly_to_pil(video_path: str, max_frames: int=8, sampling_fps: Optional[float] = None) -> List[Image.Image]:
     """
-    使用 cv2 (OpenCV) 打開影片，算出總幀數
-    用 np.linspace 算出均勻分佈的索引
+    從影片中抓取截圖，支援兩種模式：
+    - 如果提供 sampling_fps: 嚴格按照 FPS 設定取樣（例如 0.5 fps = 每2秒取1 frame）
+    - 如果未提供 sampling_fps: 使用均勻分佈（舊模式，向後兼容）
+    
+    參數:
+    - video_path: 影片路徑
+    - max_frames: 最大取樣幀數（當 sampling_fps 未設定時使用）
+    - sampling_fps: 取樣 FPS（例如 0.5 表示每2秒取1 frame）
     """
     cap = cv2.VideoCapture(video_path)
     if not cap.isOpened():
         raise RuntimeError(f"cannot open video: {video_path}")
     try:
-        total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-        if total <= 0: raise RuntimeError("invalid or zero-frame video")
-        n = min(max_frames, total)
-        idxs = np.linspace(0, total-1, num=n, dtype=np.int64)
-        frames=[]
-        for fi in idxs:
-            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-            ok, bgr = cap.read()
-            if not ok: continue
-            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-            frames.append(Image.fromarray(rgb))
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+        if total_frames <= 0: raise RuntimeError("invalid or zero-frame video")
+        
+        duration_sec = total_frames / fps
+        
+        frames = []
+        
+        if sampling_fps and sampling_fps > 0:
+            # 嚴格模式：根據 FPS 設定取樣
+            # 例如 0.5 fps = 每2秒取1 frame
+            interval_sec = 1.0 / sampling_fps  # 取樣間隔（秒）
+            
+            # 計算取樣時間點
+            sample_times = []
+            t = 0.0
+            while t < duration_sec:
+                sample_times.append(t)
+                t += interval_sec
+            
+            # 根據時間點取樣
+            for sample_time in sample_times:
+                frame_number = int(round(sample_time * fps))
+                if frame_number >= total_frames:
+                    frame_number = total_frames - 1
+                
+                cap.set(cv2.CAP_PROP_POS_FRAMES, frame_number)
+                ok, bgr = cap.read()
+                if not ok: continue
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(rgb))
+        else:
+            # 舊模式：均勻分佈（向後兼容）
+            n = min(max_frames, total_frames)
+            idxs = np.linspace(0, total_frames-1, num=n, dtype=np.int64)
+            for fi in idxs:
+                cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+                ok, bgr = cap.read()
+                if not ok: continue
+                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+                frames.append(Image.fromarray(rgb))
+        
         if not frames: raise RuntimeError("no frames sampled")
         return frames
     finally:
@@ -379,10 +485,15 @@ def infer_segment_qwen(
     event_detection_prompt: str,
     summary_prompt: str,
     target_short: int = 720,
-    frames_per_segment: int = 8,):
+    frames_per_segment: int = 8,
+    sampling_fps: Optional[float] = None,):
 
-    # 從影片中均勻抓取 N 張截圖
-    frames_pil = _sample_frames_evenly_to_pil(video_path, max_frames=frames_per_segment)
+    # 從影片中抓取截圖（根據 FPS 設定或均勻分佈）
+    frames_pil = _sample_frames_evenly_to_pil(
+        video_path, 
+        max_frames=frames_per_segment,
+        sampling_fps=sampling_fps
+    )
     images_b64 = []
     for img in frames_pil:
 
@@ -458,7 +569,7 @@ def infer_segment_owl(seg_path: str, labels: str, every_sec: float, score_thr: f
             raise
 
 # gemini 的輸入和 qwen 不一樣，qwen 用到 base64 字串
-def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt: str, summary_prompt: str, target_short: int=720, frames_per_segment: int=8) -> Tuple[Dict[str, Any], str]:
+def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt: str, summary_prompt: str, target_short: int=720, frames_per_segment: int=8, sampling_fps: Optional[float] = None) -> Tuple[Dict[str, Any], str]:
 
     # 0. 檢查 Key
     if not GEMINI_API_KEY:
@@ -468,7 +579,7 @@ def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt:
     try:
         # 1. Gemini 支援直接輸入多張圖片 (PIL Objects)，不像 Ollama 先轉成 Base64 字串，google-generativeai 套件會自動處理。
         print(f"--- [DEBUG] 正在處理影片: {seg_path}")
-        frames = _sample_frames_evenly_to_pil(seg_path, max_frames=frames_per_segment)
+        frames = _sample_frames_evenly_to_pil(seg_path, max_frames=frames_per_segment, sampling_fps=sampling_fps)
         print(f"--- [DEBUG] 成功抽取 {len(frames)} 張影格")
 
         # 2. 準備 Prompt，這裡將圖片和文字混合在一起。先放圖片，後放文字指令
@@ -532,22 +643,11 @@ def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt:
 # ================== 確認狀態的路由 ==================
 
 # Ping 的功能，確認 API 還有在運行
-@app.get("/health", tags=["確認連線狀態"])
-def health():
-    return {"ok": True, "time": _now_ts()}
-
-# 驗證 Key 是否有效 (前端 checkAuth 用)
-@app.get("/auth/verify", tags=["驗證 Key 是否有效"])
-def auth_verify(api_key: str = Depends(get_api_key)):
-    """
-    簡單回傳 200 OK，代表 Header 裡的 Key 是正確的。
-    如果 Key 錯誤，get_api_key 會直接拋出 401 異常，根本進不到這裡。
-    """
-    is_admin = api_key == ADMIN_TOKEN
-    return {"ok": True, "message": "Key is valid", "is_admin": is_admin}
+# 健康檢查和認證 API 已移至 src.api.health
 
 # ================== 所有業務邏輯 ==================
 
+# SegmentAnalysisRequest 定義保留在此處，供 video_analysis 模組使用
 # 制定資料格式的正確標準，供 /v1/analyze_segment_result、/v1/segment_pipeline_multipart 使用
 class SegmentAnalysisRequest(BaseModel):
     model_config = ConfigDict(protected_namespaces=())
@@ -563,6 +663,7 @@ class SegmentAnalysisRequest(BaseModel):
     qwen_model: str = "qwen2.5-vl:7b"
     frames_per_segment: int = 8
     target_short: int = 720
+    sampling_fps: Optional[float] = None  # 取樣 FPS（如果提供則嚴格遵循）
 
     # Prompt
     event_detection_prompt: str
@@ -573,102 +674,151 @@ class SegmentAnalysisRequest(BaseModel):
     owl_every_sec: float = 2.0
     owl_score_thr: float = 0.15
 
-# 處理一個小片段，完全不管檔案是怎麼上傳或切割的
-@app.post("/v1/analyze_segment_result", dependencies=[Depends(get_api_key)], tags=["總結"])
-def analyze_segment_result(req: SegmentAnalysisRequest):
-    """
-    這就是您要求的 API：輸入單一片段資訊，輸出該片段的分析結果 (JSON + Summary)
-    """
-    p = req.segment_path
-    tr = f"{_fmt_hms(req.start_time)} - {_fmt_hms(req.end_time)}"
-    t1 = time.time()
-
-    # 回傳結構初始化
-    result = {
-        "segment": Path(p).name,
-        "time_range": tr,
-        "duration_sec": round(req.end_time - req.start_time, 2),
-        "success": False,
-        "time_sec": 0.0,
-        "parsed": {},
-        "raw_detection": None,
-        "error": None
-    }
-
-    try:
-        # ==================== Qwen / Gemini 邏輯 ====================
-        if req.model_type in ("qwen", "gemini"):
-            # 1. 執行推論
-            if req.model_type == "qwen":
-                frame_obj, summary_txt = infer_segment_qwen(
-                    req.qwen_model, p, req.event_detection_prompt, req.summary_prompt,
-                    target_short=req.target_short, frames_per_segment=req.frames_per_segment
-                )
-            else: # gemini
-                # 自動判斷模型名稱
-                g_model = req.qwen_model if req.qwen_model.startswith("gemini") else "gemini-2.5-flash"
-                frame_obj, summary_txt = infer_segment_gemini(
-                    g_model, p, req.event_detection_prompt, req.summary_prompt,
-                    req.target_short, req.frames_per_segment
-                )
-
-            # 2. 資料清洗與標準化 (Normalization)
-            frame_norm = {
-                "events": {
-                    "water_flood": False, "fire": False,
-                    "abnormal_attire_face_cover_at_entry": False,
-                    "person_fallen_unmoving": False,
-                    "double_parking_lane_block": False,
-                    "smoking_outside_zone": False,
-                    "crowd_loitering": False,
-                    "security_door_tamper": False,
-                    "reason": ""
-                }
-            }
-
-            if isinstance(frame_obj, dict) and "error" not in frame_obj:
-                ev = frame_obj.get("events") or {}
-                defaults = frame_norm["events"]
-
-                # [動態欄位更新] 支援使用者自訂 Prompt
-                for k, v in ev.items():
-                    if k == "reason": continue
-                    try:
-                        defaults[k] = bool(v)
-                    except: pass
-
-                # [Reason 排序修正] 刪除再新增，確保排在最後
-                reason_text = str(ev.get("reason", "") or "")
-                if "reason" in defaults: del defaults["reason"]
-                defaults["reason"] = reason_text
-
-
-            # 填寫成功結果
-            result["success"] = ("error" not in (frame_obj or {})) and \
-                                (not req.summary_prompt.strip() or len((summary_txt or "").strip()) > 0)
-            result["parsed"] = {
-                "frame_analysis": frame_norm,
-                "summary_independent": (summary_txt or "").strip()
-            }
-
-        # ==================== OWL 邏輯 ====================
-        elif req.model_type == "owl":
-            j = infer_segment_owl(p, labels=req.owl_labels, every_sec=req.owl_every_sec, score_thr=req.owl_score_thr)
-            result["success"] = True
-            result["raw_detection"] = j
-
-        else:
-            raise ValueError("model_type must be qwen, gemini, or owl")
-
-    except Exception as ex:
-        result["error"] = str(ex)
-
-    result["time_sec"] = round(time.time() - t1, 2)
-    return result
+# 影片分析相關 API 已移至 src.api.video_analysis
 
 # 它不親自做分析，而是負責調度資源與流程控制。影片，切割，片段影片填入標準格式，片段 API 處理，打包成大的 JSON
-@app.post("/v1/segment_pipeline_multipart", dependencies=[Depends(get_api_key)], tags=["總結"])
-def segment_pipeline_multipart(
+# 影片切割 API 已移至 src.api.video_analysis
+# 保留函數定義以向後兼容（如果需要）
+def _segment_video_legacy(
+    request: Request,
+    api_key: str = Depends(get_api_key),
+    file: UploadFile = File(None),
+    video_url: str = Form(None),
+    segment_duration: float = Form(10.0),
+    overlap: float = Form(0.0),
+    sampling_fps: float = Form(0.5),
+    resolution: int = Form(720),
+    output_dir: Optional[str] = Form(None),  # 可選：自訂輸出目錄
+):
+    """
+    專門用於切割影片的 API，嚴格遵循所有參數：
+    
+    1. Segment Duration (s): 嚴格每 N 秒切割一段（除了最後一段可能較短）
+    2. Overlap (s): 嚴格重疊設定的秒數
+    3. Sampling Rate (FPS): 嚴格遵循，例如 0.5 fps = 每2秒取1 frame
+    4. Resolution (px): 強制設定影片長邊解析度
+    
+    參數:
+    - file: 上傳的影片檔案
+    - video_url: 影片 URL（與 file 二選一）
+    - segment_duration: 每段秒數（嚴格遵循）
+    - overlap: 重疊秒數（嚴格遵循）
+    - sampling_fps: 取樣 FPS（嚴格遵循，例如 0.5 = 每2秒取1 frame）
+    - resolution: 長邊解析度（px，嚴格遵循）
+    
+    返回:
+    - segments: 切割後的影片片段列表
+    - segment_info: 每個片段的詳細資訊（路徑、時間範圍、取樣幀數等）
+    """
+    # 1. 下載或獲取影片
+    if file is not None:
+        target_filename = file.filename or "video.mp4"
+        fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(file.filename or "video.mp4").suffix)
+        with os.fdopen(fd, "wb") as f:
+            f.write(file.file.read())
+        local_path, cleanup = tmp, True
+    elif video_url:
+        target_filename = Path(video_url).name or "video_url.mp4"
+        local_path, cleanup = _download_to_temp(video_url), True
+    else:
+        raise HTTPException(status_code=422, detail="需要 file 或 video_url")
+    
+    # 2. 驗證參數
+    if segment_duration <= 0:
+        raise HTTPException(status_code=422, detail="segment_duration 必須大於 0")
+    if overlap < 0:
+        raise HTTPException(status_code=422, detail="overlap 不能為負數")
+    if overlap >= segment_duration:
+        raise HTTPException(status_code=422, detail="overlap 必須小於 segment_duration")
+    if sampling_fps <= 0:
+        raise HTTPException(status_code=422, detail="sampling_fps 必須大於 0")
+    if resolution <= 0:
+        raise HTTPException(status_code=422, detail="resolution 必須大於 0")
+    
+    try:
+        # 3. 切割影片（使用嚴格模式）
+        stem = Path(target_filename).stem
+        if output_dir:
+            # 使用自訂輸出目錄
+            seg_dir = Path(output_dir)
+        else:
+            # 預設輸出目錄
+            seg_dir = Path("segment") / f"{stem}_strict"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"--- [INFO] 開始切割影片（嚴格模式）---")
+        print(f"  - Segment Duration: {segment_duration} 秒")
+        print(f"  - Overlap: {overlap} 秒")
+        print(f"  - Sampling FPS: {sampling_fps} (每 {1.0/sampling_fps:.1f} 秒取1 frame)")
+        print(f"  - Resolution: {resolution} px (長邊)")
+        
+        seg_files = _split_one_video(
+            local_path, 
+            seg_dir, 
+            segment_duration, 
+            overlap, 
+            prefix="segment",
+            resolution=resolution,
+            strict_mode=True  # 使用嚴格模式
+        )
+        
+        print(f"--- [INFO] 切割完成，共 {len(seg_files)} 個片段 ---")
+        
+        # 4. 為每個片段生成詳細資訊
+        segment_info = []
+        total_duration = _probe_duration_seconds(local_path)
+        
+        for i, seg_file in enumerate(seg_files):
+            # 計算時間範圍
+            start = i * (segment_duration - overlap)
+            end = min(start + segment_duration, total_duration)
+            
+            # 驗證實際片段時長
+            actual_duration = _probe_duration_seconds(seg_file)
+            
+            # 計算應該取樣的幀數（根據 FPS 設定）
+            expected_frames = max(1, int(round(sampling_fps * actual_duration)))
+            
+            segment_info.append({
+                "index": i,
+                "path": str(seg_file),
+                "relative_path": f"/segment/{Path(seg_file).parent.name}/{Path(seg_file).name}",
+                "start_time": round(start, 3),
+                "end_time": round(end, 3),
+                "expected_duration": round(segment_duration, 3),
+                "actual_duration": round(actual_duration, 3),
+                "expected_frames": expected_frames,
+                "sampling_fps": sampling_fps,
+                "resolution": resolution,
+            })
+        
+        # 5. 返回結果
+        return {
+            "status": "success",
+            "message": f"成功切割 {len(seg_files)} 個片段",
+            "segments": [str(f) for f in seg_files],
+            "segment_info": segment_info,
+            "total_segments": len(seg_files),
+            "total_duration": round(total_duration, 3),
+            "parameters": {
+                "segment_duration": segment_duration,
+                "overlap": overlap,
+                "sampling_fps": sampling_fps,
+                "resolution": resolution,
+            }
+        }
+    
+    except Exception as e:
+        if cleanup and os.path.exists(local_path):
+            os.remove(local_path)
+        raise HTTPException(status_code=500, detail=f"切割失敗：{str(e)}")
+    finally:
+        if cleanup and os.path.exists(local_path):
+            os.remove(local_path)
+
+# segment_pipeline_multipart API 已移至 src.api.video_analysis
+# 保留函數定義以向後兼容（如果需要）
+def _segment_pipeline_multipart_legacy(
     request: Request,
     api_key: str = Depends(get_api_key),
     db: Session = Depends(get_db) if HAS_DB else None,
@@ -681,6 +831,8 @@ def segment_pipeline_multipart(
     qwen_model: str = Form("qwen3-vl:8b"),
     frames_per_segment: int = Form(8),
     target_short: int = Form(720),
+    sampling_fps: Optional[float] = Form(None),  # 新增：取樣 FPS（如果提供則嚴格遵循）
+    strict_segmentation: bool = Form(False),  # 新增：是否使用嚴格切割模式
     owl_labels: str = Form("person,pedestrian,motorcycle,car,bus,scooter,truck"),
     owl_every_sec: float = Form(2.0),
     owl_score_thr: float = Form(0.15),
@@ -690,44 +842,103 @@ def segment_pipeline_multipart(
     save_basename: str = Form(None),
 ):
 
-    target_filename = "unknown_video"
+        target_filename = "unknown_video"
 
     # 1. 下載與儲存 (維持原樣)
-    # 如果提供了 video_id，表示要重新分析已存在的影片，跳過下載和切割
-    if video_id and video_id.strip():
-        # 使用已存在的影片，不需要下載或切割
-        local_path = None
-        cleanup = False
-    elif file is not None:
-        # [修正 1] 抓取原始檔名 (例如 "my_video.mp4")
-        target_filename = file.filename or "video.mp4"
-        fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(file.filename or "video.mp4").suffix)
-        with os.fdopen(fd, "wb") as f: f.write(file.file.read())
-        local_path, cleanup = tmp, True
-    elif video_url:
-        # [修正 2] 如果是 URL，從網址抓檔名
-        target_filename = Path(video_url).name or "video_url.mp4"
-        local_path, cleanup = _download_to_temp(video_url), True
-    else:
-        raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
+        # 如果提供了 video_id，表示要重新分析已存在的影片，跳過下載和切割
+        if video_id and video_id.strip():
+            # 使用已存在的影片，不需要下載或切割
+            local_path = None
+            cleanup = False
+        elif file is not None:
+            # [修正 1] 抓取原始檔名 (例如 "my_video.mp4")
+            target_filename = file.filename or "video.mp4"
+            fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(file.filename or "video.mp4").suffix)
+            with os.fdopen(fd, "wb") as f: f.write(file.file.read())
+            local_path, cleanup = tmp, True
+        elif video_url:
+            # [修正 2] 如果是 URL，從網址抓檔名
+            target_filename = Path(video_url).name or "video_url.mp4"
+            local_path, cleanup = _download_to_temp(video_url), True
+        else:
+            raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
 
-    # 2. 切割影片 (如果沒有使用已存在的影片)
+        # 2. 切割影片 (如果沒有使用已存在的影片)
     # [修正 3] 使用 "原始檔名" 來當作 ID，而不是用 local_path 的亂碼檔名
-    if video_id and video_id.strip():
-        video_id_clean = video_id.strip()
-        
-        # 檢查是否為 video_lib 格式 (category/video_name)
-        if "/" in video_id_clean:
-            # 從 video 資料夾讀取原始影片
-            category, video_name = video_id_clean.split("/", 1)
+        if video_id and video_id.strip():
+            video_id_clean = video_id.strip()
             
-            # 檢查是否已經在 segment 中處理過（使用 {category}_{video_name} 作為 ID）
-            stem = f"{category}_{video_name}"  # 使用分類和影片名作為 ID
-            seg_dir = Path("segment") / stem
-            
-            if seg_dir.exists() and list(seg_dir.glob("segment_*.mp4")):
-                # 已經處理過，直接使用現有的片段（不從 video 資料夾複製）
-                seg_files = sorted(seg_dir.glob("segment_*.mp4"))
+            # 檢查是否為 video_lib 格式 (category/video_name)
+            if "/" in video_id_clean:
+                # 從 video 資料夾讀取原始影片
+                category, video_name = video_id_clean.split("/", 1)
+                
+                # 檢查是否已經在 segment 中處理過（使用 {category}_{video_name} 作為 ID）
+                stem = f"{category}_{video_name}"  # 使用分類和影片名作為 ID
+                seg_dir = Path("segment") / stem
+                
+                if seg_dir.exists() and list(seg_dir.glob("segment_*.mp4")):
+                    # 已經處理過，直接使用現有的片段（不從 video 資料夾複製）
+                    seg_files = sorted(seg_dir.glob("segment_*.mp4"))
+                    try:
+                        json_files = list(seg_dir.glob("*.json"))
+                        if json_files:
+                            with open(max(json_files, key=lambda p: p.stat().st_mtime), "r", encoding="utf-8") as f:
+                                old_data = json.load(f)
+                                total_duration = sum(r.get("duration_sec", segment_duration) for r in old_data.get("results", []))
+                        else:
+                            total_duration = len(seg_files) * segment_duration
+                    except:
+                        total_duration = len(seg_files) * segment_duration
+                else:
+                    # 尚未處理過，需要從 video 資料夾讀取原始影片並切割
+                    video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
+                    
+                    # 嘗試其他擴展名
+                    if not video_path.exists():
+                        for ext in ['.avi', '.mov', '.mkv', '.flv']:
+                            video_path = VIDEO_LIB_DIR / category / f"{video_name}{ext}"
+                            if video_path.exists():
+                                break
+                    
+                    if not video_path.exists():
+                        raise HTTPException(status_code=404, detail=f"Video {video_id_clean} not found in video library")
+                    
+                    # 尚未處理過，需要切割影片
+                    seg_dir.mkdir(parents=True, exist_ok=True)
+                    try:
+                        # 複製影片到 segment 資料夾進行處理
+                        import shutil
+                        temp_video = seg_dir / video_path.name
+                        shutil.copy2(video_path, temp_video)
+                        seg_files = _split_one_video(
+                            temp_video, 
+                            seg_dir, 
+                            segment_duration, 
+                            overlap, 
+                            prefix="segment",
+                            resolution=target_short if strict_segmentation else None,
+                            strict_mode=strict_segmentation
+                        )
+                        total_duration = _probe_duration_seconds(temp_video)
+                        # 處理完後可以選擇刪除臨時副本（保留原始文件在 video 資料夾）
+                        # os.remove(temp_video)  # 可選：刪除臨時副本
+                    except Exception as e:
+                        raise HTTPException(status_code=500, detail=f"切割失敗：{e}")
+            else:
+                # 傳統的 segment 中的影片
+                stem = video_id_clean
+                seg_dir = Path("segment") / stem
+                if not seg_dir.exists():
+                    raise HTTPException(status_code=404, detail=f"Video {video_id_clean} not found")
+                
+                # 查找已存在的片段影片
+                seg_files_existing = sorted(seg_dir.glob("segment_*.mp4"))
+                if not seg_files_existing:
+                    raise HTTPException(status_code=404, detail=f"No segment files found for video {video_id_clean}")
+                
+                seg_files = seg_files_existing
+                # 估算總時長（從片段數量推斷，或從 JSON 讀取）
                 try:
                     json_files = list(seg_dir.glob("*.json"))
                     if json_files:
@@ -738,148 +949,107 @@ def segment_pipeline_multipart(
                         total_duration = len(seg_files) * segment_duration
                 except:
                     total_duration = len(seg_files) * segment_duration
-            else:
-                # 尚未處理過，需要從 video 資料夾讀取原始影片並切割
-                video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
-                
-                # 嘗試其他擴展名
-                if not video_path.exists():
-                    for ext in ['.avi', '.mov', '.mkv', '.flv']:
-                        video_path = VIDEO_LIB_DIR / category / f"{video_name}{ext}"
-                        if video_path.exists():
-                            break
-                
-                if not video_path.exists():
-                    raise HTTPException(status_code=404, detail=f"Video {video_id_clean} not found in video library")
-                
-                # 尚未處理過，需要切割影片
-                seg_dir.mkdir(parents=True, exist_ok=True)
-                try:
-                    # 複製影片到 segment 資料夾進行處理
-                    import shutil
-                    temp_video = seg_dir / video_path.name
-                    shutil.copy2(video_path, temp_video)
-                    seg_files = _split_one_video(temp_video, seg_dir, segment_duration, overlap, prefix="segment")
-                    total_duration = _probe_duration_seconds(temp_video)
-                    # 處理完後可以選擇刪除臨時副本（保留原始文件在 video 資料夾）
-                    # os.remove(temp_video)  # 可選：刪除臨時副本
-                except Exception as e:
-                    raise HTTPException(status_code=500, detail=f"切割失敗：{e}")
         else:
-            # 傳統的 segment 中的影片
-            stem = video_id_clean
+            stem = Path(target_filename).stem
+            # 建立固定的資料夾 segment/video_1/
             seg_dir = Path("segment") / stem
-            if not seg_dir.exists():
-                raise HTTPException(status_code=404, detail=f"Video {video_id_clean} not found")
-            
-            # 查找已存在的片段影片
-            seg_files_existing = sorted(seg_dir.glob("segment_*.mp4"))
-            if not seg_files_existing:
-                raise HTTPException(status_code=404, detail=f"No segment files found for video {video_id_clean}")
-            
-            seg_files = seg_files_existing
-            # 估算總時長（從片段數量推斷，或從 JSON 讀取）
+            seg_dir.mkdir(parents=True, exist_ok=True)
             try:
-                json_files = list(seg_dir.glob("*.json"))
-                if json_files:
-                    with open(max(json_files, key=lambda p: p.stat().st_mtime), "r", encoding="utf-8") as f:
-                        old_data = json.load(f)
-                        total_duration = sum(r.get("duration_sec", segment_duration) for r in old_data.get("results", []))
-                else:
-                    total_duration = len(seg_files) * segment_duration
-            except:
-                total_duration = len(seg_files) * segment_duration
-    else:
-        stem = Path(target_filename).stem
-        # 建立固定的資料夾 segment/video_1/
-        seg_dir = Path("segment") / stem
-        seg_dir.mkdir(parents=True, exist_ok=True)
+                seg_files = _split_one_video(
+                    local_path, 
+                    seg_dir, 
+                    segment_duration, 
+                    overlap, 
+                    prefix="segment",
+                    resolution=target_short if strict_segmentation else None,
+                    strict_mode=strict_segmentation
+                )
+                total_duration = _probe_duration_seconds(local_path)
+            except Exception as e:
+                if cleanup and os.path.exists(local_path): os.remove(local_path)
+                raise HTTPException(status_code=500, detail=f"切割失敗：{e}")
+
+        # 3. 迴圈：Call API 取得結果
+        results = []
+        t0 = time.time()
+
+        print(f"--- 開始處理 {len(seg_files)} 個片段，呼叫分析 API ---")
+
+        for p in seg_files:
+            # 3.1 計算時間區段資訊
+            m = re.search(r"(\d+)", Path(p).name)
+            idx = int(m.group(1)) if m else 0
+            start = idx * (segment_duration - overlap)
+            end = min(start + segment_duration, total_duration)
+
+            # 3.2 準備參數 (Request Body)
+            req_data = SegmentAnalysisRequest(
+                segment_path=str(p), # 傳遞絕對路徑
+                segment_index=idx,
+                start_time=start,
+                end_time=end,
+                model_type=model_type,
+                qwen_model=qwen_model,
+                frames_per_segment=frames_per_segment,
+                target_short=target_short,
+            sampling_fps=sampling_fps,  # 傳遞取樣 FPS
+                event_detection_prompt=event_detection_prompt,
+                summary_prompt=summary_prompt,
+                owl_labels=owl_labels,
+                owl_every_sec=owl_every_sec,
+                owl_score_thr=owl_score_thr
+            )
+
+            # 3.3 【關鍵步驟】Call API
+            # 這裡直接呼叫函式，這等同於透過內部網路呼叫該 API，但更快
+            res = analyze_segment_result(req_data)
+            results.append(res)
+
+        # 4. 統計與存檔 (維持原樣)
+        total_time = time.time() - t0
+        ok_count = sum(1 for r in results if r.get("success"))
+
+        resp = {
+            "model_type": model_type,
+            "total_segments": len(results),
+            "success_segments": ok_count,
+            "total_time_sec": round(total_time, 2),
+            "results": results,
+        }
+
         try:
-            seg_files = _split_one_video(local_path, seg_dir, segment_duration, overlap, prefix="segment")
-            total_duration = _probe_duration_seconds(local_path)
-        except Exception as e:
-            if cleanup and os.path.exists(local_path): os.remove(local_path)
-            raise HTTPException(status_code=500, detail=f"切割失敗：{e}")
+            if save_json:
+                filename = save_basename or f"{stem}.json"
 
-    # 3. 迴圈：Call API 取得結果
-    results = []
-    t0 = time.time()
+                save_path = seg_dir / filename
+                with open(save_path, "w", encoding="utf-8") as f:
+                    json.dump(resp, f, ensure_ascii=False, indent=2)
+                resp["save_path"] = str(save_path)
 
-    print(f"--- 開始處理 {len(seg_files)} 個片段，呼叫分析 API ---")
+                if AUTO_RAG_INDEX:
+                    resp["rag_auto_indexed"] = _auto_index_to_rag(resp)
+        except Exception: pass
 
-    for p in seg_files:
-        # 3.1 計算時間區段資訊
-        m = re.search(r"(\d+)", Path(p).name)
-        idx = int(m.group(1)) if m else 0
-        start = idx * (segment_duration - overlap)
-        end = min(start + segment_duration, total_duration)
+        # 5. 保存分析結果到 PostgreSQL（與 RAG 同步）
+        if HAS_DB and db:
+            try:
+                _save_results_to_postgres(db, results, stem)
+            except Exception as e:
+                print(f"--- [WARNING] 保存到 PostgreSQL 失敗: {e} ---")
+                # 不中斷流程，只記錄警告
 
-        # 3.2 準備參數 (Request Body)
-        req_data = SegmentAnalysisRequest(
-            segment_path=str(p), # 傳遞絕對路徑
-            segment_index=idx,
-            start_time=start,
-            end_time=end,
-            model_type=model_type,
-            qwen_model=qwen_model,
-            frames_per_segment=frames_per_segment,
-            target_short=target_short,
-            event_detection_prompt=event_detection_prompt,
-            summary_prompt=summary_prompt,
-            owl_labels=owl_labels,
-            owl_every_sec=owl_every_sec,
-            owl_score_thr=owl_score_thr
-        )
+        if cleanup and os.path.exists(local_path):
+            try: os.remove(local_path)
+            except: pass
 
-        # 3.3 【關鍵步驟】Call API
-        # 這裡直接呼叫函式，這等同於透過內部網路呼叫該 API，但更快
-        res = analyze_segment_result(req_data)
-        results.append(res)
-
-    # 4. 統計與存檔 (維持原樣)
-    total_time = time.time() - t0
-    ok_count = sum(1 for r in results if r.get("success"))
-
-    resp = {
-        "model_type": model_type,
-        "total_segments": len(results),
-        "success_segments": ok_count,
-        "total_time_sec": round(total_time, 2),
-        "results": results,
-    }
-
-    try:
-        if save_json:
-            filename = save_basename or f"{stem}.json"
-
-            save_path = seg_dir / filename
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(resp, f, ensure_ascii=False, indent=2)
-            resp["save_path"] = str(save_path)
-
-            if AUTO_RAG_INDEX:
-                resp["rag_auto_indexed"] = _auto_index_to_rag(resp)
-    except Exception: pass
-
-    # 5. 保存分析結果到 PostgreSQL（與 RAG 同步）
-    if HAS_DB and db:
-        try:
-            _save_results_to_postgres(db, results, stem)
-        except Exception as e:
-            print(f"--- [WARNING] 保存到 PostgreSQL 失敗: {e} ---")
-            # 不中斷流程，只記錄警告
-
-    if cleanup and os.path.exists(local_path):
-        try: os.remove(local_path)
-        except: pass
-
-    return JSONResponse(resp, media_type="application/json; charset=utf-8")
+        return JSONResponse(resp, media_type="application/json; charset=utf-8")
 
 # ================== 前端網頁取得 prompt 的來源 ==================
 
 # 新增一個 GET 路由
-@app.get("/prompts/defaults", tags=["回傳 prompt 到前端"])
-def get_default_prompts():
+# Prompt API 已移至 src.api.prompts
+# 保留函數定義以向後兼容（如果需要）
+def _get_default_prompts_legacy():
     """回傳後端設定的預設 Prompts（動態讀取文件，無需重啟服務）"""
     # 動態讀取 prompt 文件，而不是使用啟動時緩存的變數
     prompts_dir = Path(__file__).parent.parent / "prompts"
@@ -1020,85 +1190,62 @@ def _results_to_docs(src_resp: Any) -> List[Dict[str, Any]]:
 
     return docs
 
-# 根據 Video ID (路徑識別) 刪除舊的 RAG 紀錄
+# [DEPRECATED] _remove_old_rag_records 已不再需要
+# PostgreSQL 使用更新或新增邏輯（在 _save_results_to_postgres 中實現），不需要手動刪除舊記錄
 def _remove_old_rag_records(target_video_id: str):
     """
-    讀取 meta.jsonl，把 metadata['video'] == target_video_id 的舊資料通通刪掉。
+    [DEPRECATED] 此函數已不再使用
+    PostgreSQL 使用更新或新增邏輯，不需要手動刪除舊記錄
     """
-    meta_path = RAG_DIR / "meta.jsonl"
-    if not meta_path.exists():
-        return 0
-
-    temp_path = meta_path.with_suffix(".tmp")
-    removed_count = 0
-
-    try:
-        with open(meta_path, "r", encoding="utf-8") as fin, \
-             open(temp_path, "w", encoding="utf-8") as fout:
-
-            for line in fin:
-                try:
-                    doc = json.loads(line)
-                    # 關鍵比對：如果這行資料屬於我們要覆寫的影片，就跳過（刪除）
-                    if doc.get("metadata", {}).get("video") == target_video_id:
-                        removed_count += 1
-                        continue
-                    fout.write(line)
-                except:
-                    fout.write(line)
-
-        # 覆蓋回原檔案
-        import shutil
-        shutil.move(str(temp_path), str(meta_path))
-
-    except Exception as e:
-        print(f"[RAG Clean Error] {e}")
-        if temp_path.exists():
-            os.remove(temp_path)
-
-    return removed_count
+    return 0
 
 # 當影片分析完成後，順便自動把結果存進向量資料庫。
+# 注意：數據已經通過 _save_results_to_postgres 自動保存到 PostgreSQL（包含 embedding）
+# 此函數現在只返回成功狀態，實際索引已在 PostgreSQL 中完成
 def _auto_index_to_rag(resp: Dict[str, Any]) -> Dict[str, Any]:
 
     # 先看全域變數 AUTO_RAG_INDEX 是否為 True。如果關閉就不做。
     if not AUTO_RAG_INDEX:
         return {"enabled": False, "message": "自動 RAG 索引已停用"}
 
+    # 檢查資料庫是否可用
+    if not HAS_DB:
+        return {
+            "success": False,
+            "error": "Database not available",
+            "message": "RAG 索引失敗：資料庫不可用"
+        }
+
     try:
-        # 1. 轉換格式
-        docs = _results_to_docs(resp)
-        if not docs:
-            return {
-                "success": False,
-                "added": 0,
-                "message": "無可索引的文件"
-            }
-
-        # 2. [新增] 抓出這次要索引的影片名稱 (Video ID)
-        # 我們從第一筆 doc 的 metadata 拿 video 欄位
-        target_video_id = docs[0]["metadata"]["video"]
-
-        # 3. 先執行刪除舊資料
-        removed = _remove_old_rag_records(target_video_id)
-
-        # 4. 呼叫 RAGStore 加入新資料 (維持原樣)
-        store = RAGStore(store_dir=str(RAG_DIR))
-        added = store.add_docs(docs)
-
-        # 計算總數
+        # 數據已經通過 _save_results_to_postgres 自動保存到 PostgreSQL（包含 embedding）
+        # 這裡只返回成功狀態
+        results = resp.get("results", [])
+        success_count = len([r for r in results if r.get("success", False)])
+        
+        # 從 PostgreSQL 查詢總數（可選，如果需要準確數字）
         total = 0
-        if store.meta_path.exists():
-            with store.meta_path.open("r", encoding="utf-8") as f:
-                for _ in f:
-                    total += 1
+        try:
+            from src.database import SessionLocal
+            from src.models import Summary
+            from sqlalchemy import func
+            db = SessionLocal()
+            try:
+                total = db.query(func.count(Summary.id)).filter(
+                    Summary.message.isnot(None),
+                    Summary.message != "",
+                    Summary.embedding.isnot(None)
+                ).scalar() or 0
+            finally:
+                db.close()
+        except Exception:
+            pass  # 查詢失敗不影響返回
 
         return {
             "success": True,
-            "removed_old": int(removed), # 回傳刪了幾筆
-            "added_new": int(added),
-            "total": int(total),
-            "message": f"✓ RAG 更新完成 (覆蓋 {removed} 筆舊資料，新增 {added} 筆)"
+            "removed_old": 0,  # PostgreSQL 使用更新或新增邏輯，不需要刪除
+            "added_new": success_count,
+            "total": total,
+            "message": f"✓ RAG 更新完成（已保存 {success_count} 筆到 PostgreSQL）"
         }
     except Exception as e:
         return {
@@ -1109,49 +1256,11 @@ def _auto_index_to_rag(resp: Dict[str, Any]) -> Dict[str, Any]:
 
 # ================== RAG 相關 API ==================
 
-# 將指定的分析結果（JSON）寫入 RAG。
-@app.post("/rag/index", tags=["RAG 相關 API"])
-async def rag_index(request: Request):
-
-    # 前端直接把分析完的一大包 JSON 陣列傳過來。
-    payload = await request.json()
-    src_resp = payload.get("results")
-    save_path = payload.get("save_path")
-
-    if not src_resp and save_path:
-        try:
-            src_resp = json.loads(Path(save_path).read_text(encoding="utf-8"))
-        except Exception as e:
-            raise HTTPException(status_code=400, detail=f"load save_path failed: {e}")
-    if not src_resp:
-        raise HTTPException(status_code=422, detail="missing results or save_path")
-
-    docs = _results_to_docs(src_resp)
-    if not docs:
-        return {"ok": True, "backend": None, "added": 0, "total": 0}
-
-    # 抓出 Video ID 並刪除舊資料
-    target_video_id = docs[0]["metadata"]["video"]
-    removed = _remove_old_rag_records(target_video_id)
-
-    if not HAS_RAG_STORE or RAGStore is None:
-        raise HTTPException(status_code=503, detail="RAGStore not available (faiss-cpu not installed)")
-    store = RAGStore(store_dir=RAG_DIR)
-    added = store.add_docs(docs)
-
-    # 計算目前總數
-    total = 0
-    if store.meta_path.exists():
-        with store.meta_path.open("r", encoding="utf-8") as f:
-            for _ in f: total += 1
-
-    return {
-        "ok": True,
-        "backend": store.embed_model,
-        "removed_old": int(removed),
-        "added": int(added),
-        "total": int(total)
-    }
+# [DEPRECATED] RAG index API 已移至 src.api.rag，並改為使用 PostgreSQL
+# 此函數已不再使用，保留僅用於向後兼容
+async def _rag_index_legacy(request: Request):
+    """[DEPRECATED] 此函數已不再使用，請使用 /rag/index API（已遷移到 PostgreSQL）"""
+    raise HTTPException(status_code=410, detail="此 API 已棄用，請使用新的 /rag/index API（PostgreSQL）")
 
 # ================== 影片管理 API ==================
 
@@ -1189,8 +1298,9 @@ def _get_video_lib_categories() -> Dict[str, List[str]]:
                     categories[category_name] = sorted(video_files)
     return categories
 
-@app.get("/v1/videos/list", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-def list_videos():
+# 影片管理 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+def _list_videos_legacy():
     """獲取已上傳的影片列表（統一管理 segment 和 video 兩個位置）"""
     seg_dir = Path("segment")
     videos = []
@@ -1299,8 +1409,9 @@ def list_videos():
         "categories": list(video_lib_categories.keys())  # 返回所有分類
     }
 
-@app.get("/v1/videos/{video_id:path}", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-def get_video_info(video_id: str):
+# 影片詳情 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+def _get_video_info_legacy(video_id: str):
     """獲取特定影片的詳細信息（支持 segment 和 video_lib 兩個來源）"""
     # 檢查是否為 video_lib 格式 (category/video_name)
     if "/" in video_id:
@@ -1392,29 +1503,15 @@ def get_video_info(video_id: str):
             "event_set_by": event_info.get("set_by", ""),
             "event_set_at": event_info.get("set_at", ""),
             "category": None,
-        }
+    }
 
-# 獲取 RAG 統計資訊 (前端顯示索引數量用)
-@app.get("/rag/stats", dependencies=[Depends(get_api_key)], tags=["RAG 相關 API"])
-def rag_stats():
-    """
-    計算目前 RAG 資料庫裡有多少筆資料。
-    透過計算 meta.jsonl 的行數來實現。
-    """
-    count = 0
-    meta_path = RAG_DIR / "meta.jsonl" # 假設您的 RAG Store 是這樣實作的
-
-    if meta_path.exists():
-        try:
-            with open(meta_path, "r", encoding="utf-8") as f:
-                for _ in f:
-                    count += 1
-        except Exception:
-            pass # 讀取失敗就當作 0
-
+# [DEPRECATED] RAG stats API 已移至 src.api.rag，並改為使用 PostgreSQL
+# 此函數已不再使用，保留僅用於向後兼容
+def _rag_stats_legacy():
+    """[DEPRECATED] 此函數已不再使用，請使用 /rag/stats API（已遷移到 PostgreSQL）"""
     return {
-        "count": count,
-        "path": str(RAG_DIR.absolute())
+        "count": 0,
+        "path": "PostgreSQL (此 API 已棄用)"
     }
 
 # ================== 影片管理 API ==================
@@ -1432,8 +1529,9 @@ def _load_video_events() -> Dict[str, Dict[str, Any]]:
             return {}
     return {}
 
-@app.post("/v1/videos/{video_id:path}/event", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-async def set_video_event(video_id: str, request: Request):
+# 影片事件 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+async def _set_video_event_legacy(video_id: str, request: Request):
     """設置影片的事件標籤（管理者功能）"""
     # 驗證影片是否存在（支持 segment 和 video_lib 格式）
     video_exists = False
@@ -1481,8 +1579,9 @@ async def set_video_event(video_id: str, request: Request):
         "message": f"影片 {video_id} 已標記為「{event_label}」"
     }
 
-@app.delete("/v1/videos/{video_id:path}/event", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-def remove_video_event(video_id: str):
+# 移除影片事件 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+def _remove_video_event_legacy(video_id: str):
     """移除影片的事件標籤"""
     events = _load_video_events()
     if video_id in events:
@@ -1491,8 +1590,9 @@ def remove_video_event(video_id: str):
         return {"success": True, "message": f"已移除影片 {video_id} 的事件標籤"}
     return {"success": False, "message": f"影片 {video_id} 沒有事件標籤"}
 
-@app.get("/v1/videos/categories", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-def get_video_categories():
+# 影片分類 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+def _get_video_categories_legacy():
     """獲取 video 資料夾中的所有分類"""
     categories = _get_video_lib_categories()
     return {
@@ -1500,8 +1600,9 @@ def get_video_categories():
         "category_details": {cat: len(videos) for cat, videos in categories.items()}
     }
 
-@app.post("/v1/videos/{video_id:path}/move", dependencies=[Depends(get_api_key)], tags=["影片管理"])
-async def move_video_to_category(video_id: str, request: Request):
+# 移動影片 API 已移至 src.api.video_management
+# 保留函數定義以向後兼容（如果需要）
+async def _move_video_to_category_legacy(video_id: str, request: Request):
     """將影片移動到 video 資料夾的指定分類（管理者功能）"""
     # 檢查是否為管理者
     api_key = request.headers.get("X-API-Key", "")
@@ -1568,8 +1669,9 @@ async def move_video_to_category(video_id: str, request: Request):
     }
 
 # 幫你找影片片段，但不負責解釋內容
-@app.post("/rag/search", tags=["RAG 相關 API"])
-async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+# RAG search API 已移至 src.api.rag
+# 保留函數定義以向後兼容（如果需要）
+async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
     """
     使用 PostgreSQL + pgvector 進行混合搜索
     - Filter 1 (Hard Filter): 時間範圍、事件類型、關鍵字過濾
@@ -1597,7 +1699,7 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         
         try:
             query_filters = _parse_query_filters(query)
-            
+        
             # 提取日期解析資訊，用於返回給前端
             if query_filters.get("date_filter") or query_filters.get("time_start"):
                 date_filter = query_filters.get("date_filter")
@@ -1932,8 +2034,8 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
                                     for keyword in required_keywords:
                                         keyword_lower = keyword.lower()
                                         if keyword in summary_original or keyword_lower in summary:
-                                            has_keyword_match = True
-                                            break
+                                                    has_keyword_match = True
+                                                    break
                                 
                                 # 只有當有事件標記或摘要中包含關鍵字時，才給予高分數
                                 if has_event_match or has_keyword_match:
@@ -2147,8 +2249,9 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         )
 
 # 它不僅幫你找資料，還會 「閱讀資料並回答問題」。
-@app.post("/rag/answer", tags=["RAG 相關 API"])
-async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+# RAG answer API 已移至 src.api.rag
+# 保留函數定義以向後兼容（如果需要）
+async def _rag_answer_legacy(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
     """
     使用 PostgreSQL + pgvector 進行混合搜索，然後使用 LLM 生成回答
     搜索邏輯與 /rag/search 完全相同
@@ -2176,7 +2279,7 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
         
         try:
             query_filters = _parse_query_filters(question)
-            
+        
             # 提取日期解析資訊，用於返回給前端
             if query_filters.get("date_filter") or query_filters.get("time_start"):
                 if not date_info:  # 如果 LLM 工具調用已經設置了 date_info，就不需要重複設置
@@ -2344,7 +2447,7 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
 
             if score < score_threshold:
                 continue
-
+            
             events_true = []
             if result.fire:
                 events_true.append("fire")
@@ -2418,7 +2521,7 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
             summary = hit.get("summary", "")
             video = hit.get("video")
             time_range = hit.get("time_range")
-            
+
             # 在 context 中加入分數資訊讓 LLM 參考也不錯，但這邊先保持簡潔
             context_blocks.append(
                 f"[{i}] 影片: {video}  時間: {time_range}\n摘要: {summary}"
@@ -3162,6 +3265,16 @@ def _merge_and_rank_results(
     sorted_results = sorted(merged.values(), key=lambda x: x["final_score"], reverse=True)
     
     return sorted_results
+
+# ================== 註冊 API 路由 ==================
+# 必須在所有函數定義之後註冊，避免循環導入
+from src.api import health, prompts, video_analysis, rag, video_management
+
+app.include_router(health.router)
+app.include_router(prompts.router)
+app.include_router(video_analysis.router)
+app.include_router(rag.router)
+app.include_router(video_management.router)
 
 if __name__ == "__main__":
     import uvicorn

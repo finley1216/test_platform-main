@@ -148,6 +148,78 @@ docker exec test_platform-main-backend-1 python3 /app/src/migrate_segments_to_db
 
 ## 開發日誌
 
+### 2025-12-31
+
+#### Backend
+- **API 模組化重構**
+  - 創建 `backend/src/api/` 資料夾結構，將所有 API 端點按功能分類管理
+  - 創建 `api/health.py`：健康檢查和認證相關 API（`/health`, `/auth/verify`）
+  - 創建 `api/prompts.py`：Prompt 管理 API（`/prompts/defaults`）
+  - 創建 `api/video_analysis.py`：影片分析相關 API
+    - `/v1/analyze_segment_result`：單一片段分析
+    - `/v1/segment_video`：影片切割（嚴格模式）
+    - `/v1/segment_pipeline_multipart`：完整分析流程
+  - 創建 `api/rag.py`：RAG 相關 API
+    - `/rag/index`：索引分析結果
+    - `/rag/search`：混合搜索
+    - `/rag/answer`：LLM 回答
+    - `/rag/stats`：統計資訊
+  - 創建 `api/video_management.py`：影片管理 API
+    - `/v1/videos/list`：影片列表
+    - `/v1/videos/{video_id}`：影片詳情
+    - `/v1/videos/{video_id}/event`：事件標籤管理
+    - `/v1/videos/categories`：分類列表
+    - `/v1/videos/{video_id}/move`：移動影片到分類
+  - 修改 `main.py`：移除所有端點定義，保留輔助函數，在文件末尾註冊路由模組
+  - 解決循環導入問題：將路由註冊移到所有函數定義之後
+
+- **修復 RAG 索引錯誤**
+  - 修改 `_auto_index_to_rag` 函數：添加 `HAS_RAG_STORE` 和 `RAGStore` 可用性檢查
+  - 當 RAGStore 不可用時（faiss-cpu 未安裝），返回明確的錯誤訊息，避免 `'NoneType' object has no attribute 'read_index'` 錯誤
+
+- **修復影片詳情 API 404 錯誤**
+  - 修改 `api/video_management.py` 的 `get_video_info` 函數：
+    - 優先檢查 `segment` 中是否有對應的處理結果（格式：`{category}_{video_name}`）
+    - 如果 segment 中有結果，優先使用 segment 的結果
+    - 如果 segment 中沒有，再檢查 `video_lib`
+    - 兩者都沒有才返回 404
+  - 解決前端使用 `fire/1` 格式訪問時找不到影片的問題
+
+- **清理不需要的遷移腳本**
+  - 刪除 `add_embedding_column.py`：一次性資料庫遷移腳本
+  - 刪除 `generate_embeddings.py`：一次性工具腳本
+  - 保留 `add_video_column.py` 和 `migrate_segments_to_db.py`（可能仍需要）
+
+#### Frontend
+- **修復無限循環請求問題**
+  - 修改 `frontend/src/components/AnalysisResults.js`：
+    - 使用 `useMemo` 記憶化 `videoIdInfo`，避免每次渲染都創建新對象
+    - 使用 `useRef` 追蹤已載入的請求，避免重複請求相同數據
+    - 解決 `useEffect` 依賴項導致無限循環的問題
+
+- **完全移除 FAISS 依賴，全面遷移到 PostgreSQL + pgvector**
+  - 修改 `/rag/index` API：改為使用 PostgreSQL 保存數據（通過 `_save_results_to_postgres`）
+  - 修改 `/rag/stats` API：改為從 PostgreSQL 查詢統計信息（查詢有 embedding 的記錄數量）
+  - 修改 `_auto_index_to_rag` 函數：移除 RAGStore 使用，改為只返回成功狀態（數據已通過 `_save_results_to_postgres` 自動保存）
+  - 移除 `main.py` 中的 RAGStore 導入：標記為已棄用，設置 `HAS_RAG_STORE = False`
+  - 移除 `_remove_old_rag_records` 函數的實際功能：PostgreSQL 使用更新或新增邏輯，不需要手動刪除
+  - 移除 `_rag_index_legacy` 和 `_rag_stats_legacy` 函數中的 RAGStore 使用：標記為已棄用
+  - 刪除 `backend/src/rag_store.py` 文件：不再需要 FAISS 相關代碼
+  - 修復循環導入問題：將 `router` 定義移到導入之前，`_save_results_to_postgres` 在函數中使用時再導入
+  - 所有 RAG 功能現在完全使用 PostgreSQL + pgvector：
+    - `/rag/search`：使用 PostgreSQL + pgvector 進行混合搜索
+    - `/rag/answer`：使用 PostgreSQL + pgvector 進行搜索後 LLM 回答
+    - `/rag/index`：使用 PostgreSQL 保存數據（包含 embedding）
+    - `/rag/stats`：從 PostgreSQL 查詢統計信息
+
+#### 備註
+- API 模組化完成，所有端點已按功能分類到獨立模組
+- 後端服務正常運行，所有 API 端點正常工作
+- 前端無限循環請求問題已修復
+- 影片詳情 API 現在可以正確處理 `category/video_name` 格式的請求
+- **完全移除 FAISS 依賴**：所有 RAG 功能現在完全使用 PostgreSQL + pgvector，不再需要 `faiss-cpu` 套件
+- `backend/rag_store/` 資料夾（包含 `meta.jsonl`、`dim.txt`、`index.faiss`）可以刪除，不再使用
+
 ### 2025-12-30
 
 #### Backend

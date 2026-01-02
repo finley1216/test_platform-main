@@ -1,13 +1,15 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useMemo, useRef } from "react";
 import { EVENT_MAP } from "../utils/constants";
 import apiService from "../services/api";
 
 const AnalysisResults = ({ data, apiKey, authenticated }) => {
   const [showJson, setShowJson] = useState(false);
   const [videoEvent, setVideoEvent] = useState(null);
+  const hasLoadedRef = useRef(false); // 用於追蹤是否已經載入過
 
   // 從 save_path 提取 video_id，並嘗試還原為 video_lib 格式
-  const getVideoId = () => {
+  // 使用 useMemo 避免每次渲染都創建新對象
+  const videoIdInfo = useMemo(() => {
     if (!data?.save_path) return null;
     const parts = data.save_path.split("/");
     const segmentIndex = parts.indexOf("segment");
@@ -33,13 +35,15 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
       };
     }
     return null;
-  };
-
-  const videoIdInfo = getVideoId();
+  }, [data?.save_path]); // 只有當 save_path 改變時才重新計算
 
   // 載入影片事件標籤
   useEffect(() => {
     if (!videoIdInfo || !authenticated || !apiKey) return;
+    
+    // 如果已經載入過，不再重複載入
+    const cacheKey = `${videoIdInfo.videoLibId || videoIdInfo.segmentId}-${apiKey}`;
+    if (hasLoadedRef.current === cacheKey) return;
     
     // 優先嘗試 video_lib 格式，如果失敗再嘗試 segment ID
     const tryLoadEvent = async (videoId) => {
@@ -50,6 +54,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
             label: info.event_label,
             description: info.event_description || "",
           });
+          hasLoadedRef.current = cacheKey; // 標記為已載入
           return true; // 成功載入
         }
       } catch (err) {
@@ -68,6 +73,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
       // 如果 video_lib ID 失敗或不存在，嘗試 segment ID
       if (videoIdInfo.segmentId) {
         await tryLoadEvent(videoIdInfo.segmentId);
+        hasLoadedRef.current = cacheKey; // 即使失敗也標記，避免無限重試
       }
     };
 
