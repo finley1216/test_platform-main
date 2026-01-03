@@ -48,3 +48,11 @@ backend/segment/
 *.mp4
 *.mov
 *.mkv
+
+
+# === model weights / cache ===
+*.pt
+*.pth
+*.onnx
+backend/clip_cache/
+backend/models/
