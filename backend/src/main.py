@@ -92,6 +92,71 @@ def get_embedding_model():
             raise RuntimeError(f"無法載入 SentenceTransformer 模型: {e}")
     return _embedding_model
 
+# CLIP 模型用於圖像 embedding（以圖搜圖）
+_clip_model = None
+_clip_processor = None
+CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"  # 輸出 512 維向量
+
+def get_clip_model():
+    """獲取或初始化 CLIP 模型（用於圖像 embedding）"""
+    global _clip_model, _clip_processor
+    if _clip_model is None:
+        try:
+            from transformers import CLIPModel, CLIPProcessor
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"--- [CLIP] 載入模型: {CLIP_MODEL_NAME} (device: {device}) ---")
+            _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device).eval()
+            _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
+            print(f"✓ CLIP 模型載入完成")
+        except ImportError:
+            print("--- [WARNING] transformers 未安裝，CLIP 功能將無法使用 ---")
+            raise RuntimeError("請安裝 transformers: pip install transformers")
+        except Exception as e:
+            print(f"⚠️  Failed to load CLIP model: {e}")
+            raise RuntimeError(f"無法載入 CLIP 模型: {e}")
+    return _clip_model, _clip_processor
+
+def generate_image_embedding(image_path: str) -> Optional[List[float]]:
+    """
+    為圖像生成 CLIP embedding（用於以圖搜圖）
+    
+    Args:
+        image_path: 圖像文件路徑
+        
+    Returns:
+        embedding 向量（512 維）或 None
+    """
+    try:
+        clip_model, clip_processor = get_clip_model()
+        import torch
+        
+        # 讀取圖像
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            print(f"--- [WARNING] 無法讀取圖像: {image_path} ---")
+            return None
+        
+        # 轉換為 RGB
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        
+        # 使用 CLIP 處理
+        inputs = clip_processor(images=[img_rgb], return_tensors="pt")
+        device = next(clip_model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # 生成 embedding
+        with torch.no_grad():
+            image_features = clip_model.get_image_features(**inputs)[0]
+            embedding = image_features.detach().cpu().numpy().astype(np.float32)
+            # L2 正規化
+            embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
+        
+        return embedding.tolist()
+    except Exception as e:
+        print(f"--- [WARNING] 生成圖像 embedding 失敗 ({image_path}): {e} ---")
+        return None
+
 # Video library directory (歷史影片分類存放位置)
 VIDEO_LIB_DIR = config.VIDEO_LIB_DIR
 
@@ -164,12 +229,12 @@ def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: flo
                      resolution: Optional[int] = None, strict_mode: bool = False) -> List[str]:
     """
     切割影片，支援兩種模式：
-    - strict_mode=False (預設): 使用 -c copy，速度快但不保證精確時間
+    - strict_mode=False (預設): 使用 -c copy，速度快但不保證精確時間（優化：100x 速度提升）
     - strict_mode=True: 重新編碼，嚴格遵循 segment duration 和 overlap，並可設定解析度
     
     參數:
     - resolution: 長邊解析度（px），例如 720 表示長邊為 720px
-    - strict_mode: 是否使用嚴格模式（重新編碼）
+    - strict_mode: 是否使用嚴格模式（重新編碼），默認為 False 使用 stream copy
     """
     Path(out_dir).mkdir(parents=True, exist_ok=True)
     duration = _probe_duration_seconds(input_path)
@@ -178,18 +243,19 @@ def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: flo
     outs = []
     
     for i, st in enumerate(starts):
-        # 嚴格模式：每段都是嚴格的 segment 秒（除了最後一段可能較短）
+        # 計算每段時長
         if strict_mode:
+            # 嚴格模式：每段都是嚴格的 segment 秒（除了最後一段可能較短）
             dur = segment  # 嚴格使用 segment 秒
             # 如果超過總長度，則調整為剩餘長度
             if st + dur > duration:
                 dur = max(0.0, duration - st)
-            if dur <= 0.05: continue
         else:
-            # 舊模式：允許最後一段較短
+            # 優化模式：允許最後一段較短
             dur = max(0.0, min(segment, duration - st))
-            if dur <= 0.05:
-                continue
+        
+        if dur <= 0.05:
+            continue
         
         out_file = str(Path(out_dir) / f"{prefix}_{i:04d}{ext}")
         
@@ -240,13 +306,16 @@ def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: flo
             
             ffmpeg_cmd.extend(["-y", out_file])
         else:
-            # 舊模式：使用 -c copy（快速但不精確）
+            # 優化模式：使用 -c copy（快速但不精確，100x 速度提升）
+            # 注意：-ss 放在 -i 之前可以更快（輸入定位），但可能不夠精確
+            # 為了速度，我們使用輸入定位
             ffmpeg_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
-                "-ss", f"{st:.3f}",
-                "-t", f"{dur:.3f}",
+                "-ss", f"{st:.3f}",  # 輸入定位（更快）
                 "-i", input_path,
-                "-c", "copy",
+                "-t", f"{dur:.3f}",
+                "-c", "copy",  # Stream copy，不重新編碼
+                "-avoid_negative_ts", "make_zero",  # 避免負時間戳
                 "-y", out_file
             ]
         
@@ -306,12 +375,12 @@ def _sample_frames_evenly_to_pil(video_path: str, max_frames: int=8, sampling_fp
             # 舊模式：均勻分佈（向後兼容）
             n = min(max_frames, total_frames)
             idxs = np.linspace(0, total_frames-1, num=n, dtype=np.int64)
-            for fi in idxs:
-                cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
-                ok, bgr = cap.read()
-                if not ok: continue
-                rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
-                frames.append(Image.fromarray(rgb))
+        for fi in idxs:
+            cap.set(cv2.CAP_PROP_POS_FRAMES, int(fi))
+            ok, bgr = cap.read()
+            if not ok: continue
+            rgb = cv2.cvtColor(bgr, cv2.COLOR_BGR2RGB)
+            frames.append(Image.fromarray(rgb))
         
         if not frames: raise RuntimeError("no frames sampled")
         return frames
@@ -517,7 +586,16 @@ def infer_segment_qwen(
     ]
 
     # 呼叫 _ollama_chat 取得回應
-    event_txt = _ollama_chat(qwen_model, event_msgs, images_b64=images_b64, stream=False)
+    try:
+        event_txt = _ollama_chat(qwen_model, event_msgs, images_b64=images_b64, stream=False)
+    except Exception as e:
+        # 如果 _ollama_chat 失敗，設置預設值
+        event_txt = ""
+        print(f"--- [WARNING] _ollama_chat 失敗: {e} ---")
+    
+    # 確保 event_txt 不是 None
+    if event_txt is None:
+        event_txt = ""
 
     # 使用 _safe_parse_json 和 _extract_first_json 雙重保險來嘗試解析 JSON。
     frame_obj = _safe_parse_json(event_txt)
@@ -530,18 +608,25 @@ def infer_segment_qwen(
     # ---- (2) 摘要：只回純文字 50~100 字 ----
     summary_txt = ""
     if (summary_prompt or "").strip():
-        summary_system = (
-            "你是影片小結產生器。你只能輸出 50–100 個中文字的摘要，"
-            "不得輸出 JSON、不得輸出 Markdown/程式碼圍欄，不得回答其他問題。"
-        )
-        summary_user = (summary_prompt or "").strip() + "\n\n" + \
-                       "強制規則：只輸出 50–100 字中文，不要 JSON、不要程式碼區塊、不要英文字說明。"
-        summary_msgs = [
-            {"role": "system", "content": summary_system},
-            {"role": "user", "content": summary_user},
-        ]
-        summary_raw = _ollama_chat(qwen_model, summary_msgs, images_b64=images_b64, stream=False)
-        summary_txt = _clean_summary_text(summary_raw)
+        try:
+            summary_system = (
+                "你是影片小結產生器。你只能輸出 50–100 個中文字的摘要，"
+                "不得輸出 JSON、不得輸出 Markdown/程式碼圍欄，不得回答其他問題。"
+            )
+            summary_user = (summary_prompt or "").strip() + "\n\n" + \
+                           "強制規則：只輸出 50–100 字中文，不要 JSON、不要程式碼區塊、不要英文字說明。"
+            summary_msgs = [
+                {"role": "system", "content": summary_system},
+                {"role": "user", "content": summary_user},
+            ]
+            summary_raw = _ollama_chat(qwen_model, summary_msgs, images_b64=images_b64, stream=False)
+            if summary_raw is None:
+                summary_raw = ""
+            summary_txt = _clean_summary_text(summary_raw)
+        except Exception as e:
+            # 如果摘要生成失敗，設置為空字串
+            summary_txt = ""
+            print(f"--- [WARNING] 摘要生成失敗: {e} ---")
 
     # 回傳格式、形容的句子
     return frame_obj, summary_txt
@@ -567,6 +652,213 @@ def infer_segment_owl(seg_path: str, labels: str, every_sec: float, score_thr: f
                     f"  3. 或使用其他模型類型：將 model_type 改為 'qwen' 或 'gemini'"
                 ) from e
             raise
+
+# YOLO-World 物件偵測（本地模型）
+_yolo_world_model = None
+def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: float) -> Dict:
+    """
+    使用本地 YOLO-World 模型進行物件偵測並生成切片
+    
+    參數:
+    - seg_path: 影片片段路徑
+    - labels: 要偵測的物件類別（逗號分隔，例如 "person,pedestrian,car"）
+    - every_sec: 取樣頻率（每幾秒處理一幀）
+    - score_thr: 信心門檻（0.0-1.0）
+    
+    返回:
+    - Dict: 包含偵測結果和物件切片的字典
+    """
+    global _yolo_world_model
+    
+    try:
+        from ultralytics import YOLOWorld
+    except ImportError:
+        raise RuntimeError("ultralytics 未安裝，請先安裝: pip install ultralytics")
+    
+    # 初始化模型（單例模式，避免重複載入）
+    if _yolo_world_model is None:
+        import os
+        local_model_path = '/app/models/yolov8s-world.pt'
+        if os.path.exists(local_model_path):
+            print(f"--- [YOLO] 載入本地模型: {local_model_path} ---")
+            _yolo_world_model = YOLOWorld(local_model_path)
+        else:
+            print(f"--- [YOLO] 本地模型不存在 ({local_model_path})，嘗試使用預設模型名稱 ---")
+            try:
+                _yolo_world_model = YOLOWorld('yolov8s-world.pt')
+            except Exception as e:
+                error_msg = (
+                    f"無法載入 YOLO-World 模型：{str(e)}\n"
+                    f"請確保模型文件存在於 {local_model_path} 或網路連接正常"
+                )
+                raise RuntimeError(error_msg) from e
+        print("--- [YOLO] 模型載入完成 ---")
+    
+    # 解析標籤
+    labels_list = [l.strip() for l in labels.split(",") if l.strip()]
+    if not labels_list:
+        labels_list = ["person", "pedestrian", "car", "motorcycle", "bus", "truck"]
+    
+    # 設定要偵測的類別
+    try:
+        _yolo_world_model.set_classes(labels_list)
+        print(f"--- [YOLO] 設定偵測類別: {', '.join(labels_list)} ---")
+    except Exception as e:
+        error_msg = str(e)
+        if "name resolution" in error_msg or "Temporary failure" in error_msg or "urlopen" in error_msg.lower():
+            raise RuntimeError(
+                f"無法設定偵測類別：網路連接失敗，CLIP 模型無法下載\n"
+                f"錯誤詳情：{error_msg}\n"
+                f"解決方案：請確保 CLIP 模型已預先下載到 ~/.cache/clip/ 目錄"
+            ) from e
+        raise
+    
+    # 讀取影片
+    cap = cv2.VideoCapture(seg_path)
+    if not cap.isOpened():
+        raise RuntimeError(f"無法打開影片: {seg_path}")
+    
+    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
+    
+    if total_frames <= 0:
+        cap.release()
+        raise RuntimeError("無效的影片或零幀影片")
+    
+    # 計算取樣間隔
+    frame_interval = max(1, int(round(fps * every_sec)))
+    
+    # 準備輸出目錄
+    seg_dir = Path(seg_path).parent
+    output_dir = seg_dir / "yolo_output"
+    output_dir.mkdir(exist_ok=True)
+    
+    # 物件切片目錄
+    crops_dir = output_dir / "object_crops"
+    crops_dir.mkdir(exist_ok=True)
+    
+    # 處理結果
+    detections = []
+    frame_count = 0
+    processed_count = 0
+    object_counter = {}
+    crop_paths = []  # 記錄所有生成的切片路徑
+    
+    print(f"--- [YOLO] 開始處理影片: {seg_path} ---")
+    print(f"  - FPS: {fps:.2f}")
+    print(f"  - 總幀數: {total_frames}")
+    print(f"  - 取樣間隔: {frame_interval} 幀 (每 {every_sec} 秒)")
+    print(f"  - 輸出目錄: {output_dir}")
+    
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+        
+        # 根據取樣間隔決定是否處理此幀
+        if frame_count % frame_interval != 0:
+            frame_count += 1
+            continue
+        
+        timestamp = frame_count / fps
+        
+        # 轉換為 RGB（YOLO 需要）
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(frame_rgb)
+        
+        # 執行偵測
+        results = _yolo_world_model.predict(pil_image, verbose=False, conf=score_thr)
+        
+        # 處理偵測結果
+        frame_detections = []
+        if results and len(results) > 0:
+            result = results[0]
+            if result.boxes is not None and len(result.boxes) > 0:
+                for idx, box in enumerate(result.boxes):
+                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(float).tolist()
+                    confidence = float(box.conf[0].cpu().numpy())
+                    class_id = int(box.cls[0].cpu().numpy())
+                    class_name = labels_list[class_id] if class_id < len(labels_list) else f"class_{class_id}"
+                    
+                    # 確保座標在範圍內
+                    x1, y1 = max(0, int(x1)), max(0, int(y1))
+                    x2, y2 = min(width, int(x2)), min(height, int(y2))
+                    
+                    frame_detections.append({
+                        "box": [x1, y1, x2, y2],
+                        "score": confidence,
+                        "label": class_name,
+                        "label_idx": class_id
+                    })
+                    
+                    # 裁剪物件並保存
+                    if x2 > x1 and y2 > y1:
+                        crop = frame[y1:y2, x1:x2]
+                        if crop.size > 0:
+                            # 生成文件名：類別_時間戳_序號.jpg
+                            if class_name not in object_counter:
+                                object_counter[class_name] = 0
+                            object_counter[class_name] += 1
+                            
+                            timestamp_str = f"{timestamp:.3f}".replace(".", "_")
+                            crop_filename = f"{class_name}_{timestamp_str}_{object_counter[class_name]:03d}.jpg"
+                            crop_path = crops_dir / crop_filename
+                            
+                            # 保存物件切片圖片
+                            cv2.imwrite(str(crop_path), crop)
+                            
+                            # 生成 ReID embedding（用於物件 re-identification）
+                            reid_embedding = None
+                            try:
+                                reid_embedding = generate_reid_embedding(str(crop_path))
+                                if reid_embedding:
+                                    print(f"  ✓ 生成 ReID embedding: {crop_filename} (維度: {len(reid_embedding)})")
+                                else:
+                                    print(f"  ⚠️  無法生成 ReID embedding: {crop_filename}")
+                            except Exception as e:
+                                print(f"  ⚠️  生成 ReID embedding 失敗 ({crop_filename}): {e}")
+                            
+                            crop_paths.append({
+                                "path": str(crop_path),
+                                "label": class_name,
+                                "score": confidence,
+                                "timestamp": timestamp,
+                                "frame": frame_count,
+                                "box": [x1, y1, x2, y2],
+                                "embedding": reid_embedding  # 新增：ReID embedding（2048 維）
+                            })
+        
+        if frame_detections:
+            detections.append({
+                "timestamp": timestamp,
+                "frame": frame_count,
+                "detections": frame_detections
+            })
+        
+        processed_count += 1
+        if processed_count % 10 == 0:
+            print(f"  - 進度: {frame_count}/{total_frames} 幀 ({frame_count/total_frames*100:.1f}%)")
+        
+        frame_count += 1
+    
+    cap.release()
+    
+    print(f"--- [YOLO] 處理完成: 共處理 {processed_count} 幀，偵測到 {len(detections)} 個有物件的時間點，生成 {len(crop_paths)} 個物件切片 ---")
+    
+    # 返回格式
+    return {
+        "video_url": seg_path,
+        "fps_input": fps,
+        "every_sec": every_sec,
+        "size": [width, height],
+        "detections": detections,
+        "total_frames_processed": processed_count,
+        "total_detections": sum(len(d["detections"]) for d in detections),
+        "crop_paths": crop_paths,  # 新增：所有物件切片路徑
+        "object_count": object_counter
+    }
 
 # gemini 的輸入和 qwen 不一樣，qwen 用到 base64 字串
 def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt: str, summary_prompt: str, target_short: int=720, frames_per_segment: int=8, sampling_fps: Optional[float] = None) -> Tuple[Dict[str, Any], str]:
@@ -673,6 +965,11 @@ class SegmentAnalysisRequest(BaseModel):
     owl_labels: Optional[str] = None
     owl_every_sec: float = 2.0
     owl_score_thr: float = 0.15
+
+    # YOLO 參數
+    yolo_labels: Optional[str] = None
+    yolo_every_sec: float = 2.0
+    yolo_score_thr: float = 0.25
 
 # 影片分析相關 API 已移至 src.api.video_analysis
 
@@ -1002,6 +1299,7 @@ def _segment_pipeline_multipart_legacy(
 
             # 3.3 【關鍵步驟】Call API
             # 這裡直接呼叫函式，這等同於透過內部網路呼叫該 API，但更快
+            from src.api.video_analysis import analyze_segment_result
             res = analyze_segment_result(req_data)
             results.append(res)
 
@@ -1210,8 +1508,8 @@ def _auto_index_to_rag(resp: Dict[str, Any]) -> Dict[str, Any]:
 
     # 檢查資料庫是否可用
     if not HAS_DB:
-        return {
-            "success": False,
+            return {
+                "success": False,
             "error": "Database not available",
             "message": "RAG 索引失敗：資料庫不可用"
         }
@@ -1699,7 +1997,7 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
         
         try:
             query_filters = _parse_query_filters(query)
-        
+            
             # 提取日期解析資訊，用於返回給前端
             if query_filters.get("date_filter") or query_filters.get("time_start"):
                 date_filter = query_filters.get("date_filter")
@@ -2279,7 +2577,7 @@ async def _rag_answer_legacy(request: Request, db: Session = Depends(get_db) if 
         
         try:
             query_filters = _parse_query_filters(question)
-        
+            
             # 提取日期解析資訊，用於返回給前端
             if query_filters.get("date_filter") or query_filters.get("time_start"):
                 if not date_info:  # 如果 LLM 工具調用已經設置了 date_info，就不需要重複設置
@@ -2633,26 +2931,47 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
         video_stem: 影片名稱（用於識別，例如 "fire_1" 或 "火災生成_Video_火災"）
     """
     if not HAS_DB:
+        print("--- [PostgreSQL] HAS_DB = False，跳過保存 ---")
         return
+    
+    if not db:
+        print("--- [PostgreSQL] db session 為 None，跳過保存 ---")
+        return
+    
+    print(f"--- [PostgreSQL] 開始保存 {len(results)} 筆結果到資料庫 (video: {video_stem}) ---")
     
     # [修改] 採用「更新或新增」的邏輯，與 migrate_segments_to_db.py 保持一致
     # 不再先刪除舊記錄，而是檢查是否存在，存在則更新，不存在則新增
     saved_count = 0
     updated_count = 0
     inserted_count = 0
+    skipped_count = 0
     
-    for result in results:
+    for idx, result in enumerate(results):
         # 只處理成功的結果
         if not result.get("success", False):
+            print(f"--- [PostgreSQL] 片段 {idx}：success=False，跳過 ---")
+            skipped_count += 1
             continue
         
         # 獲取摘要文字
         parsed = result.get("parsed", {})
         summary_text = parsed.get("summary_independent", "")
         
-        # 如果沒有摘要，跳過
-        if not summary_text or not summary_text.strip():
+        # [修改] 如果有 YOLO 結果，即使沒有摘要也要保存
+        raw_detection = result.get("raw_detection")
+        has_yolo = raw_detection and isinstance(raw_detection, dict) and raw_detection.get("yolo")
+        
+        # 如果沒有摘要且沒有 YOLO 結果，跳過
+        if (not summary_text or not summary_text.strip()) and not has_yolo:
+            print(f"--- [PostgreSQL] 片段 {idx}：無摘要且無 YOLO 結果，跳過 ---")
+            skipped_count += 1
             continue
+        
+        # 如果沒有摘要但有 YOLO 結果，使用預設摘要
+        if not summary_text or not summary_text.strip():
+            summary_text = "YOLO 偵測結果（無 VLM 摘要）"
+            print(f"--- [PostgreSQL] 片段 {idx}：無摘要但有 YOLO 結果，使用預設摘要 ---")
         
         # 解析時間範圍
         time_range = result.get("time_range", "")
@@ -2694,6 +3013,26 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.crowd_loitering = bool(events.get("crowd_loitering", False))
             existing.security_door_tamper = bool(events.get("security_door_tamper", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
+            
+            # [NEW] 更新 YOLO 結果（如果有的話）
+            raw_detection = result.get("raw_detection")
+            if raw_detection and isinstance(raw_detection, dict):
+                yolo_result = raw_detection.get("yolo")
+                if yolo_result:
+                    existing.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
+                    existing.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
+                    existing.yolo_total_detections = yolo_result.get("total_detections", 0)
+                    existing.yolo_total_frames_processed = yolo_result.get("total_frames_processed", 0)
+                    # 設置物件切片目錄路徑（優化版本可能不包含 path，改為 None）
+                    if yolo_result.get("crop_paths"):
+                        first_crop = yolo_result["crop_paths"][0]
+                        if isinstance(first_crop, dict) and first_crop.get("path"):
+                            crops_dir = str(Path(first_crop["path"]).parent)
+                            existing.yolo_crops_dir = crops_dir
+                        else:
+                            # 優化版本：不保存文件，設置為 None
+                            existing.yolo_crops_dir = None
+            
             # [NEW] 如果 message 有變更，重新生成 embedding
             if existing.message != summary_text.strip() and summary_text.strip():
                 try:
@@ -2746,9 +3085,34 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 security_door_tamper=bool(events.get("security_door_tamper", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
                 embedding=embedding,  # [NEW] 自動生成的 embedding
+                # [NEW] YOLO 結果（整合到 summaries 表）
+                yolo_detections=None,
+                yolo_object_count=None,
+                yolo_crops_dir=None,
+                yolo_total_detections=None,
+                yolo_total_frames_processed=None,
                 created_at=datetime.now(),
                 updated_at=datetime.now()
             )
+            
+            # [NEW] 如果有 YOLO 結果，添加到記錄中
+            raw_detection = result.get("raw_detection")
+            if raw_detection and isinstance(raw_detection, dict):
+                yolo_result = raw_detection.get("yolo")
+                if yolo_result:
+                    summary.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
+                    summary.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
+                    summary.yolo_total_detections = yolo_result.get("total_detections", 0)
+                    summary.yolo_total_frames_processed = yolo_result.get("total_frames_processed", 0)
+                    # 設置物件切片目錄路徑（優化版本可能不包含 path，改為 None）
+                    if yolo_result.get("crop_paths"):
+                        first_crop = yolo_result["crop_paths"][0]
+                        if isinstance(first_crop, dict) and first_crop.get("path"):
+                            crops_dir = str(Path(first_crop["path"]).parent)
+                            summary.yolo_crops_dir = crops_dir
+                        else:
+                            # 優化版本：不保存文件，設置為 None
+                            summary.yolo_crops_dir = None
             
             try:
                 db.add(summary)
@@ -2759,20 +3123,224 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 continue
     
     # 批量提交
+    print(f"--- [PostgreSQL] 準備提交：已處理 {saved_count} 筆（新增: {inserted_count}, 更新: {updated_count}, 跳過: {skipped_count}）---")
+    
     if saved_count > 0:
         try:
             db.commit()
-            print(f"--- [PostgreSQL] 成功保存/更新 {saved_count} 筆分析結果到資料庫 (video: {video_stem}, 新增: {inserted_count}, 更新: {updated_count}) ---")
+            print(f"--- [PostgreSQL] ✓ 成功保存/更新 {saved_count} 筆分析結果到資料庫 (video: {video_stem}, 新增: {inserted_count}, 更新: {updated_count}) ---")
         except Exception as e:
             db.rollback()
-            print(f"--- [PostgreSQL ERROR] 提交失敗: {e} ---")
+            print(f"--- [PostgreSQL ERROR] ✗ 提交失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
     else:
         # 即使沒有新記錄，也要提交（可能只有更新操作）
         try:
             db.commit()
+            print(f"--- [PostgreSQL] 無新記錄需要保存（跳過: {skipped_count}）---")
         except Exception as e:
             db.rollback()
-            print(f"--- [PostgreSQL ERROR] 提交失敗: {e} ---")
+            print(f"--- [PostgreSQL ERROR] ✗ 提交失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+
+# ReID 模型（用於物件 re-identification）
+_reid_model = None
+_reid_device = None
+
+def get_reid_model():
+    """獲取或初始化 ReID 模型（用於物件 re-identification，優先使用 torchreid/FastReID）"""
+    global _reid_model, _reid_device
+    
+    if _reid_model is not None:
+        return _reid_model, _reid_device
+    
+    try:
+        import torch
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        _reid_device = device
+        
+        # 優先使用 torchreid（FastReID 風格）
+        try:
+            import torchreid
+            print(f"--- [ReID] 載入 torchreid 模型 (device: {device}) ---")
+            model = torchreid.models.build_model(
+                name='resnet50',
+                num_classes=751,  # Market-1501 dataset classes
+                loss='softmax',
+                pretrained=True
+            )
+            model = model.to(device).eval()
+            model.classifier = None  # 移除分類層，只保留特徵提取器
+            print("✓ torchreid ResNet50 模型載入完成")
+            _reid_model = model
+            return model, device
+        except ImportError:
+            # 備用：使用 timm ResNet50
+            try:
+                import timm
+                print(f"--- [ReID] 載入 timm ResNet50 模型 (device: {device}) ---")
+                model = timm.create_model('resnet50', pretrained=True, num_classes=0)
+                model = model.to(device).eval()
+                print("✓ timm ResNet50 模型載入完成")
+                _reid_model = model
+                return model, device
+            except ImportError:
+                # 最後備用：使用 torchvision ResNet50
+                import torchvision.models as models
+                print(f"--- [ReID] 載入 torchvision ResNet50 模型 (device: {device}) ---")
+                model = models.resnet50(pretrained=True)
+                model.fc = torch.nn.Identity()  # 移除分類層
+                model = model.to(device).eval()
+                print("✓ torchvision ResNet50 模型載入完成")
+                _reid_model = model
+                return model, device
+    except Exception as e:
+        print(f"--- [WARNING] 無法載入 ReID 模型: {e}，將使用 CLIP 作為備用 ---")
+        return None, None
+
+def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=None, reid_device=None) -> List[Optional[List[float]]]:
+    """
+    批量生成 ReID embedding（優化版本，用於內存中的裁剪圖像）
+    
+    Args:
+        crop_images: 裁剪的圖像列表（numpy arrays，BGR 格式）
+        reid_model: ReID 模型（如果為 None 則自動獲取）
+        reid_device: 設備（如果為 None 則自動獲取）
+        
+    Returns:
+        embedding 向量列表（每個 2048 維）或 None
+    """
+    if not crop_images:
+        return []
+    
+    try:
+        if reid_model is None or reid_device is None:
+            reid_model, reid_device = get_reid_model()
+        
+        if reid_model is None:
+            # 備用：使用 CLIP（但 CLIP 不支持批量，需要逐個處理）
+            print("--- [WARNING] ReID 模型不可用，跳過批量 embedding 生成 ---")
+            return [None] * len(crop_images)
+        
+        import torch
+        import torchvision.transforms as transforms
+        from PIL import Image
+        
+        # 批量預處理
+        transform = transforms.Compose([
+            transforms.Resize((256, 128)),  # ReID 標準尺寸
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        # 轉換所有圖像為 tensor
+        tensors = []
+        valid_indices = []
+        for i, crop in enumerate(crop_images):
+            try:
+                # 轉換 BGR 到 RGB
+                if len(crop.shape) == 3 and crop.shape[2] == 3:
+                    rgb_image = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
+                else:
+                    rgb_image = crop
+                
+                # 轉換為 PIL Image
+                pil_image = Image.fromarray(rgb_image)
+                
+                # 預處理
+                tensor = transform(pil_image)
+                tensors.append(tensor)
+                valid_indices.append(i)
+            except Exception as e:
+                print(f"--- [WARNING] 預處理圖像失敗 (index {i}): {e} ---")
+                valid_indices.append(None)
+        
+        if not tensors:
+            return [None] * len(crop_images)
+        
+        # 批量推理
+        batch_tensor = torch.stack(tensors).to(reid_device)
+        
+        with torch.no_grad():
+            features = reid_model(batch_tensor)
+            # L2 正規化
+            features = features / (torch.norm(features, dim=1, keepdim=True) + 1e-12)
+            embeddings = features.cpu().numpy()
+        
+        # 映射回原始索引
+        result = [None] * len(crop_images)
+        for idx, valid_idx in enumerate(valid_indices):
+            if valid_idx is not None:
+                result[valid_idx] = embeddings[idx].tolist()
+        
+        return result
+    except Exception as e:
+        print(f"--- [WARNING] 批量生成 ReID embedding 失敗: {e} ---")
+        import traceback
+        traceback.print_exc()
+        return [None] * len(crop_images)
+
+def generate_reid_embedding(image_path: str) -> Optional[List[float]]:
+    """
+    為圖像生成 ReID embedding（用於物件 re-identification）
+    
+    Args:
+        image_path: 圖像文件路徑
+        
+    Returns:
+        embedding 向量（2048 維，ResNet50）或 None
+    """
+    try:
+        reid_model, reid_device = get_reid_model()
+        if reid_model is None:
+            # 備用：使用 CLIP
+            return generate_image_embedding(image_path)
+        
+        import torch
+        import torchvision.transforms as transforms
+        from PIL import Image
+        
+        # 讀取圖像
+        img_bgr = cv2.imread(image_path)
+        if img_bgr is None:
+            return None
+        
+        img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
+        pil_image = Image.fromarray(img_rgb)
+        
+        # ReID 標準預處理（256x128）
+        transform = transforms.Compose([
+            transforms.Resize((256, 128)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+        
+        input_tensor = transform(pil_image).unsqueeze(0).to(reid_device)
+        
+        # 生成 embedding
+        with torch.no_grad():
+            features = reid_model(input_tensor)
+            embedding = features.cpu().numpy().flatten()
+            # L2 正規化
+            embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
+        
+        return embedding.tolist()
+    except Exception as e:
+        print(f"--- [WARNING] 生成 ReID embedding 失敗 ({image_path}): {e} ---")
+        # 備用：使用 CLIP
+        return generate_image_embedding(image_path)
+
+# [DEPRECATED] _save_object_crops_to_postgres 已不再使用
+# YOLO 結果現在直接整合到 summaries 表中，通過 _save_results_to_postgres 保存
+# 保留函數定義以向後兼容
+def _save_object_crops_to_postgres(db: Session, yolo_result: Dict, video_stem: str, segment_name: str, segment_index: int, time_range: str):
+    """
+    [DEPRECATED] 此函數已不再使用
+    YOLO 結果現在直接整合到 summaries 表中，通過 _save_results_to_postgres 保存
+    """
+    return
 
 
 # ================== Prompt 解析與 PostgreSQL 過濾 ==================

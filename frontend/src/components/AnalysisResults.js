@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { EVENT_MAP } from "../utils/constants";
+import { EVENT_MAP, getApiBaseUrl } from "../utils/constants";
 import apiService from "../services/api";
 
 const AnalysisResults = ({ data, apiKey, authenticated }) => {
@@ -80,6 +80,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
     loadEvent();
   }, [videoIdInfo, authenticated, apiKey]);
 
+  // Early returns 必須在所有 Hooks 之後
   if (!data) return null;
   if (data.error) {
     return (
@@ -92,6 +93,12 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
   const results = data.results || [];
   const totalSegments = data.total_segments || 0;
   const totalTime = data.total_time_sec || 0;
+  const modelType = data.model_type || "";
+  
+  // 提取 YOLO 輸出信息（從第一個結果的 raw_detection 中）
+  const yoloOutput = results.length > 0 && results[0].raw_detection?.output 
+    ? results[0].raw_detection.output 
+    : null;
 
   let abnormalCount = 0;
   const anomalies = [];
@@ -270,6 +277,143 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
           </div>
         </div>
       </div>
+
+      {/* YOLO 標註影片顯示 */}
+      {modelType === "yolo" && yoloOutput && yoloOutput.annotated_video && (
+        <div
+          style={{
+            background: "#1a1a1a",
+            padding: "20px",
+            borderRadius: "8px",
+            border: "1px solid #333",
+            marginBottom: "24px",
+          }}
+        >
+          <h4
+            style={{
+              color: "#fff",
+              marginBottom: "16px",
+              display: "flex",
+              alignItems: "center",
+              gap: "8px",
+            }}
+          >
+            🎯 YOLO 物件偵測結果
+          </h4>
+          
+          {/* 標註影片 */}
+          <div style={{ marginBottom: "16px" }}>
+            <div
+              style={{
+                color: "#888",
+                fontSize: "12px",
+                marginBottom: "8px",
+                textTransform: "uppercase",
+              }}
+            >
+              標註影片（含辨識框）
+            </div>
+            <video
+              controls
+              style={{
+                width: "100%",
+                maxWidth: "800px",
+                borderRadius: "4px",
+                background: "#000",
+              }}
+            >
+              <source
+                src={`${getApiBaseUrl()}/${yoloOutput.annotated_video}`}
+                type="video/mp4"
+              />
+              您的瀏覽器不支援影片播放
+            </video>
+          </div>
+
+          {/* 物件統計 */}
+          {yoloOutput.object_count && Object.keys(yoloOutput.object_count).length > 0 && (
+            <div
+              style={{
+                display: "grid",
+                gridTemplateColumns: "repeat(auto-fit, minmax(150px, 1fr))",
+                gap: "12px",
+                marginBottom: "16px",
+              }}
+            >
+              {Object.entries(yoloOutput.object_count).map(([label, count]) => (
+                <div
+                  key={label}
+                  style={{
+                    background: "#2a2a2a",
+                    padding: "12px",
+                    borderRadius: "6px",
+                    border: "1px solid #444",
+                    textAlign: "center",
+                  }}
+                >
+                  <div style={{ color: "#888", fontSize: "11px", marginBottom: "4px" }}>
+                    {label}
+                  </div>
+                  <div style={{ color: "#fff", fontSize: "20px", fontWeight: "700" }}>
+                    {count}
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* 物件切片和下載連結 */}
+          <div
+            style={{
+              display: "flex",
+              gap: "12px",
+              flexWrap: "wrap",
+              marginTop: "16px",
+            }}
+          >
+            {yoloOutput.object_crops_dir && (
+              <a
+                href={`${getApiBaseUrl()}/${yoloOutput.object_crops_dir}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  background: "#3b82f6",
+                  color: "#fff",
+                  padding: "8px 16px",
+                  borderRadius: "6px",
+                  textDecoration: "none",
+                  fontSize: "13px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                📁 查看物件切片
+              </a>
+            )}
+            {yoloOutput.timestamp_file && (
+              <a
+                href={`${getApiBaseUrl()}/${yoloOutput.timestamp_file}`}
+                target="_blank"
+                rel="noopener noreferrer"
+                style={{
+                  background: "#10b981",
+                  color: "#fff",
+                  padding: "8px 16px",
+                  borderRadius: "6px",
+                  textDecoration: "none",
+                  fontSize: "13px",
+                  display: "inline-flex",
+                  alignItems: "center",
+                  gap: "6px",
+                }}
+              >
+                ⏱️ 查看時間戳記錄
+              </a>
+            )}
+          </div>
+        </div>
+      )}
 
       {anomalies.length > 0 ? (
         <>

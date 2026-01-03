@@ -47,6 +47,18 @@ class Summary(Base):
     event_reason = Column(Text, nullable=True)  # Event detection reason
     # Vector embedding for semantic search (384 dimensions for paraphrase-multilingual-MiniLM-L12-v2)
     embedding = Column(Vector(384), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
+    
+    # YOLO 偵測結果（整合到 summaries 表，不需要單獨的表）
+    yolo_detections = Column(Text, nullable=True)  # YOLO 偵測結果 JSON（包含所有偵測到的物件信息）
+    yolo_object_count = Column(Text, nullable=True)  # 物件計數 JSON（例如 {"person": 5, "car": 2}）
+    yolo_crops_dir = Column(String(500), nullable=True)  # 物件切片目錄路徑（例如 "segment/fire_299/yolo_output/object_crops"）
+    yolo_total_detections = Column(Integer, nullable=True)  # 總偵測物件數
+    yolo_total_frames_processed = Column(Integer, nullable=True)  # 處理的總幀數
+    
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
+
+# [DEPRECATED] ObjectCrop 表已不再使用，YOLO 結果現在整合到 summaries 表中
+# 完全移除類別定義，避免 SQLAlchemy 嘗試創建表
+# 如果需要向後兼容，可以在需要時動態創建，但現在完全移除
 

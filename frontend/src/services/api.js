@@ -116,6 +116,23 @@ class ApiService {
     }
   }
 
+  async checkOllamaStatus(apiKey) {
+    try {
+      const data = await this.request("/health/ollama", {
+        method: "GET",
+        apiKey,
+      });
+      return data;
+    } catch (e) {
+      console.error("Failed to check Ollama status", e);
+      return {
+        status: "error",
+        available: false,
+        error: e.message,
+      };
+    }
+  }
+
   async runAnalysis(formData, apiKey) {
     return this.request("/v1/segment_pipeline_multipart", {
       method: "POST",

@@ -350,3 +350,15 @@ docker exec test_platform-main-backend-1 python3 /app/src/migrate_segments_to_db
 #### 備註
 - 已部署到 140.117.176.88
 - 所有端口已開放並可正常訪問
+
+
+
+
+
+恢復 VLM 功能
+當 GPU 有空閒時，要恢復 VLM 功能，只需要：
+打開檔案：test_platform-main/backend/src/api/video_analysis.py
+找到第 483 行：SKIP_VLM = True
+改為：SKIP_VLM = False
+重啟服務
+或者告訴我，我可以幫您恢復。

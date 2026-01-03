@@ -100,6 +100,43 @@ function App() {
     }
   }, [authenticated, apiKey]);
 
+  // Check Ollama status and log to console
+  useEffect(() => {
+    if (authenticated && apiKey) {
+      const checkOllama = async () => {
+        console.log("%c" + "=".repeat(60), "color: #3b82f6; font-weight: bold; font-size: 14px");
+        console.log("%c[Ollama 狀態檢查]", "color: #3b82f6; font-weight: bold; font-size: 14px");
+        console.log("%c正在檢查 Ollama 服務狀態...", "color: #6b7280");
+        
+        const status = await apiService.checkOllamaStatus(apiKey);
+        
+        if (status.available) {
+          console.log("%c✓ Ollama 服務可用", "color: #10b981; font-weight: bold");
+          console.log("%c  服務地址: " + status.ollama_base, "color: #6b7280; font-size: 12px");
+          console.log("%c  可用模型數量: " + (status.model_count || 0), "color: #6b7280; font-size: 12px");
+          if (status.models && status.models.length > 0) {
+            console.log("%c  可用模型列表:", "color: #6b7280; font-size: 12px");
+            status.models.forEach((model, idx) => {
+              console.log("%c    " + (idx + 1) + ". " + model, "color: #10b981; font-size: 12px");
+            });
+          } else {
+            console.log("%c  ⚠️ 沒有找到可用模型", "color: #f59e0b; font-size: 12px");
+          }
+        } else {
+          console.log("%c✗ Ollama 服務不可用", "color: #ef4444; font-weight: bold");
+          console.log("%c  狀態: " + status.status, "color: #ef4444; font-size: 12px");
+          if (status.error) {
+            console.log("%c  錯誤訊息: " + status.error, "color: #ef4444; font-size: 12px");
+          }
+          console.log("%c  建議: 請檢查 Ollama 服務是否正常運行", "color: #f59e0b; font-size: 12px");
+        }
+        console.log("%c" + "=".repeat(60), "color: #3b82f6; font-weight: bold; font-size: 14px");
+      };
+      
+      checkOllama();
+    }
+  }, [authenticated, apiKey]);
+
   // Update model when modelType changes
   useEffect(() => {
     if (modelType === "gemini") {

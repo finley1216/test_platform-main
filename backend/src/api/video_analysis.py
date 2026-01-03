@@ -11,6 +11,7 @@ import tempfile
 import time
 from pathlib import Path
 from typing import Optional
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, ConfigDict
@@ -51,6 +52,11 @@ from src.main import (
     _auto_index_to_rag, _save_results_to_postgres, HAS_DB, get_db
 )
 
+# 延遲導入 YOLO 函數以避免循環導入
+def _get_infer_segment_yolo():
+    from src.main import infer_segment_yolo
+    return infer_segment_yolo
+
 router = APIRouter(tags=["影片分析"])
 
 # 從 main.py 導入 SegmentAnalysisRequest
@@ -73,7 +79,7 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
         "success": False,
         "time_sec": 0.0,
         "parsed": {},
-        "raw_detection": None,
+        "raw_detection": {},  # 改為空字典，避免 None 錯誤
         "error": None
     }
 
@@ -81,19 +87,32 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
         # ==================== Qwen / Gemini 邏輯 ====================
         if req.model_type in ("qwen", "gemini"):
             # 1. 執行推論
-            if req.model_type == "qwen":
-                frame_obj, summary_txt = infer_segment_qwen(
-                    req.qwen_model, p, req.event_detection_prompt, req.summary_prompt,
-                    target_short=req.target_short, frames_per_segment=req.frames_per_segment,
-                    sampling_fps=req.sampling_fps
-                )
-            else: # gemini
-                # 自動判斷模型名稱
-                g_model = req.qwen_model if req.qwen_model.startswith("gemini") else "gemini-2.5-flash"
-                frame_obj, summary_txt = infer_segment_gemini(
-                    g_model, p, req.event_detection_prompt, req.summary_prompt,
-                    req.target_short, req.frames_per_segment, sampling_fps=req.sampling_fps
-                )
+            frame_obj = None
+            summary_txt = None
+            try:
+                if req.model_type == "qwen":
+                    frame_obj, summary_txt = infer_segment_qwen(
+                        req.qwen_model, p, req.event_detection_prompt, req.summary_prompt,
+                        target_short=req.target_short, frames_per_segment=req.frames_per_segment,
+                        sampling_fps=req.sampling_fps
+                    )
+                else: # gemini
+                    # 自動判斷模型名稱
+                    g_model = req.qwen_model if req.qwen_model.startswith("gemini") else "gemini-2.5-flash"
+                    frame_obj, summary_txt = infer_segment_gemini(
+                        g_model, p, req.event_detection_prompt, req.summary_prompt,
+                        req.target_short, req.frames_per_segment, sampling_fps=req.sampling_fps
+                    )
+            except Exception as infer_e:
+                # 如果推論失敗，設置預設值
+                frame_obj = {"error": str(infer_e)}
+                summary_txt = ""
+            
+            # 確保 frame_obj 和 summary_txt 不是 None
+            if frame_obj is None:
+                frame_obj = {"error": "推論返回 None"}
+            if summary_txt is None:
+                summary_txt = ""
 
             # 2. 資料清洗與標準化 (Normalization)
             frame_norm = {
@@ -109,21 +128,56 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
                 }
             }
 
+            # 確保 frame_norm["events"] 是字典，避免 None 錯誤
+            if not isinstance(frame_norm.get("events"), dict):
+                frame_norm["events"] = {
+                    "water_flood": False, "fire": False,
+                    "abnormal_attire_face_cover_at_entry": False,
+                    "person_fallen_unmoving": False,
+                    "double_parking_lane_block": False,
+                    "smoking_outside_zone": False,
+                    "crowd_loitering": False,
+                    "security_door_tamper": False,
+                    "reason": ""
+                }
+
             if isinstance(frame_obj, dict) and "error" not in frame_obj:
                 ev = frame_obj.get("events") or {}
-                defaults = frame_norm["events"]
+                # 確保 ev 是字典
+                if not isinstance(ev, dict):
+                    ev = {}
+                
+                defaults = frame_norm.get("events")
+                # 確保 defaults 是字典，避免 None 錯誤
+                if not isinstance(defaults, dict):
+                    defaults = {
+                        "water_flood": False, "fire": False,
+                        "abnormal_attire_face_cover_at_entry": False,
+                        "person_fallen_unmoving": False,
+                        "double_parking_lane_block": False,
+                        "smoking_outside_zone": False,
+                        "crowd_loitering": False,
+                        "security_door_tamper": False,
+                        "reason": ""
+                    }
+                    frame_norm["events"] = defaults
 
                 # [動態欄位更新] 支援使用者自訂 Prompt
                 for k, v in ev.items():
                     if k == "reason": continue
                     try:
-                        defaults[k] = bool(v)
-                    except: pass
+                        if isinstance(defaults, dict):
+                            defaults[k] = bool(v)
+                    except Exception as e:
+                        print(f"--- [WARNING] 設置欄位 {k} 失敗: {e} ---")
+                        pass
 
                 # [Reason 排序修正] 刪除再新增，確保排在最後
                 reason_text = str(ev.get("reason", "") or "")
-                if "reason" in defaults: del defaults["reason"]
-                defaults["reason"] = reason_text
+                if isinstance(defaults, dict):
+                    if "reason" in defaults: 
+                        del defaults["reason"]
+                    defaults["reason"] = reason_text
 
             # 填寫成功結果
             result["success"] = ("error" not in (frame_obj or {})) and \
@@ -139,8 +193,20 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
             result["success"] = True
             result["raw_detection"] = j
 
+        # ==================== YOLO 邏輯 ====================
+        elif req.model_type == "yolo":
+            infer_segment_yolo = _get_infer_segment_yolo()
+            j = infer_segment_yolo(
+                p, 
+                labels=req.yolo_labels or "person,pedestrian,motorcycle,car,bus,scooter,truck",
+                every_sec=req.yolo_every_sec,
+                score_thr=req.yolo_score_thr
+            )
+            result["success"] = True
+            result["raw_detection"] = j
+
         else:
-            raise ValueError("model_type must be qwen, gemini, or owl")
+            raise ValueError("model_type must be qwen, gemini, owl, or yolo")
 
     except Exception as ex:
         result["error"] = str(ex)
@@ -305,6 +371,10 @@ def segment_pipeline_multipart(
     owl_labels: str = Form("person,pedestrian,motorcycle,car,bus,scooter,truck"),
     owl_every_sec: float = Form(2.0),
     owl_score_thr: float = Form(0.15),
+    yolo_labels: Optional[str] = Form(None),  # YOLO 偵測類別
+    yolo_every_sec: float = Form(2.0),  # YOLO 取樣頻率
+    yolo_score_thr: float = Form(0.25),  # YOLO 信心門檻
+    # [DEPRECATED] enable_yolo_parallel 已移除，現在每個片段都會自動執行 YOLO
     event_detection_prompt: str = Form(EVENT_DETECTION_PROMPT),
     summary_prompt: str = Form(SUMMARY_PROMPT),
     save_json: bool = Form(True),
@@ -313,6 +383,9 @@ def segment_pipeline_multipart(
     """
     它不親自做分析，而是負責調度資源與流程控制。影片，切割，片段影片填入標準格式，片段 API 處理，打包成大的 JSON
     """
+    # 記錄總開始時間（包括上傳、下載、切割、處理）
+    t0_total = time.time()
+    
     target_filename = "unknown_video"
 
     # 1. 下載與儲存 (維持原樣)
@@ -442,49 +515,516 @@ def segment_pipeline_multipart(
 
     # 3. 迴圈：Call API 取得結果
     results = []
+    # t0 用於計算處理時間（不包括上傳、切割）
     t0 = time.time()
 
+    # VLM 和 YOLO 都已啟用
+    SKIP_VLM = False  # 設為 True 時跳過 VLM 分析，只執行 YOLO
+    SKIP_YOLO = False  # 設為 True 時跳過 YOLO 偵測，只執行 VLM
+    
     print(f"--- 開始處理 {len(seg_files)} 個片段，呼叫分析 API ---")
+    if SKIP_VLM:
+        print(f"--- [注意] VLM (Ollama) 已暫時停用，只執行 YOLO 偵測 ---")
+    elif SKIP_YOLO:
+        print(f"--- [測試模式] YOLO 已停用，只執行 VLM (Ollama) 分析 ---")
+    else:
+        print(f"--- 處理模式: VLM ({model_type}) + YOLO (每個片段都會執行，並行處理) ---")
 
-    for p in seg_files:
-        # 3.1 計算時間區段資訊
-        m = re.search(r"(\d+)", Path(p).name)
-        idx = int(m.group(1)) if m else 0
+    def process_segment(seg_path, seg_idx):
+        """處理單個片段：VLM 分析 + YOLO 偵測（優化版本：內存處理、批量推理）"""
+        # 計算基本資訊（用於錯誤處理）
+        m = re.search(r"(\d+)", Path(seg_path).name)
+        idx = int(m.group(1)) if m else seg_idx
         start = idx * (segment_duration - overlap)
         end = min(start + segment_duration, total_duration)
+        time_range_str = f"{_fmt_hms(start)} - {_fmt_hms(end)}"
+        
+        # 使用優化版本（內存處理、批量推理、共享解碼）
+        try:
+            from src.main_optimized import infer_segment_yolo_optimized
+            from src.main import _yolo_world_model, get_reid_model
+            
+            # 獲取全局模型
+            yolo_model = _yolo_world_model
+            reid_model, reid_device = get_reid_model()
+            
+            # 3.1 計算時間區段資訊
+            m = re.search(r"(\d+)", Path(seg_path).name)
+            idx = int(m.group(1)) if m else seg_idx
+            start = idx * (segment_duration - overlap)
+            end = min(start + segment_duration, total_duration)
+            time_range_str = f"{_fmt_hms(start)} - {_fmt_hms(end)}"
 
-        # 3.2 準備參數 (Request Body)
-        req_data = SegmentAnalysisRequest(
-            segment_path=str(p), # 傳遞絕對路徑
-            segment_index=idx,
-            start_time=start,
-            end_time=end,
-            model_type=model_type,
-            qwen_model=qwen_model,
-            frames_per_segment=frames_per_segment,
-            target_short=target_short,
-            sampling_fps=sampling_fps,  # 傳遞取樣 FPS
-            event_detection_prompt=event_detection_prompt,
-            summary_prompt=summary_prompt,
-            owl_labels=owl_labels,
-            owl_every_sec=owl_every_sec,
-            owl_score_thr=owl_score_thr
-        )
+            # 3.2 準備 VLM 分析參數（如果未跳過 VLM）
+            vlm_result = None  # 初始化 vlm_result，避免未定義錯誤
+            if not SKIP_VLM:
+                try:
+                    req_data = SegmentAnalysisRequest(
+                        segment_path=str(seg_path),
+                        segment_index=idx,
+                        start_time=start,
+                        end_time=end,
+                        model_type=model_type,
+                        qwen_model=qwen_model,
+                        frames_per_segment=frames_per_segment,
+                        target_short=target_short,
+                        sampling_fps=sampling_fps,
+                        event_detection_prompt=event_detection_prompt,
+                        summary_prompt=summary_prompt,
+                        owl_labels=owl_labels,
+                        owl_every_sec=owl_every_sec,
+                        owl_score_thr=owl_score_thr,
+                        yolo_labels=yolo_labels,
+                        yolo_every_sec=yolo_every_sec,
+                        yolo_score_thr=yolo_score_thr
+                    )
 
-        # 3.3 【關鍵步驟】Call API
-        # 這裡直接呼叫函式，這等同於透過內部網路呼叫該 API，但更快
-        res = analyze_segment_result(req_data)
-        results.append(res)
+                    # 3.3 執行 VLM 分析
+                    vlm_result = analyze_segment_result(req_data)
+                except Exception as vlm_e:
+                    # 如果 VLM 分析失敗，創建錯誤結果
+                    print(f"--- [ERROR] VLM 分析失敗 (segment {idx}): {vlm_e} ---")
+                    import traceback
+                    traceback.print_exc()
+                    vlm_result = {
+                        "segment": Path(seg_path).name,
+                        "time_range": time_range_str,
+                        "duration_sec": end - start,
+                        "success": False,
+                        "time_sec": 0.0,
+                        "parsed": {},
+                        "raw_detection": {},  # 改為空字典，避免 None 錯誤
+                        "error": f"VLM 分析失敗: {str(vlm_e)}"
+                    }
+            else:
+                # [跳過 VLM] 創建基本的結果結構，不執行 Ollama 分析
+                print(f"--- [跳過 VLM] 片段 {idx}：只執行 YOLO 偵測 ---")
+                vlm_result = {
+                    "segment": Path(seg_path).name,
+                    "time_range": time_range_str,
+                    "duration_sec": end - start,
+                    "success": True,  # YOLO 成功就算成功
+                    "time_sec": 0.0,
+                    "parsed": {
+                        "frame_analysis": {
+                            "events": {
+                                "water_flood": False,
+                                "fire": False,
+                                "abnormal_attire_face_cover_at_entry": False,
+                                "person_fallen_unmoving": False,
+                                "double_parking_lane_block": False,
+                                "smoking_outside_zone": False,
+                                "crowd_loitering": False,
+                                "security_door_tamper": False,
+                                "reason": "VLM 分析已暫時停用（GPU 滿載）"
+                            },
+                            "persons": []
+                        },
+                        "summary_independent": "VLM 分析已暫時停用"
+                    },
+                    "raw_detection": {},
+                    "error": None
+                }
+            
+            # 確保 vlm_result 是有效的字典
+            if vlm_result is None or not isinstance(vlm_result, dict):
+                print(f"--- [ERROR] VLM 分析返回無效結果: {vlm_result} ---")
+                import traceback
+                traceback.print_exc()
+                vlm_result = {
+                    "segment": Path(seg_path).name,
+                    "time_range": time_range_str,
+                    "duration_sec": end - start,
+                    "success": False,
+                    "time_sec": 0.0,
+                    "parsed": {
+                        "frame_analysis": {
+                            "events": {
+                                "water_flood": False,
+                                "fire": False,
+                                "abnormal_attire_face_cover_at_entry": False,
+                                "person_fallen_unmoving": False,
+                                "double_parking_lane_block": False,
+                                "smoking_outside_zone": False,
+                                "crowd_loitering": False,
+                                "security_door_tamper": False,
+                                "reason": ""
+                            }
+                        },
+                        "summary_independent": ""
+                    },
+                    "raw_detection": {},
+                    "error": f"VLM 分析返回無效結果: {vlm_result}"
+                }
+            
+            # 確保 vlm_result 有必要的欄位
+            if "parsed" not in vlm_result:
+                vlm_result["parsed"] = {
+                    "frame_analysis": {
+                        "events": {
+                            "water_flood": False,
+                            "fire": False,
+                            "abnormal_attire_face_cover_at_entry": False,
+                            "person_fallen_unmoving": False,
+                            "double_parking_lane_block": False,
+                            "smoking_outside_zone": False,
+                            "crowd_loitering": False,
+                            "security_door_tamper": False,
+                            "reason": ""
+                        }
+                    },
+                    "summary_independent": ""
+                }
+            # 確保 raw_detection 是字典，不是 None
+            if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                vlm_result["raw_detection"] = {}
+            
+            # 3.4 【可選執行】每個片段都要執行 YOLO 偵測（優化版本：內存處理、批量推理）
+            yolo_result = None
+            if SKIP_YOLO:
+                print(f"--- [跳過 YOLO] 片段 {idx}：只執行 VLM 分析 ---")
+            else:
+                try:
+                    # 如果全局模型未初始化，先初始化它（避免回退到慢速的舊版本）
+                    if yolo_model is None:
+                        print("--- [YOLO] 全局模型未初始化，先初始化模型（使用優化版本）---")
+                        # 先調用一次舊版本來初始化模型（但我們會立即使用優化版本）
+                        infer_segment_yolo = _get_infer_segment_yolo()
+                        # 只初始化模型，不執行完整處理
+                        from src.main import _yolo_world_model
+                        if _yolo_world_model is None:
+                            # 觸發模型初始化（通過調用一次，但只初始化，不處理）
+                            try:
+                                # 快速初始化：只載入模型，不處理視頻
+                                from ultralytics import YOLOWorld
+                                import os
+                                local_model_path = '/app/models/yolov8s-world.pt'
+                                if os.path.exists(local_model_path):
+                                    _yolo_world_model = YOLOWorld(local_model_path)
+                                else:
+                                    _yolo_world_model = YOLOWorld('yolov8s-world.pt')
+                                print("--- [YOLO] 模型初始化完成（優化版本）---")
+                                yolo_model = _yolo_world_model
+                            except Exception as init_e:
+                                print(f"--- [WARNING] 模型初始化失敗: {init_e}，使用舊版本 ---")
+                                # 回退到舊版本
+                                yolo_result = infer_segment_yolo(
+                                    str(seg_path),
+                                    labels=yolo_labels or "person,pedestrian,motorcycle,car,bus,scooter,truck",
+                                    every_sec=yolo_every_sec,
+                                    score_thr=yolo_score_thr
+                                )
+                                yolo_model = None  # 標記為已處理
+                    
+                    # 使用優化版本（如果模型已初始化）
+                    if yolo_model is not None:
+                        yolo_result = infer_segment_yolo_optimized(
+                            str(seg_path),
+                            labels=yolo_labels or "person,pedestrian,motorcycle,car,bus,scooter,truck",
+                            every_sec=yolo_every_sec,
+                            score_thr=yolo_score_thr,
+                            yolo_model=yolo_model,
+                            reid_model=reid_model,
+                            reid_device=reid_device
+                        )
+                    elif yolo_result is None:
+                        # 如果還是沒有結果，使用舊版本（最後備用）
+                        print("--- [WARNING] 使用舊版本 YOLO（較慢）---")
+                        infer_segment_yolo = _get_infer_segment_yolo()
+                        yolo_result = infer_segment_yolo(
+                            str(seg_path),
+                            labels=yolo_labels or "person,pedestrian,motorcycle,car,bus,scooter,truck",
+                            every_sec=yolo_every_sec,
+                            score_thr=yolo_score_thr
+                        )
+                    
+                    # 將 YOLO 結果添加到 VLM 結果中（確保 vlm_result 是字典）
+                    if isinstance(vlm_result, dict):
+                        # 確保 raw_detection 是字典，不是 None
+                        if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                            vlm_result["raw_detection"] = {}
+                        vlm_result["raw_detection"]["yolo"] = yolo_result
+                        print(f"--- [YOLO Optimized] 片段 {idx} 完成：偵測到 {yolo_result.get('total_detections', 0) if yolo_result else 0} 個物件 ---")
+                    else:
+                        print(f"--- [ERROR] vlm_result 不是字典，無法添加 YOLO 結果 ---")
+                except Exception as e:
+                    print(f"--- [WARNING] YOLO 處理失敗 (segment {idx}): {e} ---")
+                    import traceback
+                    traceback.print_exc()
+                    # 確保 vlm_result 是字典後再設置錯誤
+                    if isinstance(vlm_result, dict):
+                        vlm_result["yolo_error"] = str(e)
+                        # 即使失敗也設置空結果，確保結構一致
+                        if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                            vlm_result["raw_detection"] = {}
+                        vlm_result["raw_detection"]["yolo"] = None
+                    else:
+                        print(f"--- [ERROR] vlm_result 不是字典，無法設置 YOLO 錯誤 ---")
+            
+            # 如果跳過 YOLO，確保 raw_detection 欄位存在但為空
+            if SKIP_YOLO:
+                if isinstance(vlm_result, dict):
+                    # 確保 raw_detection 是字典，不是 None
+                    if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                        vlm_result["raw_detection"] = {}
+                    vlm_result["raw_detection"]["yolo"] = None
+                    vlm_result["raw_detection"]["yolo_skipped"] = True
+            
+            # 確保返回的是有效的字典
+            if vlm_result is None or not isinstance(vlm_result, dict):
+                print(f"--- [ERROR] process_segment 返回無效結果: {vlm_result} ---")
+                vlm_result = {
+                    "segment": Path(seg_path).name,
+                    "time_range": time_range_str,
+                    "duration_sec": end - start,
+                    "success": False,
+                    "time_sec": 0.0,
+                    "parsed": {},
+                    "raw_detection": {},  # 改為空字典，避免 None 錯誤
+                    "error": "process_segment 返回無效結果"
+                }
+            return vlm_result
+        except Exception as outer_e:
+            # 捕獲所有其他異常（包括 ImportError 和其他錯誤）
+            print(f"--- [ERROR] process_segment 發生異常: {outer_e} ---")
+            import traceback
+            traceback.print_exc()
+            # 返回一個有效的錯誤結果
+            return {
+                "segment": Path(seg_path).name,
+                "time_range": time_range_str,
+                "duration_sec": end - start,
+                "success": False,
+                "time_sec": 0.0,
+                "parsed": {},
+                "raw_detection": {},  # 改為空字典，避免 None 錯誤
+                "error": str(outer_e)
+            }
+        except ImportError:
+            # 如果優化版本不可用，回退到舊版本
+            print("--- [WARNING] 優化版本不可用，使用舊版本 ---")
+            # 使用舊的 process_segment 邏輯
+            m = re.search(r"(\d+)", Path(seg_path).name)
+            idx = int(m.group(1)) if m else seg_idx
+            start = idx * (segment_duration - overlap)
+            end = min(start + segment_duration, total_duration)
+            time_range_str = f"{_fmt_hms(start)} - {_fmt_hms(end)}"
+
+            vlm_result = None  # 初始化 vlm_result，避免未定義錯誤
+            if not SKIP_VLM:
+                try:
+                    req_data = SegmentAnalysisRequest(
+                        segment_path=str(seg_path),
+                        segment_index=idx,
+                        start_time=start,
+                        end_time=end,
+                        model_type=model_type,
+                        qwen_model=qwen_model,
+                        frames_per_segment=frames_per_segment,
+                        target_short=target_short,
+                        sampling_fps=sampling_fps,
+                        event_detection_prompt=event_detection_prompt,
+                        summary_prompt=summary_prompt,
+                        owl_labels=owl_labels,
+                        owl_every_sec=owl_every_sec,
+                        owl_score_thr=owl_score_thr,
+                        yolo_labels=yolo_labels,
+                        yolo_every_sec=yolo_every_sec,
+                        yolo_score_thr=yolo_score_thr
+                    )
+
+                    vlm_result = analyze_segment_result(req_data)
+                except Exception as vlm_e:
+                    # 如果 VLM 分析失敗，創建錯誤結果
+                    print(f"--- [ERROR] VLM 分析失敗 (segment {idx}, 舊版本回退): {vlm_e} ---")
+                    import traceback
+                    traceback.print_exc()
+                    vlm_result = {
+                        "segment": Path(seg_path).name,
+                        "time_range": time_range_str,
+                        "duration_sec": end - start,
+                        "success": False,
+                        "time_sec": 0.0,
+                        "parsed": {
+                            "frame_analysis": {
+                                "events": {
+                                    "water_flood": False,
+                                    "fire": False,
+                                    "abnormal_attire_face_cover_at_entry": False,
+                                    "person_fallen_unmoving": False,
+                                    "double_parking_lane_block": False,
+                                    "smoking_outside_zone": False,
+                                    "crowd_loitering": False,
+                                    "security_door_tamper": False,
+                                    "reason": ""
+                                }
+                            },
+                            "summary_independent": ""
+                        },
+                        "raw_detection": {},  # 確保是空字典，不是 None
+                        "error": f"VLM 分析失敗: {str(vlm_e)}"
+                    }
+            else:
+                # [跳過 VLM] 創建基本的結果結構
+                vlm_result = {
+                    "segment": Path(seg_path).name,
+                    "time_range": time_range_str,
+                    "duration_sec": end - start,
+                    "success": True,
+                    "time_sec": 0.0,
+                    "parsed": {
+                        "frame_analysis": {
+                            "events": {
+                                "water_flood": False,
+                                "fire": False,
+                                "abnormal_attire_face_cover_at_entry": False,
+                                "person_fallen_unmoving": False,
+                                "double_parking_lane_block": False,
+                                "smoking_outside_zone": False,
+                                "crowd_loitering": False,
+                                "security_door_tamper": False,
+                                "reason": "VLM 分析已暫時停用（GPU 滿載）"
+                            },
+                            "persons": []
+                        },
+                        "summary_independent": "VLM 分析已暫時停用"
+                    },
+                    "raw_detection": {},
+                    "error": None
+                }
+            
+            # 確保 vlm_result 是有效的字典（舊版本回退路徑）
+            if vlm_result is None or not isinstance(vlm_result, dict):
+                print(f"--- [ERROR] VLM 分析返回無效結果（舊版本回退）: {vlm_result} ---")
+                import traceback
+                traceback.print_exc()
+                vlm_result = {
+                    "segment": Path(seg_path).name,
+                    "time_range": time_range_str,
+                    "duration_sec": end - start,
+                    "success": False,
+                    "time_sec": 0.0,
+                    "parsed": {
+                        "frame_analysis": {
+                            "events": {
+                                "water_flood": False,
+                                "fire": False,
+                                "abnormal_attire_face_cover_at_entry": False,
+                                "person_fallen_unmoving": False,
+                                "double_parking_lane_block": False,
+                                "smoking_outside_zone": False,
+                                "crowd_loitering": False,
+                                "security_door_tamper": False,
+                                "reason": ""
+                            }
+                        },
+                        "summary_independent": ""
+                    },
+                    "raw_detection": {},
+                    "error": f"VLM 分析返回無效結果: {vlm_result}"
+                }
+            
+            # 確保 vlm_result 有必要的欄位（舊版本回退路徑）
+            if "parsed" not in vlm_result:
+                vlm_result["parsed"] = {
+                    "frame_analysis": {
+                        "events": {
+                            "water_flood": False,
+                            "fire": False,
+                            "abnormal_attire_face_cover_at_entry": False,
+                            "person_fallen_unmoving": False,
+                            "double_parking_lane_block": False,
+                            "smoking_outside_zone": False,
+                            "crowd_loitering": False,
+                            "security_door_tamper": False,
+                            "reason": ""
+                        }
+                    },
+                    "summary_independent": ""
+                }
+            # 確保 raw_detection 是字典，不是 None
+            if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                vlm_result["raw_detection"] = {}
+            
+            # 舊版本回退路徑：也檢查是否跳過 YOLO
+            if SKIP_YOLO:
+                print(f"--- [跳過 YOLO] 片段 {idx}（舊版本回退）：只執行 VLM 分析 ---")
+                if isinstance(vlm_result, dict):
+                    # 確保 raw_detection 是字典，不是 None
+                    if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                        vlm_result["raw_detection"] = {}
+                    vlm_result["raw_detection"]["yolo"] = None
+                    vlm_result["raw_detection"]["yolo_skipped"] = True
+            else:
+                yolo_result = None
+                try:
+                    infer_segment_yolo = _get_infer_segment_yolo()
+                    yolo_result = infer_segment_yolo(
+                        str(seg_path),
+                        labels=yolo_labels or "person,pedestrian,motorcycle,car,bus,scooter,truck",
+                        every_sec=yolo_every_sec,
+                        score_thr=yolo_score_thr
+                    )
+                    # 確保 vlm_result 是字典後再賦值
+                    if isinstance(vlm_result, dict):
+                        # 確保 raw_detection 是字典，不是 None
+                        if "raw_detection" not in vlm_result or vlm_result["raw_detection"] is None:
+                            vlm_result["raw_detection"] = {}
+                        vlm_result["raw_detection"]["yolo"] = yolo_result
+                        print(f"--- [YOLO] 片段 {idx} 完成：偵測到 {yolo_result.get('total_detections', 0) if yolo_result else 0} 個物件 ---")
+                    else:
+                        print(f"--- [ERROR] vlm_result 不是字典（舊版本回退），無法添加 YOLO 結果 ---")
+                except Exception as e:
+                    print(f"--- [WARNING] YOLO 處理失敗 (segment {idx}): {e} ---")
+                    import traceback
+                    traceback.print_exc()
+                    # 確保 vlm_result 是字典後再設置錯誤
+                    if isinstance(vlm_result, dict):
+                        vlm_result["yolo_error"] = str(e)
+                        if "raw_detection" not in vlm_result:
+                            vlm_result["raw_detection"] = {}
+                        vlm_result["raw_detection"]["yolo"] = None
+                    else:
+                        print(f"--- [ERROR] vlm_result 不是字典（舊版本回退），無法設置 YOLO 錯誤 ---")
+            
+            return vlm_result
+
+    # 使用線程池實現併行處理（增加並行度以加速 VLM 處理）
+    # max_workers 設為 4，可以同時處理 4 個片段（VLM + YOLO）
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = []
+        for i, p in enumerate(seg_files):
+            future = executor.submit(process_segment, p, i)
+            futures.append((future, i))
+        
+        # 收集結果（按順序）
+        results_dict = {}
+        for future, idx in futures:
+            try:
+                res = future.result()
+                results_dict[idx] = res
+            except Exception as e:
+                print(f"--- [ERROR] 片段處理失敗 (index {idx}): {e} ---")
+                results_dict[idx] = {
+                    "success": False,
+                    "error": str(e),
+                    "time_sec": 0
+                }
+        
+        # 按索引排序
+        results = [results_dict[i] for i in sorted(results_dict.keys())]
 
     # 4. 統計與存檔 (維持原樣)
-    total_time = time.time() - t0
+    process_time = time.time() - t0  # 處理時間（不包括上傳、切割）
+    total_time = time.time() - t0_total  # 總時間（包括上傳、切割、處理）
     ok_count = sum(1 for r in results if r.get("success"))
 
     resp = {
         "model_type": model_type,
         "total_segments": len(results),
         "success_segments": ok_count,
-        "total_time_sec": round(total_time, 2),
+        "total_time_sec": round(total_time, 2),  # 總時間（包括所有操作）
+        "process_time_sec": round(process_time, 2),  # 處理時間（不包括上傳、切割）
         "results": results,
     }
 
