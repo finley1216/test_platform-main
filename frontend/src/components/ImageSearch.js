@@ -76,8 +76,8 @@ const ImageSearch = ({ apiKey, authenticated }) => {
 
       setSearchProgress("生成 embedding 中...");
       
-      // 設置超時時間為 10 秒
-      const timeoutDuration = 10000; // 10 秒
+      // 設置超時時間為 60 秒（以圖搜圖需要載入 CLIP 模型和執行向量搜索，可能需要較長時間）
+      const timeoutDuration = 60000; // 60 秒
       
       // 設置超時
       const timeoutPromise = new Promise((_, reject) => {

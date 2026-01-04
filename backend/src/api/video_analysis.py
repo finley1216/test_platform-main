@@ -1165,7 +1165,23 @@ def search_by_image(
             if query_embedding is None:
                 print("--- [Image Search] ✗ 無法生成圖片 embedding ---")
                 sys.stdout.flush()
-                raise HTTPException(status_code=500, detail="無法生成查詢圖片的 embedding")
+                # 檢查 CLIP 模型狀態
+                try:
+                    from src.main import get_clip_model, _clip_model, _clip_processor
+                    clip_model, clip_processor = get_clip_model()
+                    model_status = "已載入" if clip_model is not None else "未載入"
+                    processor_status = "已載入" if clip_processor is not None else "未載入"
+                    
+                    # 檢查全局變數狀態
+                    global_model_status = "已載入" if _clip_model is not None else "未載入"
+                    
+                    if clip_model is None:
+                        error_detail = f"無法生成查詢圖片的 embedding。CLIP 模型未載入（可能是網路問題無法下載模型，或模型載入失敗）。請檢查：1) 網路連線是否正常 2) 是否可以連接到 huggingface.co 3) 後端日誌中的詳細錯誤信息。模型狀態: {model_status}, 處理器狀態: {processor_status}, 全局狀態: {global_model_status}"
+                    else:
+                        error_detail = f"無法生成查詢圖片的 embedding。CLIP 模型已載入但生成失敗。請檢查：1) 圖片格式是否正確 2) 圖片文件是否損壞 3) 後端日誌中的詳細錯誤信息。"
+                except Exception as e:
+                    error_detail = f"無法生成查詢圖片的 embedding。CLIP 模型載入檢查失敗: {str(e)}。請檢查後端日誌以獲取詳細錯誤信息。"
+                raise HTTPException(status_code=500, detail=error_detail)
             print(f"--- [Image Search] ✓ 圖片 embedding 生成完成 (維度: {len(query_embedding)}) ---")
             print(f"--- [Image Search] 查詢向量前5個值: {query_embedding[:5] if len(query_embedding) >= 5 else query_embedding} ---")
             sys.stdout.flush()

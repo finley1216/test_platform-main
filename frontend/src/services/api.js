@@ -351,9 +351,9 @@ class ApiService {
   }
 
   // 以圖搜圖 API
-  async searchImage(formData, apiKey, timeoutMs = 10000) {
+  async searchImage(formData, apiKey, timeoutMs = 60000) {
     // 使用 fetch 直接調用以支持超時和進度追蹤
-    // 預設超時時間為 10 秒
+    // 預設超時時間為 60 秒（以圖搜圖需要載入 CLIP 模型和執行向量搜索）
     const url = `${this.baseUrl}/v1/search/image`;
     const controller = new AbortController();
     const timeoutId = setTimeout(() => controller.abort(), timeoutMs);

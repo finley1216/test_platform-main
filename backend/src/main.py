@@ -2,7 +2,12 @@
 import os, io, re, json, base64, tempfile, subprocess, time, secrets, hashlib, copy, requests, cv2
 
 import numpy as np
-import google.generativeai as genai
+try:
+    import google.generativeai as genai
+    HAS_GEMINI = True
+except ImportError:
+    HAS_GEMINI = False
+    print("--- [WARNING] google.generativeai 未安裝，Gemini 功能將無法使用 ---")
 
 from typing import List, Dict, Any, Optional, Tuple
 from pathlib import Path
@@ -13,7 +18,17 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.security import APIKeyHeader
-from google.generativeai.types import HarmCategory, HarmBlockThreshold
+if HAS_GEMINI:
+    from google.generativeai.types import HarmCategory, HarmBlockThreshold
+else:
+    # 定義假類別以避免導入錯誤
+    class HarmCategory:
+        HARM_CATEGORY_HARASSMENT = None
+        HARM_CATEGORY_HATE_SPEECH = None
+        HARM_CATEGORY_SEXUALLY_EXPLICIT = None
+        HARM_CATEGORY_DANGEROUS_CONTENT = None
+    class HarmBlockThreshold:
+        BLOCK_NONE = None
 # [DEPRECATED] RAGStore 已完全移除，現在完全使用 PostgreSQL + pgvector
 # 不再需要 faiss，所有 RAG 功能都使用 PostgreSQL
 HAS_RAG_STORE = False
@@ -104,17 +119,57 @@ def get_clip_model():
         try:
             from transformers import CLIPModel, CLIPProcessor
             import torch
+            import os
             device = "cuda" if torch.cuda.is_available() else "cpu"
             print(f"--- [CLIP] 載入模型: {CLIP_MODEL_NAME} (device: {device}) ---")
-            _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME).to(device).eval()
-            _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME)
-            print(f"✓ CLIP 模型載入完成")
+            
+            # 直接使用模型名稱載入，transformers 會自動從緩存讀取（如果可用）
+            # 如果緩存不完整，會嘗試從網路下載缺失的部分
+            try:
+                # 先嘗試只使用本地文件（如果緩存完整）
+                print("--- [CLIP] 嘗試從本地緩存載入模型和處理器... ---")
+                _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, local_files_only=True).to(device).eval()
+                print("--- [CLIP] 模型載入完成，載入處理器... ---")
+                _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, local_files_only=True)
+                print(f"✓ CLIP 模型和處理器從本地緩存載入完成")
+            except Exception as local_e:
+                # 如果本地緩存不完整，嘗試從網路下載（但可能因為網路問題失敗）
+                print(f"--- [CLIP] 本地緩存不完整或載入失敗: {type(local_e).__name__}: {str(local_e)[:200]} ---")
+                print("--- [CLIP] 嘗試從網路下載（如果網路可用，但可能很慢）... ---")
+                try:
+                    # 設置較短的超時，避免長時間等待
+                    import requests
+                    original_timeout = getattr(requests.adapters, 'DEFAULT_TIMEOUT', None)
+                    if hasattr(requests.adapters, 'DEFAULT_TIMEOUT'):
+                        requests.adapters.DEFAULT_TIMEOUT = 10  # 10 秒超時
+                    
+                    print("--- [CLIP] 從網路載入模型... ---")
+                    _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, local_files_only=False).to(device).eval()
+                    print("--- [CLIP] 模型載入完成，從網路載入處理器... ---")
+                    _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, local_files_only=False)
+                    print(f"✓ CLIP 模型和處理器從網路載入完成")
+                    
+                    # 恢復原始超時設置
+                    if original_timeout is not None and hasattr(requests.adapters, 'DEFAULT_TIMEOUT'):
+                        requests.adapters.DEFAULT_TIMEOUT = original_timeout
+                except Exception as network_e:
+                    print(f"⚠️  CLIP 模型網路載入也失敗: {type(network_e).__name__}: {str(network_e)[:200]}")
+                    # 不拋出異常，讓應用繼續運行，但模型為 None
+                    _clip_model = None
+                    _clip_processor = None
+                    print("⚠️  CLIP 功能將無法使用（無法從緩存或網路載入模型），但應用可以繼續運行")
+                    print("⚠️  建議：檢查網路連線或確保模型緩存完整")
         except ImportError:
             print("--- [WARNING] transformers 未安裝，CLIP 功能將無法使用 ---")
-            raise RuntimeError("請安裝 transformers: pip install transformers")
+            _clip_model = None
+            _clip_processor = None
         except Exception as e:
             print(f"⚠️  Failed to load CLIP model: {e}")
-            raise RuntimeError(f"無法載入 CLIP 模型: {e}")
+            import traceback
+            traceback.print_exc()
+            _clip_model = None
+            _clip_processor = None
+            print("⚠️  CLIP 功能將無法使用，但應用可以繼續運行")
     return _clip_model, _clip_processor
 
 def generate_image_embedding(image_path: str) -> Optional[List[float]]:
@@ -129,39 +184,56 @@ def generate_image_embedding(image_path: str) -> Optional[List[float]]:
     """
     try:
         print(f"--- [generate_image_embedding] 開始處理圖片: {image_path} ---")
-        print(f"--- [generate_image_embedding] 檢查文件是否存在: {os.path.exists(image_path) if 'os' in dir() else 'N/A'} ---")
+        import os
+        file_exists = os.path.exists(image_path)
+        print(f"--- [generate_image_embedding] 檢查文件是否存在: {file_exists} ---")
+        
+        if not file_exists:
+            print(f"--- [generate_image_embedding] ✗ 文件不存在: {image_path} ---")
+            return None
         
         clip_model, clip_processor = get_clip_model()
         if clip_model is None:
-            print("--- [generate_image_embedding] ✗ CLIP 模型為 None ---")
+            print("--- [generate_image_embedding] ✗ CLIP 模型為 None（可能未載入或載入失敗）---")
             return None
-        print(f"--- [generate_image_embedding] CLIP 模型已加載 ---")
+        if clip_processor is None:
+            print("--- [generate_image_embedding] ✗ CLIP 處理器為 None（可能未載入或載入失敗）---")
+            return None
+        print(f"--- [generate_image_embedding] CLIP 模型已加載（模型: {type(clip_model).__name__}, 處理器: {type(clip_processor).__name__}）---")
         import torch
         
         # 讀取圖像
         img_bgr = cv2.imread(image_path)
         if img_bgr is None:
-            print(f"--- [WARNING] 無法讀取圖像: {image_path} ---")
+            print(f"--- [WARNING] 無法讀取圖像: {image_path}（可能是格式不支持或文件損壞）---")
             return None
+        
+        print(f"--- [generate_image_embedding] 圖片尺寸: {img_bgr.shape} ---")
         
         # 轉換為 RGB
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         
         # 使用 CLIP 處理
+        print(f"--- [generate_image_embedding] 使用 CLIP 處理器處理圖片... ---")
         inputs = clip_processor(images=[img_rgb], return_tensors="pt")
         device = next(clip_model.parameters()).device
         inputs = {k: v.to(device) for k, v in inputs.items()}
+        print(f"--- [generate_image_embedding] 輸入已移至設備: {device} ---")
         
         # 生成 embedding
+        print(f"--- [generate_image_embedding] 生成 embedding... ---")
         with torch.no_grad():
             image_features = clip_model.get_image_features(**inputs)[0]
             embedding = image_features.detach().cpu().numpy().astype(np.float32)
             # L2 正規化
             embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
         
+        print(f"--- [generate_image_embedding] ✓ embedding 生成成功，維度: {len(embedding)} ---")
         return embedding.tolist()
     except Exception as e:
-        print(f"--- [WARNING] 生成圖像 embedding 失敗 ({image_path}): {e} ---")
+        print(f"--- [ERROR] 生成圖像 embedding 失敗 ({image_path}): {e} ---")
+        import traceback
+        traceback.print_exc()
         return None
 
 def generate_text_embedding(text: str) -> Optional[List[float]]:
@@ -217,6 +289,75 @@ def _make_app() -> FastAPI:
     return app
 
 app = _make_app()
+
+# ================== 啟動時預載入模型 ==================
+@app.on_event("startup")
+async def startup_event():
+    """應用啟動時預載入模型，避免首次請求時延遲（在背景執行，不阻塞啟動）"""
+    import asyncio
+    import threading
+    
+    def preload_models_sync():
+        """在背景線程中預載入模型（同步執行，避免阻塞）"""
+        print("=" * 80)
+        print("--- [啟動] 開始預載入模型（背景執行）... ---")
+        
+        # 預載入 CLIP 模型（以圖搜圖功能）
+        try:
+            print("--- [啟動] 預載入 CLIP 模型... ---")
+            # 設置超時，避免無限等待
+            import signal
+            
+            def timeout_handler(signum, frame):
+                raise TimeoutError("CLIP 模型載入超時")
+            
+            # 只在非 Windows 系統上使用 signal
+            try:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(60)  # 60 秒超時
+            except (AttributeError, ValueError):
+                pass  # Windows 不支持 SIGALRM
+            
+            try:
+                clip_model, clip_processor = get_clip_model()
+                if clip_model is not None and clip_processor is not None:
+                    print("✓ CLIP 模型預載入完成")
+                else:
+                    print("⚠️  CLIP 模型預載入失敗（模型為 None）")
+            finally:
+                try:
+                    signal.alarm(0)  # 取消超時
+                except (AttributeError, ValueError):
+                    pass
+        except TimeoutError:
+            print("⚠️  CLIP 模型預載入超時（60秒），將在首次使用時載入")
+        except Exception as e:
+            print(f"⚠️  CLIP 模型預載入失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            # 不中斷啟動，讓應用繼續運行
+        
+        # 預載入 SentenceTransformer 模型（RAG 搜索功能）
+        try:
+            print("--- [啟動] 預載入 SentenceTransformer 模型... ---")
+            embedding_model = get_embedding_model()
+            if embedding_model is not None:
+                print("✓ SentenceTransformer 模型預載入完成")
+            else:
+                print("⚠️  SentenceTransformer 模型預載入失敗（模型為 None）")
+        except Exception as e:
+            print(f"⚠️  SentenceTransformer 模型預載入失敗: {e}")
+            import traceback
+            traceback.print_exc()
+            # 不中斷啟動，讓應用繼續運行
+        
+        print("--- [啟動] 模型預載入完成 ---")
+        print("=" * 80)
+    
+    # 在背景線程中執行，不阻塞應用啟動
+    thread = threading.Thread(target=preload_models_sync, daemon=True)
+    thread.start()
+
 app.mount("/segment", StaticFiles(directory="segment"), name="segment")
 
 # ================== 小工具 ==================
@@ -3543,6 +3684,8 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         # 顏色 + 衣服
         "黃色衣服", "黑色衣服", "白色衣服", "紅色衣服", "藍色衣服", "綠色衣服",
         "深色衣服", "淺色衣服", "灰色衣服",
+        "黃色制服", "黑色制服", "白色制服", "紅色制服", "藍色制服", "綠色制服",
+        "深色制服", "淺色制服", "灰色制服",
         # 顏色 + 車輛
         "藍色貨車", "白色貨車", "紅色貨車", "黑色貨車", "綠色貨車", "黃色貨車",
         "藍色卡車", "白色卡車", "紅色卡車", "黑色卡車",

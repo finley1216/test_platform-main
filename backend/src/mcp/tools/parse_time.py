@@ -26,10 +26,17 @@ def day_window(d: date) -> Tuple[datetime, datetime]:
 
 
 def week_window(anchor: date) -> Tuple[datetime, datetime]:
-    """Return Monday 00:00 ~ next Monday 00:00 for the week containing anchor."""
-    monday = anchor - timedelta(days=anchor.weekday())  # Monday
-    start = datetime.combine(monday, time(0, 0, 0), tzinfo=TZ)
-    end = start + timedelta(days=7)
+    """
+    Return Sunday 00:00 ~ next Sunday 00:00 for the week containing anchor.
+    Week starts on Sunday (global week standard).
+    Python weekday(): Monday=0, Tuesday=1, ..., Sunday=6
+    """
+    # 計算包含 anchor 的週的週日（週的開始）
+    # 如果 anchor 是週日（weekday() == 6），則不減；否則減去 (weekday() + 1) 天
+    days_to_sunday = (anchor.weekday() + 1) % 7
+    sunday = anchor - timedelta(days=days_to_sunday)
+    start = datetime.combine(sunday, time(0, 0, 0), tzinfo=TZ)
+    end = start + timedelta(days=7)  # Next Sunday 00:00
     return start, end
 
 
@@ -60,18 +67,26 @@ def parse_relative_date(text: str, now: datetime) -> Optional[Dict[str, Any]]:
         s, e = day_window(d)
         return {"mode": "RELATIVE_TOMORROW", "picked": d, "start": s, "end": e}
 
-    # Week-relative (whole week)
+    # Week-relative (whole week) - 使用全球週標準（週日到週六）
     if "本週" in text or "這週" in text or "本周" in text or "这周" in text:
         s, e = week_window(today)
         return {"mode": "RELATIVE_THIS_WEEK", "picked": today, "start": s, "end": e}
 
     if "上週" in text or "上周" in text:
-        s, e = week_window(today - timedelta(days=7))
-        return {"mode": "RELATIVE_LAST_WEEK", "picked": today - timedelta(days=7), "start": s, "end": e}
+        # 先找到本週的週日，然後減去 7 天得到上週的週日
+        days_to_sunday = (today.weekday() + 1) % 7
+        this_week_sunday = today - timedelta(days=days_to_sunday)
+        last_week_sunday = this_week_sunday - timedelta(days=7)
+        s, e = week_window(last_week_sunday)
+        return {"mode": "RELATIVE_LAST_WEEK", "picked": last_week_sunday, "start": s, "end": e}
 
     if "下週" in text or "下周" in text:
-        s, e = week_window(today + timedelta(days=7))
-        return {"mode": "RELATIVE_NEXT_WEEK", "picked": today + timedelta(days=7), "start": s, "end": e}
+        # 先找到本週的週日，然後加上 7 天得到下週的週日
+        days_to_sunday = (today.weekday() + 1) % 7
+        this_week_sunday = today - timedelta(days=days_to_sunday)
+        next_week_sunday = this_week_sunday + timedelta(days=7)
+        s, e = week_window(next_week_sunday)
+        return {"mode": "RELATIVE_NEXT_WEEK", "picked": next_week_sunday, "start": s, "end": e}
 
     return None
 
