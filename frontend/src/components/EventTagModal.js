@@ -299,8 +299,7 @@ const EventTagModal = ({ isOpen, onClose, apiKey }) => {
                 {videos.map((video) => (
                     <option key={video.video_id} value={video.video_id}>
                       {video.display_name}
-                      {video.category && ` [${video.category}]`}
-                      {video.event_label && !video.category && ` [${video.event_label}]`}
+                      {video.event_label && ` [${video.event_label}]`}
                       {video.source === "segment" &&
                         ` (${video.success_segments}/${video.total_segments} 片段)`}
                       {video.source === "video_lib" && ` [未處理]`}
@@ -343,16 +342,10 @@ const EventTagModal = ({ isOpen, onClose, apiKey }) => {
                         >
                           {selectedVideo.display_name}
                         </div>
-                        {/* 如果分類和事件類型相同，只顯示事件類型 */}
+                        {/* 只顯示事件類型，不顯示分類 */}
                         {selectedVideo.event_label && (
                           <div style={{ color: "#999", marginBottom: "4px", wordBreak: "break-word" }}>
                             事件類型：{selectedVideo.event_label}
-                          </div>
-                        )}
-                        {selectedVideo.category && 
-                         selectedVideo.category !== selectedVideo.event_label && (
-                          <div style={{ color: "#999", marginBottom: "4px", wordBreak: "break-word" }}>
-                            分類：{selectedVideo.category}
                           </div>
                         )}
                         {selectedVideo.event_description && (

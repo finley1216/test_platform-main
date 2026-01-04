@@ -236,10 +236,13 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 else:
                     t1 = datetime.fromisoformat(time_end_str)
                 
+                # 修正時區處理：資料庫中的時間是無時區的本地時間
+                # 如果查詢時間帶時區，直接移除時區信息（保持時間值不變）
+                # 這樣可以避免時區轉換導致的時間偏移
                 if t0.tzinfo:
-                    t0 = t0.astimezone().replace(tzinfo=None)
+                    t0 = t0.replace(tzinfo=None)
                 if t1.tzinfo:
-                    t1 = t1.astimezone().replace(tzinfo=None)
+                    t1 = t1.replace(tzinfo=None)
                 
                 stmt = stmt.filter(
                     Summary.start_timestamp >= t0,
@@ -284,14 +287,17 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 stmt = stmt.filter(or_(*event_conditions))
                 print(f"--- [DEBUG] 應用事件過濾: {query_filters['event_types']} ---")
 
-        # 關鍵字過濾
-        if query_filters.get("message_keywords"):
+        # 關鍵字過濾（只在沒有事件類型過濾時使用，避免過度過濾）
+        # 如果已經有事件類型過濾，關鍵字過濾可能會導致結果為 0（因為 message 可能不包含關鍵字）
+        if query_filters.get("message_keywords") and not query_filters.get("event_types"):
             message_conditions = []
             for keyword in query_filters["message_keywords"]:
                 message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
             if message_conditions:
                 stmt = stmt.filter(or_(*message_conditions))
                 print(f"--- [DEBUG] 應用關鍵字過濾: {query_filters['message_keywords']} ---")
+        elif query_filters.get("message_keywords") and query_filters.get("event_types"):
+            print(f"--- [DEBUG] 跳過關鍵字過濾（已有事件類型過濾）: {query_filters['message_keywords']} ---")
 
         # Filter 2: Vector search - 使用 cosine_distance 排序
         try:
@@ -485,10 +491,13 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 else:
                     t1 = datetime.fromisoformat(time_end_str)
                 
+                # 修正時區處理：資料庫中的時間是無時區的本地時間
+                # 如果查詢時間帶時區，直接移除時區信息（保持時間值不變）
+                # 這樣可以避免時區轉換導致的時間偏移
                 if t0.tzinfo:
-                    t0 = t0.astimezone().replace(tzinfo=None)
+                    t0 = t0.replace(tzinfo=None)
                 if t1.tzinfo:
-                    t1 = t1.astimezone().replace(tzinfo=None)
+                    t1 = t1.replace(tzinfo=None)
                 
                 stmt = stmt.filter(
                     Summary.start_timestamp >= t0,
@@ -533,14 +542,17 @@ async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB e
                 stmt = stmt.filter(or_(*event_conditions))
                 print(f"--- [DEBUG] 應用事件過濾: {query_filters['event_types']} ---")
 
-        # 關鍵字過濾
-        if query_filters.get("message_keywords"):
+        # 關鍵字過濾（只在沒有事件類型過濾時使用，避免過度過濾）
+        # 如果已經有事件類型過濾，關鍵字過濾可能會導致結果為 0（因為 message 可能不包含關鍵字）
+        if query_filters.get("message_keywords") and not query_filters.get("event_types"):
             message_conditions = []
             for keyword in query_filters["message_keywords"]:
                 message_conditions.append(Summary.message.ilike(f"%{keyword}%"))
             if message_conditions:
                 stmt = stmt.filter(or_(*message_conditions))
                 print(f"--- [DEBUG] 應用關鍵字過濾: {query_filters['message_keywords']} ---")
+        elif query_filters.get("message_keywords") and query_filters.get("event_types"):
+            print(f"--- [DEBUG] 跳過關鍵字過濾（已有事件類型過濾）: {query_filters['message_keywords']} ---")
 
         # Vector search
         try:

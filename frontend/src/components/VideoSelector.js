@@ -12,6 +12,19 @@ const VideoSelector = ({
   const [loading, setLoading] = useState(false);
   const [selectedCategory, setSelectedCategory] = useState("all");
 
+  // 預定義的事件類型（與 EventTagModal 保持一致）
+  const eventTypes = [
+    "火災生成",
+    "水災生成",
+    "人員倒地不起",
+    "門禁遮臉入場",
+    "車道併排阻塞",
+    "離開吸菸區吸菸",
+    "聚眾逗留",
+    "安全門破壞/撬動",
+    "其他",
+  ];
+
   useEffect(() => {
     if (authenticated && apiKey) {
       loadVideos();
@@ -23,40 +36,63 @@ const VideoSelector = ({
     try {
       const data = await apiService.listVideos(apiKey);
       setVideos(data.videos || []);
-      setCategories(data.categories || []);
+      // 使用預定義的事件類型列表，而不是後端返回的分類
+      try {
+        const catData = await apiService.getVideoCategories(apiKey);
+        if (catData.categories) {
+          setCategories(catData.categories);
+        } else {
+          // 如果後端沒有返回，使用預定義列表
+          setCategories(eventTypes);
+        }
+      } catch (e) {
+        // 如果 API 調用失敗，使用預定義列表
+        console.warn("Failed to load categories, using predefined list:", e);
+        setCategories(eventTypes);
+      }
     } catch (error) {
       console.error("Failed to load videos:", error);
       setVideos([]);
-      setCategories([]);
+      setCategories(eventTypes); // 使用預定義列表作為備用
     } finally {
       setLoading(false);
     }
   };
 
-  // 按分類分組影片
+  // 按事件類型分組影片（只使用 event_label，不使用 category）
+  // 只顯示有實際影片的事件類型
   const groupedVideos = videos.reduce((acc, video) => {
-    const category = video.category || video.event_label || "未分類";
-    if (!acc[category]) {
-      acc[category] = [];
+    // 只處理有 event_label 的影片，沒有 event_label 的歸類為"未分類"
+    if (video.event_label) {
+      const eventType = video.event_label;
+      if (!acc[eventType]) {
+        acc[eventType] = [];
+      }
+      acc[eventType].push(video);
+    } else {
+      // 沒有 event_label 的影片歸類為"未分類"
+      if (!acc["未分類"]) {
+        acc["未分類"] = [];
+      }
+      acc["未分類"].push(video);
     }
-    acc[category].push(video);
     return acc;
   }, {});
 
-  // 過濾影片
+  // 過濾影片（只使用 event_label）
   const filteredVideos =
     selectedCategory === "all"
       ? videos
       : videos.filter(
           (v) =>
-            (v.category || v.event_label || "未分類") === selectedCategory
+            (v.event_label || "未分類") === selectedCategory
         );
 
-  // 當選擇分類改變時，清除已選擇的影片
+  // 當選擇事件類型改變時，清除已選擇的影片
   useEffect(() => {
     if (selectedCategory !== "all" && selectedVideoId) {
       const selectedVideo = videos.find((v) => v.video_id === selectedVideoId);
-      if (selectedVideo && (selectedVideo.category || selectedVideo.event_label || "未分類") !== selectedCategory) {
+      if (selectedVideo && (selectedVideo.event_label || "未分類") !== selectedCategory) {
         onVideoChange("");
       }
     }
@@ -88,7 +124,7 @@ const VideoSelector = ({
                 }}
                 style={{ marginBottom: "8px" }}
               >
-                <option value="all">所有分類</option>
+                <option value="all">所有事件類型</option>
                 {categories.map((cat) => (
                   <option key={cat} value={cat}>
                     {cat}
@@ -107,9 +143,11 @@ const VideoSelector = ({
           >
             <option value="">-- 請選擇影片 --</option>
             {selectedCategory === "all" ? (
-              // 顯示所有分類，使用 optgroup 分組
-              Object.entries(groupedVideos).map(([category, categoryVideos]) => (
-                <optgroup key={category} label={category}>
+              // 顯示所有事件類型，使用 optgroup 分組（只顯示有實際影片的事件類型）
+              Object.entries(groupedVideos)
+                .filter(([eventType, categoryVideos]) => categoryVideos.length > 0)  // 只顯示有影片的事件類型
+                .map(([eventType, categoryVideos]) => (
+                <optgroup key={eventType} label={eventType}>
                   {categoryVideos.map((video) => (
                     <option key={video.video_id} value={video.video_id}>
                       {video.display_name}
@@ -169,16 +207,10 @@ const VideoSelector = ({
                     >
                       {selectedVideo.display_name}
                     </div>
-                    {/* 如果分類和事件類型相同，只顯示事件類型 */}
+                    {/* 只顯示事件類型，不顯示分類 */}
                     {selectedVideo.event_label && (
                       <div style={{ color: "#999", marginBottom: "4px", wordBreak: "break-word" }}>
                         事件類型：{selectedVideo.event_label}
-                      </div>
-                    )}
-                    {selectedVideo.category && 
-                     selectedVideo.category !== selectedVideo.event_label && (
-                      <div style={{ color: "#999", marginBottom: "4px", wordBreak: "break-word" }}>
-                        分類：{selectedVideo.category}
                       </div>
                     )}
                     {selectedVideo.event_description && (
