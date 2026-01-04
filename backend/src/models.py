@@ -2,7 +2,7 @@
 """
 Database models using SQLAlchemy
 """
-from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean
+from sqlalchemy import Column, Integer, String, Text, DateTime, Float, Boolean, ForeignKey
 from datetime import datetime
 from src.database import Base
 
@@ -58,7 +58,24 @@ class Summary(Base):
     created_at = Column(DateTime, default=datetime.now, index=True)
     updated_at = Column(DateTime, default=datetime.now, onupdate=datetime.now)
 
-# [DEPRECATED] ObjectCrop 表已不再使用，YOLO 結果現在整合到 summaries 表中
-# 完全移除類別定義，避免 SQLAlchemy 嘗試創建表
-# 如果需要向後兼容，可以在需要時動態創建，但現在完全移除
+class ObjectCrop(Base):
+    """ObjectCrop table model - 存儲 YOLO 偵測到的物件切片及其 CLIP embedding（用於以圖搜圖）"""
+    __tablename__ = "object_crops"
+    
+    id = Column(Integer, primary_key=True, index=True, autoincrement=True)
+    summary_id = Column(Integer, ForeignKey("summaries.id"), nullable=False, index=True)  # 關聯到 summaries 表
+    crop_path = Column(String(500), nullable=True)  # 物件切片圖片路徑
+    label = Column(String(50), nullable=True)  # 物件類別（例如 "person", "car"）
+    score = Column(Float, nullable=True)  # 偵測信心分數
+    timestamp = Column(Float, nullable=True)  # 時間戳（秒）
+    frame = Column(Integer, nullable=True)  # 幀號
+    box = Column(Text, nullable=True)  # 邊界框 JSON: [x1, y1, x2, y2]
+    
+    # CLIP embedding（512 維）用於以圖搜圖（找外表相似的物件）
+    clip_embedding = Column(Vector(512), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
+    
+    # ReID embedding（2048 維）用於物件 re-identification（找同一個人/同一輛車）
+    reid_embedding = Column(Vector(2048), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
+    
+    created_at = Column(DateTime, default=datetime.now, index=True)
 

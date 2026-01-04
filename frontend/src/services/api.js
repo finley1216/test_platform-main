@@ -349,6 +349,93 @@ class ApiService {
       apiKey,
     });
   }
+
+  // 以圖搜圖 API
+  async searchImage(formData, apiKey, timeoutMs = 10000) {
+    // 使用 fetch 直接調用以支持超時和進度追蹤
+    // 預設超時時間為 10 秒
+    const url = `${this.baseUrl}/v1/search/image`;
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
+    
+    try {
+      const startTime = Date.now();
+      console.log(`[以圖搜圖] 發送請求到: ${url}`);
+      console.log(`[以圖搜圖] 超時設置: ${timeoutMs / 1000} 秒`);
+      console.log(`[以圖搜圖] 開始時間: ${new Date().toISOString()}`);
+      
+      const response = await fetch(url, {
+        method: "POST",
+        headers: {
+          "X-API-Key": apiKey,
+        },
+        body: formData,
+        signal: controller.signal,
+      });
+      
+      const elapsed = Date.now() - startTime;
+      console.log(`[以圖搜圖] 收到回應，耗時: ${elapsed}ms`);
+      
+      clearTimeout(timeoutId);
+      
+      if (!response.ok) {
+        let errorMessage = `HTTP ${response.status}`;
+        let errorDetail = null;
+        try {
+          const errorData = await response.json();
+          errorMessage = errorData.detail || errorData.error || errorData.message || errorMessage;
+          errorDetail = errorData;
+          console.error("[以圖搜圖] 後端返回錯誤:", errorData);
+        } catch (e) {
+          // 如果無法解析 JSON，嘗試讀取文字
+          try {
+            const text = await response.text();
+            if (text) {
+              errorMessage = text.substring(0, 500);
+              errorDetail = { raw_text: text };
+              console.error("[以圖搜圖] 後端返回錯誤（文字格式):", text);
+            }
+          } catch (e2) {
+            console.error("[以圖搜圖] 無法讀取錯誤回應:", e2);
+          }
+        }
+        
+        // 創建包含詳細信息的錯誤
+        const error = new Error(errorMessage);
+        error.status = response.status;
+        error.detail = errorDetail;
+        throw error;
+      }
+      
+      return await response.json();
+    } catch (error) {
+      clearTimeout(timeoutId);
+      
+      // 處理不同類型的錯誤
+      if (error.name === "AbortError") {
+        throw new Error("請求超時（超過 60 秒）");
+      }
+      
+      // 處理網路錯誤
+      if (error.message && error.message.includes("Failed to fetch")) {
+        const errorMsg = `無法連接到後端服務器。請檢查：
+1. 後端服務是否正在運行（${this.baseUrl}）
+2. 網路連線是否正常
+3. 是否有 CORS 設定問題
+4. API 基礎 URL 是否正確設定`;
+        console.error("[以圖搜圖] 網路錯誤:", errorMsg);
+        throw new Error(errorMsg);
+      }
+      
+      // 如果是我們自己拋出的錯誤，直接傳遞
+      if (error.message) {
+        throw error;
+      }
+      
+      // 其他未知錯誤
+      throw new Error(`搜索失敗: ${error.toString()}`);
+    }
+  }
 }
 
 const apiService = new ApiService();

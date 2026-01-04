@@ -234,17 +234,55 @@ def infer_segment_yolo_optimized(
             print(f"--- [WARNING] 批量 ReID embedding 生成失敗: {e}（不影響 YOLO 處理）---")
             # 不打印完整 traceback，避免日誌過多
     
-    # 組裝最終結果（不包含文件路徑）
+    # 準備輸出目錄（用於保存 crop 圖片）
+    seg_dir = Path(seg_path).parent
+    output_dir = seg_dir / "yolo_output"
+    output_dir.mkdir(exist_ok=True)
+    crops_dir = output_dir / "object_crops"
+    crops_dir.mkdir(exist_ok=True)
+    
+    # 組裝最終結果（包含文件路徑，用於以圖搜圖）
     crop_data = []
+    object_counter = {}
     for i, (crop, metadata, embedding) in enumerate(zip(all_crops, detection_metadata, embeddings_list)):
+        # 生成文件名：類別_時間戳_序號.jpg
+        class_name = metadata["label"]
+        if class_name not in object_counter:
+            object_counter[class_name] = 0
+        object_counter[class_name] += 1
+        
+        timestamp = metadata["timestamp"]
+        timestamp_str = f"{timestamp:.3f}".replace(".", "_")
+        crop_filename = f"{class_name}_{timestamp_str}_{object_counter[class_name]:03d}.jpg"
+        crop_path = crops_dir / crop_filename
+        
+        # 保存物件切片圖片（用於以圖搜圖功能）
+        try:
+            cv2.imwrite(str(crop_path), crop)
+        except Exception as e:
+            print(f"  ⚠️  保存 crop 圖片失敗 ({crop_filename}): {e}")
+            crop_path = None
+        
+        # 生成 CLIP embedding（用於以圖搜圖）
+        clip_embedding = None
+        if crop_path and crop_path.exists():
+            try:
+                from src.main import generate_image_embedding
+                clip_embedding = generate_image_embedding(str(crop_path))
+                if clip_embedding:
+                    print(f"  ✓ 生成 CLIP embedding: {crop_filename} (維度: {len(clip_embedding)})")
+            except Exception as e:
+                print(f"  ⚠️  生成 CLIP embedding 失敗 ({crop_filename}): {e}")
+        
         crop_data.append({
-            "label": metadata["label"],
+            "path": str(crop_path) if crop_path else None,
+            "label": class_name,
             "score": metadata["score"],
-            "timestamp": metadata["timestamp"],
+            "timestamp": timestamp,
             "frame": metadata["frame"],
             "box": metadata["box"],
-            "embedding": embedding,  # ReID embedding（2048 維）
-            # 注意：不再包含 "path" 和 "yolo_crops_dir"
+            "clip_embedding": clip_embedding,  # CLIP embedding（512 維）- 用於以圖搜圖
+            "reid_embedding": embedding,  # ReID embedding（2048 維）- 用於物件 re-identification
         })
     
     print(f"--- [YOLO Optimized] 處理完成: 共處理 {len(yolo_frames)} 幀，偵測到 {len(detections)} 個有物件的時間點，生成 {len(crop_data)} 個物件切片（內存）---")

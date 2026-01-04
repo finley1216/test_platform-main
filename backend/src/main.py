@@ -32,7 +32,7 @@ except ImportError:
     print("--- [WARNING] sentence-transformers not installed, embedding search will not work ---")
 try:
     from src.database import get_db
-    from src.models import Summary
+    from src.models import Summary, ObjectCrop
     HAS_DB = True
 except ImportError:
     HAS_DB = False
@@ -128,7 +128,14 @@ def generate_image_embedding(image_path: str) -> Optional[List[float]]:
         embedding 向量（512 維）或 None
     """
     try:
+        print(f"--- [generate_image_embedding] 開始處理圖片: {image_path} ---")
+        print(f"--- [generate_image_embedding] 檢查文件是否存在: {os.path.exists(image_path) if 'os' in dir() else 'N/A'} ---")
+        
         clip_model, clip_processor = get_clip_model()
+        if clip_model is None:
+            print("--- [generate_image_embedding] ✗ CLIP 模型為 None ---")
+            return None
+        print(f"--- [generate_image_embedding] CLIP 模型已加載 ---")
         import torch
         
         # 讀取圖像
@@ -155,6 +162,37 @@ def generate_image_embedding(image_path: str) -> Optional[List[float]]:
         return embedding.tolist()
     except Exception as e:
         print(f"--- [WARNING] 生成圖像 embedding 失敗 ({image_path}): {e} ---")
+        return None
+
+def generate_text_embedding(text: str) -> Optional[List[float]]:
+    """
+    為文字生成 CLIP embedding（用於文字搜圖）
+    
+    Args:
+        text: 文字描述（例如 "藍色衣服的人"）
+        
+    Returns:
+        embedding 向量（512 維）或 None
+    """
+    try:
+        clip_model, clip_processor = get_clip_model()
+        import torch
+        
+        # 使用 CLIP 處理文字
+        inputs = clip_processor(text=[text], return_tensors="pt", padding=True, truncation=True)
+        device = next(clip_model.parameters()).device
+        inputs = {k: v.to(device) for k, v in inputs.items()}
+        
+        # 生成 embedding
+        with torch.no_grad():
+            text_features = clip_model.get_text_features(**inputs)[0]
+            embedding = text_features.detach().cpu().numpy().astype(np.float32)
+            # L2 正規化
+            embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
+        
+        return embedding.tolist()
+    except Exception as e:
+        print(f"--- [WARNING] 生成文字 embedding 失敗 ({text}): {e} ---")
         return None
 
 # Video library directory (歷史影片分類存放位置)
@@ -809,7 +847,18 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
                             # 保存物件切片圖片
                             cv2.imwrite(str(crop_path), crop)
                             
-                            # 生成 ReID embedding（用於物件 re-identification）
+                            # 生成 CLIP embedding（用於以圖搜圖 - 找外表相似的物件）
+                            clip_embedding = None
+                            try:
+                                clip_embedding = generate_image_embedding(str(crop_path))
+                                if clip_embedding:
+                                    print(f"  ✓ 生成 CLIP embedding: {crop_filename} (維度: {len(clip_embedding)})")
+                                else:
+                                    print(f"  ⚠️  無法生成 CLIP embedding: {crop_filename}")
+                            except Exception as e:
+                                print(f"  ⚠️  生成 CLIP embedding 失敗 ({crop_filename}): {e}")
+                            
+                            # 生成 ReID embedding（用於物件 re-identification - 找同一個人/同一輛車）
                             reid_embedding = None
                             try:
                                 reid_embedding = generate_reid_embedding(str(crop_path))
@@ -827,7 +876,8 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
                                 "timestamp": timestamp,
                                 "frame": frame_count,
                                 "box": [x1, y1, x2, y2],
-                                "embedding": reid_embedding  # 新增：ReID embedding（2048 維）
+                                "clip_embedding": clip_embedding,  # CLIP embedding（512 維）- 用於以圖搜圖
+                                "reid_embedding": reid_embedding  # ReID embedding（2048 維）- 用於物件 re-identification
                             })
         
         if frame_detections:
@@ -1524,7 +1574,7 @@ def _auto_index_to_rag(resp: Dict[str, Any]) -> Dict[str, Any]:
         total = 0
         try:
             from src.database import SessionLocal
-            from src.models import Summary
+            from src.models import Summary, ObjectCrop
             from sqlalchemy import func
             db = SessionLocal()
             try:
@@ -3032,6 +3082,36 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                         else:
                             # 優化版本：不保存文件，設置為 None
                             existing.yolo_crops_dir = None
+                    
+                    # [NEW] 更新 ObjectCrop 記錄：先刪除舊的，再添加新的
+                    try:
+                        # 刪除該 summary 的所有舊 ObjectCrop 記錄
+                        db.query(ObjectCrop).filter(ObjectCrop.summary_id == existing.id).delete()
+                        
+                        # 添加新的 ObjectCrop 記錄
+                        if yolo_result.get("crop_paths"):
+                            crop_paths = yolo_result.get("crop_paths", [])
+                            for crop_data in crop_paths:
+                                if isinstance(crop_data, dict):
+                                    try:
+                                        object_crop = ObjectCrop(
+                                            summary_id=existing.id,
+                                            crop_path=crop_data.get("path"),
+                                            label=crop_data.get("label"),
+                                            score=crop_data.get("score"),
+                                            timestamp=crop_data.get("timestamp"),
+                                            frame=crop_data.get("frame"),
+                                            box=json.dumps(crop_data.get("box", []), ensure_ascii=False) if crop_data.get("box") else None,
+                                            clip_embedding=crop_data.get("clip_embedding"),  # CLIP embedding（512 維）
+                                            reid_embedding=crop_data.get("reid_embedding"),  # ReID embedding（2048 維）
+                                            created_at=datetime.now()
+                                        )
+                                        db.add(object_crop)
+                                    except Exception as e:
+                                        print(f"  ⚠️  更新 ObjectCrop 失敗: {e}")
+                                        continue
+                    except Exception as e:
+                        print(f"  ⚠️  更新 ObjectCrop 記錄時出錯: {e}")
             
             # [NEW] 如果 message 有變更，重新生成 embedding
             if existing.message != summary_text.strip() and summary_text.strip():
@@ -3116,8 +3196,34 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             
             try:
                 db.add(summary)
+                db.flush()  # 獲取 summary.id
                 saved_count += 1
                 inserted_count += 1
+                
+                # [NEW] 保存 ObjectCrop 記錄（如果有的話）
+                if raw_detection and isinstance(raw_detection, dict):
+                    yolo_result = raw_detection.get("yolo")
+                    if yolo_result and yolo_result.get("crop_paths"):
+                        crop_paths = yolo_result.get("crop_paths", [])
+                        for crop_data in crop_paths:
+                            if isinstance(crop_data, dict):
+                                try:
+                                    object_crop = ObjectCrop(
+                                        summary_id=summary.id,
+                                        crop_path=crop_data.get("path"),
+                                        label=crop_data.get("label"),
+                                        score=crop_data.get("score"),
+                                        timestamp=crop_data.get("timestamp"),
+                                        frame=crop_data.get("frame"),
+                                        box=json.dumps(crop_data.get("box", []), ensure_ascii=False) if crop_data.get("box") else None,
+                                        clip_embedding=crop_data.get("clip_embedding"),  # CLIP embedding（512 維）
+                                        reid_embedding=crop_data.get("reid_embedding"),  # ReID embedding（2048 維）
+                                        created_at=datetime.now()
+                                    )
+                                    db.add(object_crop)
+                                except Exception as e:
+                                    print(f"  ⚠️  保存 ObjectCrop 失敗: {e}")
+                                    continue
             except Exception as e:
                 print(f"Warning: Failed to add summary to session: {e}")
                 continue

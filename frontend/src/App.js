@@ -15,6 +15,7 @@ import DetectionSettings from "./components/DetectionSettings";
 import OWLSettings from "./components/OWLSettings";
 import AnalysisResults from "./components/AnalysisResults";
 import RAGSearch from "./components/RAGSearch";
+import ImageSearch from "./components/ImageSearch";
 import EventTagModal from "./components/EventTagModal";
 
 // Services
@@ -419,6 +420,8 @@ function App() {
             onSearch={handleRagSearch}
             onAnswer={handleRagAnswer}
           />
+
+          <ImageSearch apiKey={apiKey} authenticated={authenticated} />
         </div>
       </main>
 

@@ -1055,3 +1055,530 @@ def segment_pipeline_multipart(
 
     return JSONResponse(resp, media_type="application/json; charset=utf-8")
 
+@router.post("/v1/search/image", dependencies=[Depends(get_api_key)])
+def search_by_image(
+    request: Request,
+    api_key: str = Depends(get_api_key),
+    db: Session = Depends(get_db) if HAS_DB else None,
+    file: UploadFile = File(None),  # 上傳的查詢圖片
+    text_query: Optional[str] = Form(None),  # 文字描述（例如 "藍色衣服的人"）
+    top_k: int = Form(10),  # 返回前 K 個最相似的結果
+    threshold: float = Form(0.7),  # 相似度閾值（0.0-1.0，越高越嚴格）
+    label_filter: Optional[str] = Form(None),  # 可選：過濾特定類別（例如 "person"）
+):
+    """
+    以圖搜圖 API：根據上傳的圖片或文字描述，找到外表相似的物件 crops
+    
+    支持兩種查詢方式：
+    1. 圖片上傳：上傳一張圖片，找到相似的物件
+    2. 文字描述：輸入文字描述（例如 "藍色衣服的人"），找到符合描述的物件
+    
+    參數:
+    - file: 上傳的查詢圖片（與 text_query 二選一）
+    - text_query: 文字描述（與 file 二選一）
+    - top_k: 返回前 K 個最相似的結果（預設 10）
+    - threshold: 相似度閾值（0.0-1.0，預設 0.7，越高越嚴格）
+    - label_filter: 可選，過濾特定類別（例如 "person", "car"）
+    
+    返回:
+    - query_type: 查詢類型（"image" 或 "text"）
+    - query_info: 查詢信息
+    - results: 相似物件列表，每個包含：
+      - crop_id: ObjectCrop ID
+      - crop_path: 物件切片圖片路徑
+      - label: 物件類別
+      - score: 偵測信心分數
+      - timestamp: 時間戳
+      - similarity: 相似度分數（0.0-1.0）
+      - summary_id: 關聯的 Summary ID
+      - video: 影片名稱
+      - segment: 片段名稱
+      - time_range: 時間範圍
+    """
+    if not HAS_DB or db is None:
+        raise HTTPException(status_code=503, detail="資料庫未連接，無法執行搜索")
+    
+    try:
+        from src.main import generate_image_embedding, generate_text_embedding
+        from src.models import ObjectCrop, Summary
+        import numpy as np
+        import tempfile
+        
+        print("=" * 80)
+        print("--- [Image Search] 開始處理搜索請求 ---")
+        print(f"--- [Image Search] 參數: top_k={top_k}, threshold={threshold}, label_filter={label_filter} ---")
+        print("=" * 80)
+        
+        import sys
+        sys.stdout.flush()  # 強制刷新輸出
+        
+        # 1. 生成查詢 embedding
+        query_embedding = None
+        query_type = None
+        query_info = {}
+        
+        if file is not None:
+            # 圖片查詢
+            query_type = "image"
+            query_info = {"filename": file.filename}
+            print(f"--- [Image Search] 步驟 1/3: 處理圖片上傳 ({file.filename}) ---")
+            sys.stdout.flush()
+            
+            # 保存上傳的圖片到臨時文件
+            fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
+            try:
+                with os.fdopen(fd, "wb") as f:
+                    file_content = file.file.read()
+                    f.write(file_content)
+                print(f"--- [Image Search] 圖片已保存到臨時文件: {tmp_path}, 大小: {len(file_content)} bytes ---")
+                sys.stdout.flush()
+                
+                print(f"--- [Image Search] 步驟 2/3: 生成圖片 CLIP embedding ---")
+                print(f"--- [Image Search] 臨時文件路徑: {tmp_path} ---")
+                print(f"--- [Image Search] 檢查文件是否存在: {os.path.exists(tmp_path)} ---")
+                if os.path.exists(tmp_path):
+                    file_size = os.path.getsize(tmp_path)
+                    print(f"--- [Image Search] 文件大小: {file_size} bytes ---")
+                sys.stdout.flush()
+                
+                try:
+                    query_embedding = generate_image_embedding(tmp_path)
+                    print(f"--- [Image Search] generate_image_embedding 返回: {type(query_embedding)}, 是否為 None: {query_embedding is None} ---")
+                    if query_embedding is not None:
+                        print(f"--- [Image Search] embedding 長度: {len(query_embedding)} ---")
+                except Exception as emb_error:
+                    print(f"--- [Image Search] ✗ 生成 embedding 時發生異常: {emb_error} ---")
+                    import traceback
+                    traceback.print_exc()
+                    sys.stdout.flush()
+                    raise HTTPException(
+                        status_code=500,
+                        detail=f"生成圖片 embedding 失敗: {str(emb_error)}。請檢查：1) CLIP 模型是否正確加載 2) 圖片格式是否正確 3) 後端日誌中的詳細錯誤信息"
+                    )
+                sys.stdout.flush()
+            finally:
+                try:
+                    os.remove(tmp_path)
+                except:
+                    pass
+            
+            if query_embedding is None:
+                print("--- [Image Search] ✗ 無法生成圖片 embedding ---")
+                sys.stdout.flush()
+                raise HTTPException(status_code=500, detail="無法生成查詢圖片的 embedding")
+            print(f"--- [Image Search] ✓ 圖片 embedding 生成完成 (維度: {len(query_embedding)}) ---")
+            print(f"--- [Image Search] 查詢向量前5個值: {query_embedding[:5] if len(query_embedding) >= 5 else query_embedding} ---")
+            sys.stdout.flush()
+                
+        elif text_query and text_query.strip():
+            # 文字查詢
+            query_type = "text"
+            query_info = {"text": text_query.strip()}
+            print(f"--- [Image Search] 步驟 1/3: 生成文字 CLIP embedding (文字: \"{text_query.strip()}\") ---")
+            query_embedding = generate_text_embedding(text_query.strip())
+            
+            if query_embedding is None:
+                print("--- [Image Search] ✗ 無法生成文字 embedding ---")
+                raise HTTPException(status_code=500, detail="無法生成文字描述的 embedding")
+            print(f"--- [Image Search] ✓ 文字 embedding 生成完成 (維度: {len(query_embedding)}) ---")
+            print(f"--- [Image Search] 查詢向量前5個值: {query_embedding[:5] if len(query_embedding) >= 5 else query_embedding} ---")
+        else:
+            raise HTTPException(status_code=422, detail="需要提供 file（圖片）或 text_query（文字描述）")
+        
+        # 2. 在資料庫中搜索相似的 crops（使用 PostgreSQL 向量搜索）
+        print(f"--- [Image Search] 步驟 3/3: 在資料庫中搜索相似物件 (threshold: {threshold}, top_k: {top_k}) ---")
+        sys.stdout.flush()
+        
+        results_raw = []
+        try:
+            from sqlalchemy import text
+            from src.models import HAS_PGVECTOR
+            print(f"--- [Image Search] HAS_PGVECTOR: {HAS_PGVECTOR} ---")
+            sys.stdout.flush()
+            
+            # 檢查是否有 pgvector 支持
+            if not HAS_PGVECTOR:
+                print("--- [Image Search] ⚠️  pgvector 未安裝，回退到 Python 計算模式 ---")
+                # 回退到舊的 Python 計算方式（這裡可以保留舊代碼作為備用）
+                raise NotImplementedError("pgvector not available, please install pgvector")
+            
+            # 先統計總共有多少條記錄
+            total_count = db.query(ObjectCrop).filter(
+                ObjectCrop.clip_embedding.isnot(None)
+            ).count()
+            print(f"--- [Image Search] 資料庫中共有 {total_count} 筆有 CLIP embedding 的記錄 ---")
+            
+            if total_count == 0:
+                print("--- [Image Search] ⚠️  資料庫中沒有 CLIP embedding 記錄，返回空結果 ---")
+                results_raw = []
+            else:
+                # 將 query_embedding 轉換為 PostgreSQL 向量格式
+                # pgvector 需要格式：'[0.1, 0.2, 0.3, ...]'
+                # 確保所有值都是有效的浮點數
+                try:
+                    query_embedding_clean = [float(x) for x in query_embedding]
+                    if len(query_embedding_clean) != 512:
+                        raise ValueError(f"Invalid embedding dimension: expected 512, got {len(query_embedding_clean)}")
+                    query_embedding_str = '[' + ','.join(map(str, query_embedding_clean)) + ']'
+                except (ValueError, TypeError) as e:
+                    raise HTTPException(status_code=400, detail=f"Invalid query embedding format: {e}")
+                
+                # 構建 SQL 查詢，使用 pgvector 的 <=> 運算符（cosine 距離）
+                # cosine 距離 = 1 - cosine similarity
+                # 所以 similarity = 1 - distance
+                # 我們要 similarity >= threshold，即 1 - distance >= threshold，即 distance <= 1 - threshold
+                cosine_distance_threshold = 1.0 - threshold
+                
+                # 當 threshold = 0 時，cosine_distance_threshold = 1.0，這會查詢所有記錄
+                # 為了性能，我們設置一個合理的上限（例如 0.99，對應 similarity >= 0.01）
+                if threshold == 0:
+                    print("--- [Image Search] ⚠️  threshold = 0，將使用較寬鬆的距離閾值（0.99）以提升性能 ---")
+                    cosine_distance_threshold = 0.99  # 對應 similarity >= 0.01
+                
+                print(f"--- [Image Search] 使用 PostgreSQL 向量搜索（threshold: {threshold:.4f}, cosine 距離閾值: {cosine_distance_threshold:.4f}）---")
+                
+                # 構建 SQL 查詢，使用 pgvector 的 <=> 運算符（cosine 距離）
+                # 注意：直接使用字符串插值來構建向量，因為參數綁定對向量類型支持有限
+                # 但我們會對所有輸入進行驗證，確保安全性
+                
+                # 驗證 query_embedding 格式（應該是數字列表）
+                if not isinstance(query_embedding, list) or len(query_embedding) != 512:
+                    raise ValueError(f"Invalid query_embedding: expected list of 512 floats, got {type(query_embedding)}")
+                
+                # 構建基礎 SQL（使用字符串格式化，因為向量類型需要特殊處理）
+                base_sql = f"""
+                    SELECT 
+                        oc.id,
+                        oc.summary_id,
+                        oc.crop_path,
+                        oc.label,
+                        oc.score,
+                        oc.timestamp,
+                        oc.frame,
+                        oc.box,
+                        oc.clip_embedding,
+                        s.video,
+                        s.segment,
+                        s.time_range,
+                        s.location,
+                        s.camera,
+                        1 - (oc.clip_embedding <=> '{query_embedding_str}'::vector) as similarity
+                    FROM object_crops oc
+                    JOIN summaries s ON oc.summary_id = s.id
+                    WHERE oc.clip_embedding IS NOT NULL
+                """
+                
+                # 添加相似度過濾（當 threshold > 0 時，或 threshold = 0 但我們設置了上限時）
+                # 注意：當 threshold = 0 時，我們已經將 cosine_distance_threshold 設置為 0.99
+                base_sql += f" AND (oc.clip_embedding <=> '{query_embedding_str}'::vector) <= {cosine_distance_threshold}"
+                
+                # 添加類別過濾
+                if label_filter and label_filter.strip():
+                    # 使用參數綁定來防止 SQL 注入
+                    label_filter_escaped = label_filter.strip().replace("'", "''")
+                    base_sql += f" AND oc.label = '{label_filter_escaped}'"
+                    filtered_count = db.query(ObjectCrop).filter(
+                        ObjectCrop.clip_embedding.isnot(None),
+                        ObjectCrop.label == label_filter.strip()
+                    ).count()
+                    print(f"--- [Image Search] 過濾類別 \"{label_filter.strip()}\" 後剩餘 {filtered_count} 筆記錄 ---")
+                
+                # 添加排序和限制
+                sql_query = base_sql + f"""
+                    ORDER BY oc.clip_embedding <=> '{query_embedding_str}'::vector ASC
+                    LIMIT {top_k}
+                """
+                
+                print(f"--- [Image Search] SQL 查詢預覽（前 200 字）: {sql_query[:200]}... ---")
+                
+                # 執行查詢
+                query_start = time.time()
+                print("--- [Image Search] 執行 PostgreSQL 向量搜索... ---")
+                
+                try:
+                    # 執行查詢（不需要參數，因為已經在 SQL 中直接插值）
+                    result = db.execute(text(sql_query))
+                    query_time = time.time() - query_start
+                    
+                    rows = result.fetchall()
+                    print(f"--- [Image Search] ✓ 向量搜索完成（耗時: {query_time:.3f} 秒），找到 {len(rows)} 筆結果 ---")
+                    
+                    # 處理結果
+                    for row in rows:
+                        crop_id, summary_id, crop_path, label, score, timestamp, frame, box, clip_emb, video, segment, time_range, location, camera, similarity = row
+                        
+                        # 創建簡化的對象結構
+                        crop_obj = type('Crop', (), {
+                            'id': crop_id,
+                            'summary_id': summary_id,
+                            'crop_path': crop_path,
+                            'label': label,
+                            'score': score,
+                            'timestamp': timestamp,
+                            'frame': frame,
+                            'box': box,
+                            'clip_embedding': clip_emb,
+                            'similarity': float(similarity)
+                        })()
+                        
+                        summary_obj = type('Summary', (), {
+                            'id': summary_id,
+                            'video': video,
+                            'segment': segment,
+                            'time_range': time_range,
+                            'location': location,
+                            'camera': camera
+                        })()
+                        
+                        results_raw.append((crop_obj, summary_obj))
+                    
+                    print(f"--- [Image Search] ✓ 返回 {len(results_raw)} 筆結果 ---")
+                    
+                except Exception as query_error:
+                    query_time = time.time() - query_start
+                    error_msg = str(query_error)
+                    print(f"--- [Image Search] ✗ 向量搜索失敗 (耗時: {query_time:.3f} 秒): {error_msg} ---")
+                    import traceback
+                    traceback.print_exc()
+                    
+                    # 如果查詢失敗，嘗試回退到 Python 計算模式（僅當資料量不大時）
+                    print("--- [Image Search] 嘗試回退到 Python 計算模式... ---")
+                    try:
+                        # 限制回退模式的資料量（最多 1000 筆）
+                        fallback_query = db.query(
+                            ObjectCrop.id,
+                            ObjectCrop.summary_id,
+                            ObjectCrop.crop_path,
+                            ObjectCrop.label,
+                            ObjectCrop.score,
+                            ObjectCrop.timestamp,
+                            ObjectCrop.frame,
+                            ObjectCrop.box,
+                            ObjectCrop.clip_embedding,
+                            Summary.video,
+                            Summary.segment,
+                            Summary.time_range,
+                            Summary.location,
+                            Summary.camera
+                        ).join(
+                            Summary, ObjectCrop.summary_id == Summary.id
+                        ).filter(
+                            ObjectCrop.clip_embedding.isnot(None)
+                        )
+                        
+                        if label_filter and label_filter.strip():
+                            fallback_query = fallback_query.filter(ObjectCrop.label == label_filter.strip())
+                        
+                        # 限制數量
+                        all_crops_data = fallback_query.limit(1000).all()
+                        
+                        if len(all_crops_data) > 1000:
+                            raise Exception("資料量過大，無法使用回退模式")
+                        
+                        print(f"--- [Image Search] 回退模式：載入 {len(all_crops_data)} 筆記錄，開始計算... ---")
+                        
+                        # 使用 Python 計算相似度
+                        query_embedding_array = np.array(query_embedding, dtype=np.float32)
+                        similarities = []
+                        
+                        for row in all_crops_data:
+                            crop_id, summary_id, crop_path, label, score, timestamp, frame, box, clip_emb, video, segment, time_range, location, camera = row
+                            
+                            if clip_emb:
+                                try:
+                                    # 處理 embedding
+                                    crop_emb_data = clip_emb
+                                    if isinstance(crop_emb_data, str):
+                                        crop_emb_data = json.loads(crop_emb_data)
+                                    
+                                    crop_embedding = np.array(crop_emb_data, dtype=np.float32)
+                                    
+                                    if len(crop_embedding.shape) == 0 or crop_embedding.size == 0:
+                                        continue
+                                    
+                                    # 計算 cosine similarity
+                                    similarity = float(np.dot(query_embedding_array, crop_embedding) / (
+                                        np.linalg.norm(query_embedding_array) * np.linalg.norm(crop_embedding) + 1e-12
+                                    ))
+                                    
+                                    if similarity >= threshold:
+                                        crop_obj = type('Crop', (), {
+                                            'id': crop_id, 'summary_id': summary_id, 'crop_path': crop_path,
+                                            'label': label, 'score': score, 'timestamp': timestamp,
+                                            'frame': frame, 'box': box, 'clip_embedding': clip_emb,
+                                            'similarity': similarity
+                                        })()
+                                        summary_obj = type('Summary', (), {
+                                            'id': summary_id, 'video': video, 'segment': segment,
+                                            'time_range': time_range, 'location': location, 'camera': camera
+                                        })()
+                                        similarities.append((similarity, crop_obj, summary_obj))
+                                except Exception as e:
+                                    continue
+                        
+                        # 排序並返回
+                        similarities.sort(key=lambda x: x[0], reverse=True)
+                        results_raw = [(crop, summary) for _, crop, summary in similarities[:top_k]]
+                        print(f"--- [Image Search] ✓ 回退模式完成，返回 {len(results_raw)} 筆結果 ---")
+                        
+                    except Exception as fallback_error:
+                        print(f"--- [Image Search] ✗ 回退模式也失敗: {fallback_error} ---")
+                        try:
+                            db.rollback()
+                        except:
+                            pass
+                        results_raw = []
+                        raise HTTPException(
+                            status_code=500,
+                            detail=f"向量搜索失敗: {error_msg}。回退模式也失敗: {str(fallback_error)}"
+                        )
+            
+        except Exception as e:
+            # 錯誤處理
+            print(f"--- [Image Search] ✗ 搜索失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+            
+            # 回滾事務（重要！）
+            try:
+                db.rollback()
+                print("--- [Image Search] 已回滾事務 ---")
+            except Exception as rollback_error:
+                print(f"--- [Image Search] 回滾失敗: {rollback_error} ---")
+            
+            # 返回空結果，避免再次錯誤
+            results_raw = []
+        
+        # 3. 獲取第一筆資料的向量（用於調試）
+        first_crop_embedding = None
+        first_crop_info = None
+        try:
+            print("--- [Image Search] 嘗試獲取第一筆資料的向量... ---")
+            first_crop = db.query(ObjectCrop).filter(
+                ObjectCrop.clip_embedding.isnot(None)
+            ).first()
+            if first_crop:
+                print(f"--- [Image Search] 找到第一筆資料: ID={first_crop.id}, label={first_crop.label} ---")
+                first_crop_info = {
+                    "id": first_crop.id,
+                    "label": first_crop.label,
+                    "crop_path": first_crop.crop_path
+                }
+                # 處理 embedding
+                first_emb = first_crop.clip_embedding
+                print(f"--- [Image Search] 第一筆資料 embedding 類型: {type(first_emb)} ---")
+                
+                if isinstance(first_emb, str):
+                    try:
+                        first_emb = json.loads(first_emb)
+                        print("--- [Image Search] 成功解析字符串格式的 embedding ---")
+                    except Exception as e:
+                        print(f"--- [Image Search] 解析字符串 embedding 失敗: {e} ---")
+                        pass
+                
+                if first_emb is not None:
+                    try:
+                        if hasattr(first_emb, 'tolist'):
+                            first_crop_embedding = first_emb.tolist()
+                        elif isinstance(first_emb, list):
+                            first_crop_embedding = first_emb
+                        elif hasattr(first_emb, '__iter__') and not isinstance(first_emb, str):
+                            first_crop_embedding = list(first_emb)
+                        else:
+                            first_crop_embedding = None
+                        
+                        if first_crop_embedding:
+                            print(f"--- [Image Search] 第一筆資料向量維度: {len(first_crop_embedding)} ---")
+                            print(f"--- [Image Search] 第一筆資料向量前5個值: {first_crop_embedding[:5] if len(first_crop_embedding) >= 5 else first_crop_embedding} ---")
+                    except Exception as e:
+                        print(f"--- [Image Search] 轉換 embedding 格式失敗: {e} ---")
+                else:
+                    print("--- [Image Search] 第一筆資料的 embedding 為 None ---")
+            else:
+                print("--- [Image Search] 資料庫中沒有找到有 CLIP embedding 的記錄 ---")
+        except Exception as e:
+            print(f"--- [Image Search] 獲取第一筆資料向量失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
+        
+        # 3. 組裝結果
+        print("--- [Image Search] 組裝搜索結果... ---")
+        results = []
+        for crop, summary in results_raw:
+            # 計算相似度（如果還沒計算）
+            if hasattr(crop, 'similarity'):
+                similarity = crop.similarity
+            else:
+                # 處理 embedding（可能是 list、str 或其他格式）
+                crop_emb = crop.clip_embedding
+                if isinstance(crop_emb, str):
+                    try:
+                        crop_emb = json.loads(crop_emb)
+                    except:
+                        crop_emb = None
+                
+                if crop_emb is None:
+                    similarity = 0.0
+                else:
+                    crop_embedding = np.array(crop_emb, dtype=np.float32)
+                    query_embedding_array = np.array(query_embedding, dtype=np.float32)
+                    similarity = float(np.dot(query_embedding_array, crop_embedding) / (
+                        np.linalg.norm(query_embedding_array) * np.linalg.norm(crop_embedding) + 1e-12
+                    ))
+            
+            results.append({
+                "crop_id": crop.id,
+                "crop_path": crop.crop_path,
+                "label": crop.label,
+                "score": crop.score,
+                "timestamp": crop.timestamp,
+                "frame": crop.frame,
+                "box": json.loads(crop.box) if crop.box else None,
+                "similarity": round(similarity, 4),
+                "summary_id": crop.summary_id,
+                "video": summary.video,
+                "segment": summary.segment,
+                "time_range": summary.time_range,
+                "location": summary.location,
+                "camera": summary.camera,
+            })
+        
+        print(f"--- [Image Search] ✓ 搜索完成，返回 {len(results)} 筆結果 ---")
+        
+        # 準備調試信息
+        debug_info = {
+            "query_embedding": query_embedding,  # 查詢向量（512 維）
+            "query_embedding_dim": len(query_embedding) if query_embedding else 0,
+            "query_embedding_sample": query_embedding[:10] if query_embedding and len(query_embedding) >= 10 else query_embedding,  # 前10個值
+            "first_crop_info": first_crop_info,
+            "first_crop_embedding": first_crop_embedding,  # 第一筆資料的向量
+            "first_crop_embedding_dim": len(first_crop_embedding) if first_crop_embedding else 0,
+            "first_crop_embedding_sample": first_crop_embedding[:10] if first_crop_embedding and len(first_crop_embedding) >= 10 else first_crop_embedding,  # 前10個值
+        }
+        
+        print(f"--- [Image Search] 準備返回結果，包含 {len(results)} 筆結果和調試信息 ---")
+        print(f"--- [Image Search] 調試信息: query_embedding_dim={debug_info['query_embedding_dim']}, first_crop_embedding_dim={debug_info['first_crop_embedding_dim']} ---")
+        
+        response_data = {
+            "query_type": query_type,
+            "query_info": query_info,
+            "top_k": top_k,
+            "threshold": threshold,
+            "label_filter": label_filter,
+            "total_results": len(results),
+            "results": results,
+            "debug": debug_info  # 調試信息
+        }
+        
+        print(f"--- [Image Search] 返回數據結構: {list(response_data.keys())} ---")
+        
+        return response_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"--- [ERROR] 以圖搜圖失敗: {e} ---")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"搜索失敗: {str(e)}")
+
