@@ -3293,27 +3293,8 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.security_door_tamper = bool(events.get("security_door_tamper", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
             
-            # [NEW] 更新動態事件欄位
-            detected_events_en = []
-            detected_events_zh = []
-            events_list = []
-            for event_name, detected in events.items():
-                if event_name != "reason" and detected:
-                    # 查詢 DetectionItem 以獲取中英文名稱
-                    item = db.query(DetectionItem).filter(DetectionItem.name == event_name).first()
-                    if item:
-                        detected_events_en.append(item.name_en)
-                        detected_events_zh.append(item.name_zh)
-                        events_list.append({
-                            "name": event_name,
-                            "name_en": item.name_en,
-                            "name_zh": item.name_zh,
-                            "detected": True
-                        })
-            
-            existing.events_en = ", ".join(detected_events_en) if detected_events_en else None
-            existing.events_zh = ", ".join(detected_events_zh) if detected_events_zh else None
-            existing.events_json = json.dumps(events_list, ensure_ascii=False) if events_list else None
+            # [已移除] events_en, events_zh, events_json 欄位（改用個別布林欄位）
+            # 個別的事件布林欄位已經在上面更新（行 3286-3294）
             
             # [NEW] 更新 YOLO 結果（如果有的話）
             raw_detection = result.get("raw_detection")
@@ -3418,10 +3399,6 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 crowd_loitering=bool(events.get("crowd_loitering", False)),
                 security_door_tamper=bool(events.get("security_door_tamper", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
-                # [NEW] 動態事件欄位
-                events_en=None,  # 稍後填入
-                events_zh=None,  # 稍後填入
-                events_json=None,  # 稍後填入
                 embedding=embedding,  # [NEW] 自動生成的 embedding
                 # [NEW] YOLO 結果（整合到 summaries 表）
                 yolo_detections=None,
@@ -3452,27 +3429,8 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                             # 優化版本：不保存文件，設置為 None
                             summary.yolo_crops_dir = None
             
-            # [NEW] 填入動態事件欄位
-            detected_events_en = []
-            detected_events_zh = []
-            events_list = []
-            for event_name, detected in events.items():
-                if event_name != "reason" and detected:
-                    # 查詢 DetectionItem 以獲取中英文名稱
-                    item = db.query(DetectionItem).filter(DetectionItem.name == event_name).first()
-                    if item:
-                        detected_events_en.append(item.name_en)
-                        detected_events_zh.append(item.name_zh)
-                        events_list.append({
-                            "name": event_name,
-                            "name_en": item.name_en,
-                            "name_zh": item.name_zh,
-                            "detected": True
-                        })
-            
-            summary.events_en = ", ".join(detected_events_en) if detected_events_en else None
-            summary.events_zh = ", ".join(detected_events_zh) if detected_events_zh else None
-            summary.events_json = json.dumps(events_list, ensure_ascii=False) if events_list else None
+            # [已移除] events_en, events_zh, events_json 欄位（改用個別布林欄位）
+            # 個別的事件布林欄位已經在 Summary 建構時設定（行 3412-3420）
             
             try:
                 db.add(summary)

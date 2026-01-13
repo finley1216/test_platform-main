@@ -382,40 +382,93 @@ def segment_pipeline_multipart(
     """
     它不親自做分析，而是負責調度資源與流程控制。影片，切割，片段影片填入標準格式，片段 API 處理，打包成大的 JSON
     """
+    # 記錄總開始時間（包括上傳、下載、切割、處理）
+    t0_total = time.time()
+    
+    print("=" * 100)
+    print(f"[上傳處理開始] {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 100)
+    print(f"[步驟 1/6] 接收請求參數")
+    print(f"  - 模型類型: {model_type}")
+    print(f"  - 片段長度: {segment_duration} 秒")
+    print(f"  - 重疊時間: {overlap} 秒")
+    print(f"  - 來源 IP: {request.client.host if request.client else 'Unknown'}")
+    
+    # 判斷上傳來源
+    if file is not None:
+        print(f"  - 上傳來源: 本地文件")
+        print(f"  - 文件名稱: {file.filename}")
+        print(f"  - Content-Type: {file.content_type}")
+    elif video_id:
+        print(f"  - 上傳來源: 已存在的影片")
+        print(f"  - 影片 ID: {video_id}")
+    elif video_url:
+        print(f"  - 上傳來源: URL")
+        print(f"  - 影片 URL: {video_url}")
+    
     # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
     db = None
     if HAS_DB:
         try:
             db = next(get_db())
+            print(f"  ✓ 資料庫連接成功")
         except Exception as e:
-            print(f"--- [WARNING] 無法獲取資料庫連接: {e} ---")
-    
-    # 記錄總開始時間（包括上傳、下載、切割、處理）
-    t0_total = time.time()
+            print(f"  ✗ 資料庫連接失敗: {e}")
     
     target_filename = "unknown_video"
 
     # 1. 下載與儲存 (維持原樣)
     # 如果提供了 video_id，表示要重新分析已存在的影片，跳過下載和切割
+    print(f"\n[步驟 2/6] 處理視頻文件")
+    
     if video_id and video_id.strip():
         # 使用已存在的影片，不需要下載或切割
+        print(f"  - 使用已存在的影片，跳過上傳")
         local_path = None
         cleanup = False
     elif file is not None:
         # [修正 1] 抓取原始檔名 (例如 "my_video.mp4")
         target_filename = file.filename or "video.mp4"
+        print(f"  - 開始接收上傳文件: {target_filename}")
+        
+        upload_start = time.time()
         fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(file.filename or "video.mp4").suffix)
-        with os.fdopen(fd, "wb") as f: f.write(file.file.read())
+        
+        # 讀取文件並顯示進度
+        file_content = file.file.read()
+        file_size_mb = len(file_content) / 1024 / 1024
+        
+        with os.fdopen(fd, "wb") as f:
+            f.write(file_content)
+        
+        upload_time = time.time() - upload_start
+        print(f"  ✓ 文件上傳完成")
+        print(f"    - 文件大小: {file_size_mb:.2f} MB")
+        print(f"    - 上傳耗時: {upload_time:.2f} 秒")
+        print(f"    - 上傳速度: {file_size_mb / upload_time:.2f} MB/s")
+        print(f"    - 臨時文件: {tmp}")
+        
         local_path, cleanup = tmp, True
     elif video_url:
         # [修正 2] 如果是 URL，從網址抓檔名
         target_filename = Path(video_url).name or "video_url.mp4"
+        print(f"  - 開始下載 URL: {video_url}")
+        
+        download_start = time.time()
         local_path, cleanup = _download_to_temp(video_url), True
+        download_time = time.time() - download_start
+        
+        print(f"  ✓ URL 下載完成")
+        print(f"    - 下載耗時: {download_time:.2f} 秒")
+        print(f"    - 臨時文件: {local_path}")
     else:
+        print(f"  ✗ 錯誤：未提供視頻來源")
         raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
 
     # 2. 切割影片 (如果沒有使用已存在的影片)
     # [修正 3] 使用 "原始檔名" 來當作 ID，而不是用 local_path 的亂碼檔名
+    print(f"\n[步驟 3/6] 切割視頻或載入已有片段")
+    
     if video_id and video_id.strip():
         video_id_clean = video_id.strip()
         
@@ -428,9 +481,21 @@ def segment_pipeline_multipart(
             stem = f"{category}_{video_name}"  # 使用分類和影片名作為 ID
             seg_dir = Path("segment") / stem
             
-            if seg_dir.exists() and list(seg_dir.glob("segment_*.mp4")):
+            # 檢查是否有已存在的片段（支持多種格式）
+            seg_files_check = []
+            found_ext = None
+            if seg_dir.exists():
+                for ext in ['.mp4', '.avi', '.mov', '.mkv', '.flv']:
+                    seg_files_check = list(seg_dir.glob(f"segment_*{ext}"))
+                    if seg_files_check:
+                        found_ext = ext
+                        break
+            
+            if seg_files_check:
                 # 已經處理過，直接使用現有的片段（不從 video 資料夾複製）
-                seg_files = sorted(seg_dir.glob("segment_*.mp4"))
+                print(f"  - 找到已存在的片段文件（格式: {found_ext}）")
+                seg_files = sorted(seg_dir.glob(f"segment_*{found_ext}"))
+                print(f"  - 片段數量: {len(seg_files)}")
                 try:
                     json_files = list(seg_dir.glob("*.json"))
                     if json_files:
@@ -483,8 +548,14 @@ def segment_pipeline_multipart(
             if not seg_dir.exists():
                 raise HTTPException(status_code=404, detail=f"Video {video_id_clean} not found")
             
-            # 查找已存在的片段影片
-            seg_files_existing = sorted(seg_dir.glob("segment_*.mp4"))
+            # 查找已存在的片段影片（支持多種格式）
+            seg_files_existing = []
+            for ext in ['.mp4', '.avi', '.mov', '.mkv', '.flv']:
+                seg_files_existing = sorted(seg_dir.glob(f"segment_*{ext}"))
+                if seg_files_existing:
+                    print(f"  - 找到 {len(seg_files_existing)} 個片段文件（格式: {ext}）")
+                    break
+            
             if not seg_files_existing:
                 raise HTTPException(status_code=404, detail=f"No segment files found for video {video_id_clean}")
             
@@ -505,7 +576,21 @@ def segment_pipeline_multipart(
         # 建立固定的資料夾 segment/video_1/
         seg_dir = Path("segment") / stem
         seg_dir.mkdir(parents=True, exist_ok=True)
+        
+        print(f"  - 影片 ID: {stem}")
+        print(f"  - 輸出目錄: {seg_dir}")
+        print(f"  - 開始切割視頻...")
+        
+        split_start = time.time()
         try:
+            # 先探測視頻時長
+            total_duration = _probe_duration_seconds(local_path)
+            print(f"    - 視頻總時長: {total_duration:.2f} 秒")
+            
+            # 計算預期片段數
+            expected_segments = int((total_duration - overlap) / (segment_duration - overlap)) + 1
+            print(f"    - 預期片段數: {expected_segments}")
+            
             seg_files = _split_one_video(
                 local_path, 
                 seg_dir, 
@@ -515,8 +600,14 @@ def segment_pipeline_multipart(
                 resolution=target_short if strict_segmentation else None,
                 strict_mode=strict_segmentation
             )
-            total_duration = _probe_duration_seconds(local_path)
+            
+            split_time = time.time() - split_start
+            print(f"  ✓ 視頻切割完成")
+            print(f"    - 實際片段數: {len(seg_files)}")
+            print(f"    - 切割耗時: {split_time:.2f} 秒")
+            
         except Exception as e:
+            print(f"  ✗ 視頻切割失敗: {e}")
             if cleanup and os.path.exists(local_path): os.remove(local_path)
             raise HTTPException(status_code=500, detail=f"切割失敗：{e}")
 
@@ -529,13 +620,16 @@ def segment_pipeline_multipart(
     SKIP_VLM = False  # 設為 True 時跳過 VLM 分析，只執行 YOLO
     SKIP_YOLO = False  # 設為 True 時跳過 YOLO 偵測，只執行 VLM
     
-    print(f"--- 開始處理 {len(seg_files)} 個片段，呼叫分析 API ---")
+    print(f"\n[步驟 4/6] 分析視頻片段")
+    print(f"  - 總片段數: {len(seg_files)}")
+    print(f"  - 處理模式: VLM ({model_type}) + YOLO")
+    print(f"  - 並行處理: 4 個片段同時處理")
+    print(f"  - 開始時間: {time.strftime('%H:%M:%S')}")
+    
     if SKIP_VLM:
-        print(f"--- [注意] VLM (Ollama) 已暫時停用，只執行 YOLO 偵測 ---")
+        print(f"  - [注意] VLM (Ollama) 已暫時停用，只執行 YOLO 偵測")
     elif SKIP_YOLO:
-        print(f"--- [測試模式] YOLO 已停用，只執行 VLM (Ollama) 分析 ---")
-    else:
-        print(f"--- 處理模式: VLM ({model_type}) + YOLO (每個片段都會執行，並行處理) ---")
+        print(f"  - [測試模式] YOLO 已停用，只執行 VLM (Ollama) 分析")
 
     def process_segment(seg_path, seg_idx):
         """處理單個片段：VLM 分析 + YOLO 偵測（優化版本：內存處理、批量推理）"""
@@ -545,6 +639,9 @@ def segment_pipeline_multipart(
         start = idx * (segment_duration - overlap)
         end = min(start + segment_duration, total_duration)
         time_range_str = f"{_fmt_hms(start)} - {_fmt_hms(end)}"
+        
+        segment_start_time = time.time()
+        print(f"  → 處理片段 {idx}/{len(seg_files)-1}: {Path(seg_path).name} ({time_range_str})")
         
         # 使用優化版本（內存處理、批量推理、共享解碼）
         try:
@@ -790,6 +887,11 @@ def segment_pipeline_multipart(
                     "raw_detection": {},  # 改為空字典，避免 None 錯誤
                     "error": "process_segment 返回無效結果"
                 }
+            
+            segment_time = time.time() - segment_start_time
+            status = "✓" if vlm_result.get("success") else "✗"
+            print(f"    {status} 片段 {idx} 完成 (耗時: {segment_time:.2f}s)")
+            
             return vlm_result
         except Exception as outer_e:
             # 捕獲所有其他異常（包括 ImportError 和其他錯誤）
@@ -998,6 +1100,7 @@ def segment_pipeline_multipart(
 
     # 使用線程池實現併行處理（增加並行度以加速 VLM 處理）
     # max_workers 設為 4，可以同時處理 4 個片段（VLM + YOLO）
+    print(f"\n  開始並行處理...")
     with ThreadPoolExecutor(max_workers=4) as executor:
         futures = []
         for i, p in enumerate(seg_files):
@@ -1006,25 +1109,39 @@ def segment_pipeline_multipart(
         
         # 收集結果（按順序）
         results_dict = {}
+        completed = 0
         for future, idx in futures:
             try:
                 res = future.result()
                 results_dict[idx] = res
+                completed += 1
+                if completed % 5 == 0:  # 每 5 個片段報告一次進度
+                    print(f"  進度: {completed}/{len(seg_files)} 片段已完成 ({completed*100//len(seg_files)}%)")
             except Exception as e:
-                print(f"--- [ERROR] 片段處理失敗 (index {idx}): {e} ---")
+                print(f"  ✗ 片段 {idx} 處理失敗: {e}")
                 results_dict[idx] = {
                     "success": False,
                     "error": str(e),
                     "time_sec": 0
                 }
+                completed += 1
         
         # 按索引排序
         results = [results_dict[i] for i in sorted(results_dict.keys())]
+        
+        print(f"  ✓ 所有片段處理完成: {completed}/{len(seg_files)}")
 
     # 4. 統計與存檔 (維持原樣)
     process_time = time.time() - t0  # 處理時間（不包括上傳、切割）
     total_time = time.time() - t0_total  # 總時間（包括上傳、切割、處理）
     ok_count = sum(1 for r in results if r.get("success"))
+    fail_count = len(results) - ok_count
+
+    print(f"\n[步驟 5/6] 保存結果")
+    print(f"  - 成功片段: {ok_count}/{len(results)}")
+    print(f"  - 失敗片段: {fail_count}/{len(results)}")
+    print(f"  - 處理時間: {process_time:.2f} 秒")
+    print(f"  - 總時間: {total_time:.2f} 秒")
 
     resp = {
         "model_type": model_type,
@@ -1038,22 +1155,29 @@ def segment_pipeline_multipart(
     try:
         if save_json:
             filename = save_basename or f"{stem}.json"
-
             save_path = seg_dir / filename
+            
+            print(f"  - 保存 JSON 結果: {save_path}")
             with open(save_path, "w", encoding="utf-8") as f:
                 json.dump(resp, f, ensure_ascii=False, indent=2)
             resp["save_path"] = str(save_path)
+            print(f"    ✓ JSON 文件已保存")
 
             if AUTO_RAG_INDEX:
+                print(f"  - 自動索引到 RAG...")
                 resp["rag_auto_indexed"] = _auto_index_to_rag(resp)
-    except Exception: pass
+                print(f"    ✓ RAG 索引完成")
+    except Exception as e:
+        print(f"  ✗ 保存 JSON 失敗: {e}")
 
     # 5. 保存分析結果到 PostgreSQL（與 RAG 同步）
     if HAS_DB and db:
         try:
+            print(f"  - 保存到 PostgreSQL 資料庫...")
             _save_results_to_postgres(db, results, stem)
+            print(f"    ✓ 資料庫保存完成")
         except Exception as e:
-            print(f"--- [WARNING] 保存到 PostgreSQL 失敗: {e} ---")
+            print(f"  ✗ 保存到 PostgreSQL 失敗: {e}")
             # 不中斷流程，只記錄警告
         finally:
             # 關閉 db session
@@ -1063,8 +1187,18 @@ def segment_pipeline_multipart(
                 pass
 
     if cleanup and os.path.exists(local_path):
-        try: os.remove(local_path)
-        except: pass
+        try:
+            os.remove(local_path)
+            print(f"  - 清理臨時文件: {local_path}")
+        except:
+            pass
+
+    print(f"\n[步驟 6/6] 返回結果到前端")
+    print(f"  - 響應大小: ~{len(json.dumps(resp)) / 1024:.2f} KB")
+    print(f"  - 返回時間: {time.strftime('%H:%M:%S')}")
+    print("=" * 100)
+    print(f"[上傳處理完成] 總耗時: {total_time:.2f} 秒")
+    print("=" * 100)
 
     return JSONResponse(resp, media_type="application/json; charset=utf-8")
 

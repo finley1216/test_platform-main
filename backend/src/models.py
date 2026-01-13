@@ -35,10 +35,15 @@ class Summary(Base):
     time_range = Column(String(50), nullable=True)  # Original time range string (e.g., "00:00:00 - 00:00:08")
     duration_sec = Column(Float, nullable=True)  # Segment duration in seconds
     time_sec = Column(Float, nullable=True)  # Processing time in seconds
-    # Event detection fields - 動態事件記錄（對應 DetectionItem 的 name_en 和 name_zh）
-    events_en = Column(Text, nullable=True)  # 偵測到的事件（英文名稱，以逗號分隔，例如 "fire, water_flood"）
-    events_zh = Column(Text, nullable=True)  # 偵測到的事件（中文名稱，以逗號分隔，例如 "火災, 水災"）
-    events_json = Column(Text, nullable=True)  # 偵測到的事件 JSON 格式（詳細資訊，例如 [{"name_en": "fire", "name_zh": "火災", "detected": true}]）
+    # Event detection fields from frame_analysis.events
+    water_flood = Column(Boolean, default=False, nullable=True)  # 水災
+    fire = Column(Boolean, default=False, nullable=True)  # 火災
+    abnormal_attire_face_cover_at_entry = Column(Boolean, default=False, nullable=True)  # 異常著裝/遮臉入場
+    person_fallen_unmoving = Column(Boolean, default=False, nullable=True)  # 人員倒地不起
+    double_parking_lane_block = Column(Boolean, default=False, nullable=True)  # 併排停車/車道阻塞
+    smoking_outside_zone = Column(Boolean, default=False, nullable=True)  # 非管制區吸菸
+    crowd_loitering = Column(Boolean, default=False, nullable=True)  # 聚眾逗留
+    security_door_tamper = Column(Boolean, default=False, nullable=True)  # 突破安全門
     event_reason = Column(Text, nullable=True)  # Event detection reason
     # Vector embedding for semantic search (384 dimensions for paraphrase-multilingual-MiniLM-L12-v2)
     embedding = Column(Vector(384), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
