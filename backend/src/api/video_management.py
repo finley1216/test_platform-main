@@ -59,8 +59,16 @@ def _get_video_lib_categories() -> Dict[str, List[str]]:
 
 # 注意：具體路由必須放在路徑參數路由之前，否則會被攔截
 @router.get("/v1/videos/list", dependencies=[Depends(get_api_key)])
-def list_videos(db: Session = Depends(get_db) if HAS_DB else None):
+def list_videos():
     """獲取已上傳的影片列表（完全從資料庫讀取，確保與資料庫中的 video 欄位一致）"""
+    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
+    db = None
+    if HAS_DB:
+        try:
+            db = next(get_db())
+        except Exception as e:
+            print(f"--- [WARNING] 無法獲取資料庫連接: {e} ---")
+    
     videos = []
     events = _load_video_events()
     

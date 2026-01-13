@@ -17,6 +17,7 @@ import AnalysisResults from "./components/AnalysisResults";
 import RAGSearch from "./components/RAGSearch";
 import ImageSearch from "./components/ImageSearch";
 import EventTagModal from "./components/EventTagModal";
+import DetectionItemsModal from "./components/DetectionItemsModal";
 
 // Services
 import apiService from "./services/api";
@@ -35,6 +36,9 @@ function App() {
 
   // Event Tag Modal state
   const [showEventTagModal, setShowEventTagModal] = useState(false);
+  
+  // Detection Items Modal state
+  const [showDetectionItemsModal, setShowDetectionItemsModal] = useState(false);
 
   // Analysis
   const { isAnalyzing, analysisData, analysisError, runAnalysis } =
@@ -283,6 +287,7 @@ function App() {
         authenticated={authenticated} 
         isAdmin={isAdmin}
         onEventTagClick={() => setShowEventTagModal(true)}
+        onDetectionItemsClick={() => setShowDetectionItemsModal(true)}
       />
 
       <main className="main-container">
@@ -428,6 +433,12 @@ function App() {
       <EventTagModal
         isOpen={showEventTagModal}
         onClose={() => setShowEventTagModal(false)}
+        apiKey={apiKey}
+      />
+
+      <DetectionItemsModal
+        isOpen={showDetectionItemsModal}
+        onClose={() => setShowDetectionItemsModal(false)}
         apiKey={apiKey}
       />
     </div>

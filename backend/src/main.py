@@ -72,6 +72,9 @@ OWL_VIDEO_URL = config.OWL_VIDEO_URL
 # RAG 索引開關（預設啟用）
 AUTO_RAG_INDEX = config.AUTO_RAG_INDEX
 
+# ReID 配置
+ALLOW_REID_FALLBACK_TO_CLIP = config.ALLOW_REID_FALLBACK_TO_CLIP
+
 # Gemini API Key (already configured in config.py)
 GEMINI_API_KEY = config.GEMINI_API_KEY
 
@@ -925,6 +928,10 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
     object_counter = {}
     crop_paths = []  # 記錄所有生成的切片路徑
     
+    # 批量處理：收集所有 crop 圖像用於批量 ReID embedding（全面使用 ReID）
+    reid_crops_batch = []  # 用於批量 ReID 處理的 crop 圖像
+    reid_crops_metadata = []  # 對應的元數據（用於後續映射）
+    
     print(f"--- [YOLO] 開始處理影片: {seg_path} ---")
     print(f"  - FPS: {fps:.2f}")
     print(f"  - 總幀數: {total_frames}")
@@ -988,28 +995,15 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
                             # 保存物件切片圖片
                             cv2.imwrite(str(crop_path), crop)
                             
-                            # 生成 CLIP embedding（用於以圖搜圖 - 找外表相似的物件）
-                            clip_embedding = None
-                            try:
-                                clip_embedding = generate_image_embedding(str(crop_path))
-                                if clip_embedding:
-                                    print(f"  ✓ 生成 CLIP embedding: {crop_filename} (維度: {len(clip_embedding)})")
-                                else:
-                                    print(f"  ⚠️  無法生成 CLIP embedding: {crop_filename}")
-                            except Exception as e:
-                                print(f"  ⚠️  生成 CLIP embedding 失敗 ({crop_filename}): {e}")
+                            # 收集所有 crop 圖像到批量處理列表（全面使用 ReID）
+                            reid_crops_batch.append(crop.copy())  # 複製 crop 圖像
+                            reid_crops_metadata.append({
+                                "index": len(crop_paths),  # 在 crop_paths 中的索引
+                                "filename": crop_filename,
+                                "label": class_name
+                            })
                             
-                            # 生成 ReID embedding（用於物件 re-identification - 找同一個人/同一輛車）
-                            reid_embedding = None
-                            try:
-                                reid_embedding = generate_reid_embedding(str(crop_path))
-                                if reid_embedding:
-                                    print(f"  ✓ 生成 ReID embedding: {crop_filename} (維度: {len(reid_embedding)})")
-                                else:
-                                    print(f"  ⚠️  無法生成 ReID embedding: {crop_filename}")
-                            except Exception as e:
-                                print(f"  ⚠️  生成 ReID embedding 失敗 ({crop_filename}): {e}")
-                            
+                            # 先添加 crop_paths 條目（ReID embedding 稍後批量填充）
                             crop_paths.append({
                                 "path": str(crop_path),
                                 "label": class_name,
@@ -1017,8 +1011,8 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
                                 "timestamp": timestamp,
                                 "frame": frame_count,
                                 "box": [x1, y1, x2, y2],
-                                "clip_embedding": clip_embedding,  # CLIP embedding（512 維）- 用於以圖搜圖
-                                "reid_embedding": reid_embedding  # ReID embedding（2048 維）- 用於物件 re-identification
+                                "clip_embedding": None,  # 不再使用 CLIP（保留字段以兼容舊代碼）
+                                "reid_embedding": None  # ReID embedding（2048 維）- 稍後批量生成
                             })
         
         if frame_detections:
@@ -1035,6 +1029,25 @@ def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: 
         frame_count += 1
     
     cap.release()
+    
+    # 批量生成 ReID embedding（所有物件）
+    if reid_crops_batch:
+        print(f"--- [YOLO] 批量生成 ReID embedding（共 {len(reid_crops_batch)} 個物件 crops）---")
+        try:
+            reid_embeddings = generate_reid_embeddings_batch(reid_crops_batch)
+            # 將批量生成的 ReID embedding 映射回對應的 crop_paths 條目
+            success_count = 0
+            for metadata, embedding in zip(reid_crops_metadata, reid_embeddings):
+                if embedding is not None:
+                    crop_paths[metadata["index"]]["reid_embedding"] = embedding
+                    success_count += 1
+                else:
+                    print(f"  ⚠️  ReID embedding 生成失敗: {metadata['filename']}")
+            print(f"--- [YOLO] ✓ 批量生成完成: {success_count}/{len(reid_crops_batch)} 個 ReID embedding 成功 ---")
+        except Exception as e:
+            print(f"--- [YOLO] ✗ 批量生成 ReID embedding 失敗: {e} ---")
+            import traceback
+            traceback.print_exc()
     
     print(f"--- [YOLO] 處理完成: 共處理 {processed_count} 幀，偵測到 {len(detections)} 個有物件的時間點，生成 {len(crop_paths)} 個物件切片 ---")
     
@@ -3111,6 +3124,81 @@ def _parse_time_range(time_range_str: str) -> Tuple[Optional[datetime], Optional
     return None, None
 
 
+def _create_alert_if_needed(db: Session, summary_id: int, events: Dict[str, Any], video_stem: str, segment: str, location: str = None):
+    """
+    如果偵測到事件，自動創建 Alert 記錄
+    
+    Args:
+        db: 資料庫 session
+        summary_id: Summary 記錄的 ID
+        events: 事件資料 (來自 parsed.frame_analysis.events)
+        video_stem: 影片名稱
+        segment: 片段名稱
+        location: 發生位置（可選）
+    """
+    from src.models import Alert, DetectionItem
+    
+    # 檢查是否有任何事件被偵測到
+    detected_events = []
+    for event_name, detected in events.items():
+        if event_name != "reason" and detected:
+            detected_events.append(event_name)
+    
+    # 如果沒有偵測到任何事件，不創建 Alert
+    if not detected_events:
+        return
+    
+    # 查詢 DetectionItem 以獲取事件的中英文名稱
+    detection_items = db.query(DetectionItem).filter(DetectionItem.name.in_(detected_events)).all()
+    item_dict = {item.name: item for item in detection_items}
+    
+    # 為每個偵測到的事件創建 Alert
+    for event_name in detected_events:
+        item = item_dict.get(event_name)
+        if not item:
+            print(f"  ⚠️  找不到偵測項目: {event_name}")
+            continue
+        
+        # 建立警報標題
+        title = f"偵測到{item.name_zh}"
+        if location:
+            title += f"於{location}"
+        
+        # 建立警報訊息
+        event_reason = events.get("reason", "")
+        message = f"偵測到{item.name_zh}"
+        if event_reason:
+            message += f"，{event_reason}"
+        else:
+            message += "，請立即進行疏散與應處理。"
+        
+        # 創建 Alert 記錄
+        try:
+            alert = Alert(
+                summary_id=summary_id,
+                detection_item_id=item.id,
+                alert_type=event_name,
+                title=title,
+                message=message,
+                location=location,
+                video=video_stem,
+                segment=segment,
+                timestamp=datetime.now(),
+                severity='high' if event_name in ['fire', 'water_flood'] else 'medium',
+                is_read=False,
+                created_at=datetime.now(),
+                updated_at=datetime.now()
+            )
+            db.add(alert)
+            
+            # 更新 DetectionItem 的 alert_count
+            item.alert_count += 1
+            
+            print(f"  ✓ 建立警報：{title}")
+        except Exception as e:
+            print(f"  ⚠️  建立警報失敗 ({event_name}): {e}")
+
+
 def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_stem: str):
     """
     將分析結果保存到 PostgreSQL 資料庫
@@ -3194,7 +3282,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.message = summary_text.strip()
             existing.duration_sec = float(duration_sec) if duration_sec is not None else None
             existing.time_sec = float(time_sec) if time_sec is not None else None
-            # 更新事件檢測欄位
+            # 更新事件檢測欄位（舊欄位，保留以向後兼容）
             existing.water_flood = bool(events.get("water_flood", False))
             existing.fire = bool(events.get("fire", False))
             existing.abnormal_attire_face_cover_at_entry = bool(events.get("abnormal_attire_face_cover_at_entry", False))
@@ -3204,6 +3292,28 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.crowd_loitering = bool(events.get("crowd_loitering", False))
             existing.security_door_tamper = bool(events.get("security_door_tamper", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
+            
+            # [NEW] 更新動態事件欄位
+            detected_events_en = []
+            detected_events_zh = []
+            events_list = []
+            for event_name, detected in events.items():
+                if event_name != "reason" and detected:
+                    # 查詢 DetectionItem 以獲取中英文名稱
+                    item = db.query(DetectionItem).filter(DetectionItem.name == event_name).first()
+                    if item:
+                        detected_events_en.append(item.name_en)
+                        detected_events_zh.append(item.name_zh)
+                        events_list.append({
+                            "name": event_name,
+                            "name_en": item.name_en,
+                            "name_zh": item.name_zh,
+                            "detected": True
+                        })
+            
+            existing.events_en = ", ".join(detected_events_en) if detected_events_en else None
+            existing.events_zh = ", ".join(detected_events_zh) if detected_events_zh else None
+            existing.events_json = json.dumps(events_list, ensure_ascii=False) if events_list else None
             
             # [NEW] 更新 YOLO 結果（如果有的話）
             raw_detection = result.get("raw_detection")
@@ -3269,6 +3379,9 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.updated_at = datetime.now()
             saved_count += 1
             updated_count += 1
+            
+            # [NEW] 如果偵測到事件，創建 Alert 記錄
+            _create_alert_if_needed(db, existing.id, events, video_stem, segment, location=None)
         else:
             # 新增記錄（新的則新增）
             # [NEW] 自動生成 embedding
@@ -3295,7 +3408,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 time_range=time_range if time_range else None,
                 duration_sec=float(duration_sec) if duration_sec is not None else None,
                 time_sec=float(time_sec) if time_sec is not None else None,
-                # 事件檢測欄位
+                # 事件檢測欄位（舊欄位，保留以向後兼容）
                 water_flood=bool(events.get("water_flood", False)),
                 fire=bool(events.get("fire", False)),
                 abnormal_attire_face_cover_at_entry=bool(events.get("abnormal_attire_face_cover_at_entry", False)),
@@ -3305,6 +3418,10 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 crowd_loitering=bool(events.get("crowd_loitering", False)),
                 security_door_tamper=bool(events.get("security_door_tamper", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
+                # [NEW] 動態事件欄位
+                events_en=None,  # 稍後填入
+                events_zh=None,  # 稍後填入
+                events_json=None,  # 稍後填入
                 embedding=embedding,  # [NEW] 自動生成的 embedding
                 # [NEW] YOLO 結果（整合到 summaries 表）
                 yolo_detections=None,
@@ -3335,11 +3452,36 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                             # 優化版本：不保存文件，設置為 None
                             summary.yolo_crops_dir = None
             
+            # [NEW] 填入動態事件欄位
+            detected_events_en = []
+            detected_events_zh = []
+            events_list = []
+            for event_name, detected in events.items():
+                if event_name != "reason" and detected:
+                    # 查詢 DetectionItem 以獲取中英文名稱
+                    item = db.query(DetectionItem).filter(DetectionItem.name == event_name).first()
+                    if item:
+                        detected_events_en.append(item.name_en)
+                        detected_events_zh.append(item.name_zh)
+                        events_list.append({
+                            "name": event_name,
+                            "name_en": item.name_en,
+                            "name_zh": item.name_zh,
+                            "detected": True
+                        })
+            
+            summary.events_en = ", ".join(detected_events_en) if detected_events_en else None
+            summary.events_zh = ", ".join(detected_events_zh) if detected_events_zh else None
+            summary.events_json = json.dumps(events_list, ensure_ascii=False) if events_list else None
+            
             try:
                 db.add(summary)
                 db.flush()  # 獲取 summary.id
                 saved_count += 1
                 inserted_count += 1
+                
+                # [NEW] 如果偵測到事件，創建 Alert 記錄
+                _create_alert_if_needed(db, summary.id, events, video_stem, segment, location=None)
                 
                 # [NEW] 保存 ObjectCrop 記錄（如果有的話）
                 if raw_detection and isinstance(raw_detection, dict):
@@ -3403,49 +3545,146 @@ def get_reid_model():
     if _reid_model is not None:
         return _reid_model, _reid_device
     
+    import torch
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    _reid_device = device
+    
+    errors = []  # 記錄所有嘗試的錯誤
+    
+    # 優先使用 torchreid（FastReID 風格）
     try:
-        import torch
-        device = "cuda" if torch.cuda.is_available() else "cpu"
-        _reid_device = device
+        import torchreid
+        print(f"--- [ReID] 嘗試載入 torchreid 模型 (device: {device}) ---")
+        model = torchreid.models.build_model(
+            name='resnet50',
+            num_classes=751,  # Market-1501 dataset classes
+            loss='softmax',
+            pretrained=True
+        )
+        model = model.to(device).eval()
+        model.classifier = None  # 移除分類層，只保留特徵提取器
         
-        # 優先使用 torchreid（FastReID 風格）
-        try:
-            import torchreid
-            print(f"--- [ReID] 載入 torchreid 模型 (device: {device}) ---")
-            model = torchreid.models.build_model(
-                name='resnet50',
-                num_classes=751,  # Market-1501 dataset classes
-                loss='softmax',
-                pretrained=True
-            )
-            model = model.to(device).eval()
-            model.classifier = None  # 移除分類層，只保留特徵提取器
-            print("✓ torchreid ResNet50 模型載入完成")
-            _reid_model = model
-            return model, device
-        except ImportError:
-            # 備用：使用 timm ResNet50
-            try:
-                import timm
-                print(f"--- [ReID] 載入 timm ResNet50 模型 (device: {device}) ---")
-                model = timm.create_model('resnet50', pretrained=True, num_classes=0)
-                model = model.to(device).eval()
-                print("✓ timm ResNet50 模型載入完成")
-                _reid_model = model
-                return model, device
-            except ImportError:
-                # 最後備用：使用 torchvision ResNet50
-                import torchvision.models as models
-                print(f"--- [ReID] 載入 torchvision ResNet50 模型 (device: {device}) ---")
-                model = models.resnet50(pretrained=True)
-                model.fc = torch.nn.Identity()  # 移除分類層
-                model = model.to(device).eval()
-                print("✓ torchvision ResNet50 模型載入完成")
-                _reid_model = model
-                return model, device
+        # 驗證模型輸出維度
+        test_input = torch.randn(1, 3, 256, 128).to(device)
+        with torch.no_grad():
+            test_output = model(test_input)
+            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
+        
+        if output_dim != 2048:
+            error_msg = f"torchreid 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
+            print(f"--- [ReID] ✗ {error_msg} ---")
+            errors.append(f"torchreid: {error_msg}")
+            raise ValueError(error_msg)
+        
+        print(f"✓ torchreid ResNet50 模型載入完成（輸出維度: {output_dim}）")
+        _reid_model = model
+        return model, device
+    except ImportError as e:
+        error_msg = f"torchreid 未安裝: {e}"
+        print(f"--- [ReID] {error_msg}，嘗試備用方案... ---")
+        errors.append(error_msg)
     except Exception as e:
-        print(f"--- [WARNING] 無法載入 ReID 模型: {e}，將使用 CLIP 作為備用 ---")
-        return None, None
+        error_msg = f"torchreid 載入失敗: {e}"
+        print(f"--- [ReID] ✗ {error_msg}，嘗試備用方案... ---")
+        errors.append(error_msg)
+        import traceback
+        traceback.print_exc()
+    
+    # 備用：使用 timm ResNet50（設置離線模式避免長時間下載）
+    try:
+        import timm
+        import os
+        print(f"--- [ReID] 嘗試載入 timm ResNet50 模型 (device: {device}) ---")
+        
+        # 設置 HuggingFace 為離線模式，避免網絡下載超時
+        os.environ['HF_HUB_OFFLINE'] = '1'
+        
+        try:
+            # 嘗試從本地緩存載入預訓練模型
+            model = timm.create_model('resnet50', pretrained=True, num_classes=0)
+        except Exception as download_err:
+            # 如果本地沒有緩存，使用不預訓練的模型（避免網絡下載）
+            print(f"--- [ReID] 本地無緩存，使用未預訓練的 ResNet50: {download_err} ---")
+            model = timm.create_model('resnet50', pretrained=False, num_classes=0)
+        finally:
+            # 恢復網絡模式
+            os.environ.pop('HF_HUB_OFFLINE', None)
+        
+        model = model.to(device).eval()
+        
+        # 驗證模型輸出維度
+        test_input = torch.randn(1, 3, 256, 128).to(device)
+        with torch.no_grad():
+            test_output = model(test_input)
+            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
+        
+        if output_dim != 2048:
+            error_msg = f"timm 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
+            print(f"--- [ReID] ✗ {error_msg} ---")
+            errors.append(f"timm: {error_msg}")
+            raise ValueError(error_msg)
+        
+        print(f"✓ timm ResNet50 模型載入完成（輸出維度: {output_dim}）")
+        _reid_model = model
+        return model, device
+    except ImportError as e:
+        error_msg = f"timm 未安裝: {e}"
+        print(f"--- [ReID] {error_msg}，嘗試最後備用方案... ---")
+        errors.append(error_msg)
+    except Exception as e:
+        error_msg = f"timm 載入失敗: {e}"
+        print(f"--- [ReID] ✗ {error_msg}，嘗試最後備用方案... ---")
+        errors.append(error_msg)
+        import traceback
+        traceback.print_exc()
+    
+    # 最後備用：使用 torchvision ResNet50（避免網絡下載）
+    try:
+        import torchvision.models as models
+        print(f"--- [ReID] 嘗試載入 torchvision ResNet50 模型 (device: {device}) ---")
+        
+        try:
+            # 嘗試載入預訓練模型（從本地緩存）
+            model = models.resnet50(pretrained=True)
+        except Exception as download_err:
+            # 如果下載失敗，使用未預訓練的模型
+            print(f"--- [ReID] 無法載入預訓練權重，使用未預訓練的 ResNet50: {download_err} ---")
+            model = models.resnet50(pretrained=False)
+        
+        model.fc = torch.nn.Identity()  # 移除分類層
+        model = model.to(device).eval()
+        
+        # 驗證模型輸出維度
+        test_input = torch.randn(1, 3, 256, 128).to(device)
+        with torch.no_grad():
+            test_output = model(test_input)
+            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
+        
+        if output_dim != 2048:
+            error_msg = f"torchvision 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
+            print(f"--- [ReID] ✗ {error_msg} ---")
+            errors.append(f"torchvision: {error_msg}")
+            raise ValueError(error_msg)
+        
+        print(f"✓ torchvision ResNet50 模型載入完成（輸出維度: {output_dim}）")
+        _reid_model = model
+        return model, device
+    except ImportError as e:
+        error_msg = f"torchvision 未安裝: {e}"
+        print(f"--- [ReID] ✗ {error_msg} ---")
+        errors.append(error_msg)
+    except Exception as e:
+        error_msg = f"torchvision 載入失敗: {e}"
+        print(f"--- [ReID] ✗ {error_msg} ---")
+        errors.append(error_msg)
+        import traceback
+        traceback.print_exc()
+    
+    # 所有方案都失敗
+    error_summary = "所有 ReID 模型載入方案都失敗：\n" + "\n".join(f"  - {err}" for err in errors)
+    print(f"--- [ReID] ✗ {error_summary} ---")
+    print("--- [ReID] 請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 或確保 timm/torchvision 已正確安裝 3) 檢查後端日誌以獲取詳細錯誤信息 ---")
+    return None, None
 
 def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=None, reid_device=None) -> List[Optional[List[float]]]:
     """
@@ -3529,21 +3768,42 @@ def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=Non
         traceback.print_exc()
         return [None] * len(crop_images)
 
-def generate_reid_embedding(image_path: str) -> Optional[List[float]]:
+def generate_reid_embedding(image_path: str, allow_fallback: bool = None) -> tuple[Optional[List[float]], str]:
     """
     為圖像生成 ReID embedding（用於物件 re-identification）
     
     Args:
         image_path: 圖像文件路徑
+        allow_fallback: 是否允許回退到 CLIP（None 時使用配置值）
         
     Returns:
-        embedding 向量（2048 維，ResNet50）或 None
+        (embedding 向量, embedding_type): 
+        - embedding: 2048 維（ReID）或 512 維（CLIP），或 None
+        - embedding_type: "reid" 或 "clip" 或 None
+        
+    Raises:
+        RuntimeError: 如果 ReID 模型未載入且不允許回退
     """
+    if allow_fallback is None:
+        allow_fallback = ALLOW_REID_FALLBACK_TO_CLIP
+    
     try:
         reid_model, reid_device = get_reid_model()
         if reid_model is None:
-            # 備用：使用 CLIP
-            return generate_image_embedding(image_path)
+            if allow_fallback:
+                # 允許回退到 CLIP
+                print("--- [WARNING] ReID 模型未載入，回退到 CLIP embedding（512 維）---")
+                print("--- [WARNING] 注意：這會導致搜索結果可能不準確，建議安裝 ReID 模型 ---")
+                clip_embedding = generate_image_embedding(image_path)
+                if clip_embedding is not None:
+                    return clip_embedding, "clip"
+                else:
+                    return None, None
+            else:
+                # 不允許回退，拋出異常
+                error_msg = "ReID 模型未載入。請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 後端日誌中的詳細錯誤信息 3) 或設置環境變數 ALLOW_REID_FALLBACK_TO_CLIP=true 以允許回退到 CLIP"
+                print(f"--- [ERROR] {error_msg} ---")
+                raise RuntimeError(error_msg)
         
         import torch
         import torchvision.transforms as transforms
@@ -3552,7 +3812,7 @@ def generate_reid_embedding(image_path: str) -> Optional[List[float]]:
         # 讀取圖像
         img_bgr = cv2.imread(image_path)
         if img_bgr is None:
-            return None
+            raise ValueError(f"無法讀取圖像: {image_path}")
         
         img_rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
         pil_image = Image.fromarray(img_rgb)
@@ -3573,11 +3833,40 @@ def generate_reid_embedding(image_path: str) -> Optional[List[float]]:
             # L2 正規化
             embedding = embedding / (np.linalg.norm(embedding) + 1e-12)
         
-        return embedding.tolist()
+        # 驗證維度（應該是 2048）
+        if len(embedding) != 2048:
+            error_msg = f"ReID embedding 維度錯誤: 預期 2048 維，實際 {len(embedding)} 維"
+            print(f"--- [ERROR] {error_msg} ---")
+            if allow_fallback:
+                print("--- [WARNING] 回退到 CLIP embedding ---")
+                clip_embedding = generate_image_embedding(image_path)
+                if clip_embedding is not None:
+                    return clip_embedding, "clip"
+            raise ValueError(error_msg)
+        
+        return embedding.tolist(), "reid"
+    except (RuntimeError, ValueError) as e:
+        # 如果允許回退且是 RuntimeError（模型未載入），嘗試回退
+        if allow_fallback and isinstance(e, RuntimeError) and "ReID 模型未載入" in str(e):
+            print("--- [WARNING] ReID 模型未載入，回退到 CLIP embedding ---")
+            clip_embedding = generate_image_embedding(image_path)
+            if clip_embedding is not None:
+                return clip_embedding, "clip"
+        # 否則重新拋出異常
+        raise
     except Exception as e:
-        print(f"--- [WARNING] 生成 ReID embedding 失敗 ({image_path}): {e} ---")
-        # 備用：使用 CLIP
-        return generate_image_embedding(image_path)
+        # 其他異常：如果允許回退，嘗試回退
+        if allow_fallback:
+            print(f"--- [WARNING] 生成 ReID embedding 失敗 ({image_path}): {e}，嘗試回退到 CLIP ---")
+            clip_embedding = generate_image_embedding(image_path)
+            if clip_embedding is not None:
+                return clip_embedding, "clip"
+        # 否則拋出異常
+        error_msg = f"生成 ReID embedding 失敗 ({image_path}): {e}"
+        print(f"--- [ERROR] {error_msg} ---")
+        import traceback
+        traceback.print_exc()
+        raise RuntimeError(error_msg) from e
 
 # [DEPRECATED] _save_object_crops_to_postgres 已不再使用
 # YOLO 結果現在直接整合到 summaries 表中，通過 _save_results_to_postgres 保存
@@ -4085,13 +4374,14 @@ def _merge_and_rank_results(
 
 # ================== 註冊 API 路由 ==================
 # 必須在所有函數定義之後註冊，避免循環導入
-from src.api import health, prompts, video_analysis, rag, video_management
+from src.api import health, prompts, video_analysis, rag, video_management, detection_items
 
 app.include_router(health.router)
 app.include_router(prompts.router)
 app.include_router(video_analysis.router)
 app.include_router(rag.router)
 app.include_router(video_management.router)
+app.include_router(detection_items.router)
 
 if __name__ == "__main__":
     import uvicorn

@@ -350,6 +350,58 @@ class ApiService {
     });
   }
 
+  // 偵測項目管理 API
+  async listDetectionItems(apiKey, enabledOnly = false) {
+    return this.request(`/detection-items?enabled_only=${enabledOnly}`, {
+      method: "GET",
+      apiKey,
+    });
+  }
+
+  async getDetectionItem(itemId, apiKey) {
+    return this.request(`/detection-items/${itemId}`, {
+      method: "GET",
+      apiKey,
+    });
+  }
+
+  async createDetectionItem(itemData, apiKey) {
+    return this.request("/detection-items", {
+      method: "POST",
+      body: itemData,
+      apiKey,
+    });
+  }
+
+  async updateDetectionItem(itemId, itemData, apiKey) {
+    return this.request(`/detection-items/${itemId}`, {
+      method: "PUT",
+      body: itemData,
+      apiKey,
+    });
+  }
+
+  async deleteDetectionItem(itemId, apiKey) {
+    return this.request(`/detection-items/${itemId}`, {
+      method: "DELETE",
+      apiKey,
+    });
+  }
+
+  async regeneratePrompt(apiKey) {
+    return this.request("/detection-items/regenerate-prompt", {
+      method: "POST",
+      apiKey,
+    });
+  }
+
+  async previewPrompt(apiKey) {
+    return this.request("/detection-items/preview-prompt/content", {
+      method: "GET",
+      apiKey,
+    });
+  }
+
   // 以圖搜圖 API
   async searchImage(formData, apiKey, timeoutMs = 60000) {
     // 使用 fetch 直接調用以支持超時和進度追蹤

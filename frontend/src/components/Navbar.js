@@ -1,6 +1,6 @@
 import React from "react";
 
-const Navbar = ({ authenticated, isAdmin, onEventTagClick }) => {
+const Navbar = ({ authenticated, isAdmin, onEventTagClick, onDetectionItemsClick }) => {
   return (
     <nav className="top-nav">
       <div className="nav-container">
@@ -12,6 +12,32 @@ const Navbar = ({ authenticated, isAdmin, onEventTagClick }) => {
           <div className="nav-version">v2.4 (Backend Filter)</div>
         </div>
         <div style={{ display: "flex", alignItems: "center", gap: "16px" }}>
+          {authenticated && (
+            <button
+              onClick={onDetectionItemsClick}
+              style={{
+                padding: "6px 16px",
+                background: "#2a2a3a",
+                border: "1px solid #4a4a5a",
+                borderRadius: "4px",
+                color: "#6bc3ff",
+                fontSize: "13px",
+                cursor: "pointer",
+                fontWeight: "500",
+                transition: "all 0.2s",
+              }}
+              onMouseEnter={(e) => {
+                e.target.style.background = "#3a3a4a";
+                e.target.style.borderColor = "#5a5a6a";
+              }}
+              onMouseLeave={(e) => {
+                e.target.style.background = "#2a2a3a";
+                e.target.style.borderColor = "#4a4a5a";
+              }}
+            >
+              偵測項目管理
+            </button>
+          )}
           {authenticated && isAdmin && (
             <button
               onClick={onEventTagClick}

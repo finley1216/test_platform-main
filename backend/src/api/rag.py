@@ -28,12 +28,19 @@ from src.main import (
 )
 
 @router.post("/rag/index")
-async def rag_index(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+async def rag_index(request: Request):
     """
     將指定的分析結果（JSON）寫入 PostgreSQL
     注意：數據已經通過 _save_results_to_postgres 自動保存，此 API 主要用於兼容性
     """
-    if not HAS_DB or not db:
+    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
+    db = None
+    if HAS_DB:
+        try:
+            db = next(get_db())
+        except Exception as e:
+            raise HTTPException(status_code=503, detail=f"Database not available: {str(e)}")
+    else:
         raise HTTPException(status_code=503, detail="Database not available")
     
     payload = await request.json()
@@ -104,11 +111,19 @@ async def rag_index(request: Request, db: Session = Depends(get_db) if HAS_DB el
     }
 
 @router.get("/rag/stats", dependencies=[Depends(get_api_key)])
-def rag_stats(db: Session = Depends(get_db) if HAS_DB else None):
+def rag_stats():
     """
     計算目前 RAG 資料庫裡有多少筆資料。
     從 PostgreSQL 查詢有 embedding 的記錄數量。
     """
+    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
+    db = None
+    if HAS_DB:
+        try:
+            db = next(get_db())
+        except Exception as e:
+            return {"count": 0, "error": str(e)}
+    
     if not HAS_DB or not db:
         return {
             "count": 0,
@@ -131,12 +146,20 @@ def rag_stats(db: Session = Depends(get_db) if HAS_DB else None):
     }
 
 @router.post("/rag/search")
-async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+async def rag_search(request: Request):
     """
     使用 PostgreSQL + pgvector 進行混合搜索
     - Filter 1 (Hard Filter): 時間範圍、事件類型、關鍵字過濾
     - Filter 2 (Vector Search): 使用 embedding 的 cosine_distance 進行語義搜索
     """
+    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
+    db = None
+    if HAS_DB:
+        try:
+            db = next(get_db())
+        except Exception as e:
+            return {"hits": [], "error": f"Database not available: {str(e)}"}
+    
     try:
         payload = await request.json()
 
@@ -389,11 +412,19 @@ async def rag_search(request: Request, db: Session = Depends(get_db) if HAS_DB e
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
 
 @router.post("/rag/answer")
-async def rag_answer(request: Request, db: Session = Depends(get_db) if HAS_DB else None):
+async def rag_answer(request: Request):
     """
     使用 PostgreSQL + pgvector 進行混合搜索，然後使用 LLM 生成回答
     搜索邏輯與 /rag/search 完全相同
     """
+    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
+    db = None
+    if HAS_DB:
+        try:
+            db = next(get_db())
+        except Exception as e:
+            return {"answer": "資料庫連接失敗", "error": str(e)}
+    
     try:
         payload = await request.json()
         question = (payload.get("query") or "").strip()

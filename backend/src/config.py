@@ -55,6 +55,10 @@ class Config:
         self.RAG_DIR: Path = Path(os.getenv("RAG_DIR", "./rag_store"))
         self.RAG_STORE_DIR: str = os.getenv("RAG_STORE_DIR", "./rag_store")
         self.RAG_INDEX_PATH: Path = self.RAG_DIR / "index.json"
+        
+        # ================== ReID Configuration ==================
+        # 是否允許在 ReID 模型不可用時回退到 CLIP（預設為 false，強制使用 ReID）
+        self.ALLOW_REID_FALLBACK_TO_CLIP: bool = os.getenv("ALLOW_REID_FALLBACK_TO_CLIP", "false").lower() in ("true", "1", "yes")
 
         # ================== File Paths ==================
         self.SEGMENT_DIR: Path = Path(os.getenv("SEGMENT_DIR", "./segment"))

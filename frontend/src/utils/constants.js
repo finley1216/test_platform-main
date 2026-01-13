@@ -2,10 +2,8 @@
 // 優先順序：
 // 1. 環境變數 REACT_APP_API_BASE（最高優先級）
 // 2. localStorage 中的 api_base_url（用戶手動設定）
-// 3. 根據當前訪問的 hostname 自動選擇：
-//    - 如果是 localhost 或 127.0.0.1，使用 localhost:8080（第一和第二綁在一起）
-//    - 如果是 140.117.176.88，使用 140.117.176.88:8080（第三和第四綁在一起）
-//    - 否則使用當前 hostname 的 8080 端口
+// 3. 使用相對路徑 /api（透過 nginx 反向代理）
+//    nginx 會自動將 /api/* 請求轉發到 backend:8080
 const getApiBase = () => {
   console.log(`[API 配置] 開始檢測 API base URL...`);
   console.log(`[API 配置] window.location:`, typeof window !== 'undefined' ? window.location.href : 'N/A');
@@ -30,31 +28,20 @@ const getApiBase = () => {
     console.warn("[API 配置] 無法訪問 localStorage:", e);
   }
   
-  // 3. 根據當前訪問的 hostname 自動選擇
+  // 3. 使用相對路徑 /api（透過 nginx 反向代理）
   if (typeof window === 'undefined' || !window.location) {
-    console.warn("[API 配置] window.location 不可用，使用默認值 localhost:8080");
-    return "http://localhost:8080";
+    console.warn("[API 配置] window.location 不可用，使用默認值 /api");
+    return "/api";
   }
   
-  const hostname = window.location.hostname;
   const protocol = window.location.protocol; // http: 或 https:
+  const host = window.location.host; // hostname:port
   
-  console.log(`[API 配置] 檢測到 hostname: ${hostname}, protocol: ${protocol}`);
+  console.log(`[API 配置] 檢測到 host: ${host}, protocol: ${protocol}`);
   
-  let apiBase;
-  if (hostname === "localhost" || hostname === "127.0.0.1" || hostname === "") {
-    // localhost:3000 -> localhost:8080（第一和第二綁在一起）
-    apiBase = "http://localhost:8080";
-    console.log(`[API 配置] 匹配 localhost，選擇: ${apiBase}`);
-  } else if (hostname === "140.117.176.88") {
-    // 140.117.176.88:3000 -> 140.117.176.88:8080（第三和第四綁在一起）
-    apiBase = "http://140.117.176.88:8080";
-    console.log(`[API 配置] 匹配 140.117.176.88，選擇: ${apiBase}`);
-  } else {
-    // 其他情況：使用當前 hostname 的 8080 端口
-    apiBase = `${protocol}//${hostname}:8080`;
-    console.log(`[API 配置] 其他 hostname，選擇: ${apiBase}`);
-  }
+  // 使用相對路徑 /api，nginx 會自動轉發到後端
+  const apiBase = `${protocol}//${host}/api`;
+  console.log(`[API 配置] 使用 nginx 反向代理路徑: ${apiBase}`);
   
   return apiBase;
 };

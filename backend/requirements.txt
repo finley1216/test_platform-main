@@ -27,7 +27,11 @@ sentence-transformers==2.7.0  # For embedding generation (paraphrase-multilingua
 # ReID (Re-identification) models for object embedding
 # 優先使用 torchreid（FastReID 風格），如果不可用則使用 timm 或 torchvision
 # torchreid  # 可選：如果需要完整的 ReID 功能，請取消註解（可能需要額外配置）
-timm>=0.9.0  # 輕量級替代方案：使用 timm 的 ResNet50
+timm>=0.9.0  # 主要方案：使用 timm 的 ResNet50（輸出 2048 維）
 torch>=2.0.0  # PyTorch（如果尚未安裝）
-torchvision>=0.15.0  # 備用方案：使用 torchvision ResNet50
+torchvision>=0.15.0  # 備用方案：使用 torchvision ResNet50（輸出 2048 維）
+
+# YOLO object detection
+ultralytics>=8.0.0  # YOLO 物件偵測模型（用於影片分析）
+git+https://github.com/ultralytics/CLIP.git  # YOLO-World 需要的 CLIP 模組
 
