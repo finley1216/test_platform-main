@@ -179,12 +179,19 @@ def analyze_segment_result(req: SegmentAnalysisRequest):
                         del defaults["reason"]
                     defaults["reason"] = reason_text
 
-            # 填寫成功結果
-            result["success"] = ("error" not in (frame_obj or {})) and \
-                                (not req.summary_prompt.strip() or len((summary_txt or "").strip()) > 0)
+            # 填寫成功結果（事件偵測失敗才視為失敗；摘要失敗視為警告）
+            summary_required = bool((req.summary_prompt or "").strip())
+            summary_text = (summary_txt or "").strip()
+            if summary_required and not summary_text:
+                result["summary_warning"] = "摘要生成失敗或為空"
+
+            if isinstance(frame_obj, dict) and frame_obj.get("error"):
+                result["error"] = frame_obj.get("error")
+
+            result["success"] = not (isinstance(frame_obj, dict) and frame_obj.get("error"))
             result["parsed"] = {
                 "frame_analysis": frame_norm,
-                "summary_independent": (summary_txt or "").strip()
+                "summary_independent": summary_text
             }
 
         # ==================== OWL 邏輯 ====================

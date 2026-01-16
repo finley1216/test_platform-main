@@ -768,11 +768,13 @@ def infer_segment_qwen(
     ]
 
     # 呼叫 _ollama_chat 取得回應
+    event_error = None
     try:
         event_txt = _ollama_chat(qwen_model, event_msgs, images_b64=images_b64, stream=False)
     except Exception as e:
         # 如果 _ollama_chat 失敗，設置預設值
         event_txt = ""
+        event_error = f"Ollama 事件偵測失敗: {e}"
         print(f"--- [WARNING] _ollama_chat 失敗: {e} ---")
     
     # 確保 event_txt 不是 None
@@ -786,6 +788,10 @@ def infer_segment_qwen(
     if not isinstance(frame_obj, dict):
         # 給個安全的空殼，避免後續 KeyError
         frame_obj = {"events": {"reason": ""}, "persons": []}
+        if event_error is None:
+            event_error = "事件偵測回傳非 JSON"
+    if event_error:
+        frame_obj["error"] = event_error
 
     # ---- (2) 摘要：只回純文字 50~100 字 ----
     summary_txt = ""
