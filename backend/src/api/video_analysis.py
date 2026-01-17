@@ -1531,26 +1531,26 @@ def search_by_image(
                     print("--- [Image Search] 嘗試回退到 Python 計算模式... ---")
                     try:
                         # 限制回退模式的資料量（最多 1000 筆）
-                    fallback_query = db.query(
-                        ObjectCrop.id,
-                        ObjectCrop.summary_id,
-                        ObjectCrop.crop_path,
-                        ObjectCrop.label,
-                        ObjectCrop.score,
-                        ObjectCrop.timestamp,
-                        ObjectCrop.frame,
-                        ObjectCrop.box,
-                        ObjectCrop.reid_embedding,
-                        Summary.video,
-                        Summary.segment,
-                        Summary.time_range,
-                        Summary.location,
-                        Summary.camera
-                    ).join(
-                        Summary, ObjectCrop.summary_id == Summary.id
-                    ).filter(
-                        ObjectCrop.reid_embedding.isnot(None)
-                    )
+                        fallback_query = db.query(
+                            ObjectCrop.id,
+                            ObjectCrop.summary_id,
+                            ObjectCrop.crop_path,
+                            ObjectCrop.label,
+                            ObjectCrop.score,
+                            ObjectCrop.timestamp,
+                            ObjectCrop.frame,
+                            ObjectCrop.box,
+                            ObjectCrop.reid_embedding,
+                            Summary.video,
+                            Summary.segment,
+                            Summary.time_range,
+                            Summary.location,
+                            Summary.camera
+                        ).join(
+                            Summary, ObjectCrop.summary_id == Summary.id
+                        ).filter(
+                            ObjectCrop.reid_embedding.isnot(None)
+                        )
                         
                         if label_filter and label_filter.strip():
                             fallback_query = fallback_query.filter(ObjectCrop.label == label_filter.strip())
