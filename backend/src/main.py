@@ -3732,42 +3732,27 @@ def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=Non
         traceback.print_exc()
         return [None] * len(crop_images)
 
-def generate_reid_embedding(image_path: str, allow_fallback: bool = None) -> tuple[Optional[List[float]], str]:
+def generate_reid_embedding(image_path: str) -> tuple[Optional[List[float]], str]:
     """
     為圖像生成 ReID embedding（用於物件 re-identification）
     
     Args:
         image_path: 圖像文件路徑
-        allow_fallback: 是否允許回退到 CLIP（None 時使用配置值）
         
     Returns:
         (embedding 向量, embedding_type): 
-        - embedding: 2048 維（ReID）或 512 維（CLIP），或 None
-        - embedding_type: "reid" 或 "clip" 或 None
+        - embedding: 2048 維（ReID）或 None
+        - embedding_type: "reid" 或 None
         
     Raises:
-        RuntimeError: 如果 ReID 模型未載入且不允許回退
+        RuntimeError: 如果 ReID 模型未載入
     """
-    if allow_fallback is None:
-        allow_fallback = ALLOW_REID_FALLBACK_TO_CLIP
-    
     try:
         reid_model, reid_device = get_reid_model()
         if reid_model is None:
-            if allow_fallback:
-                # 允許回退到 CLIP
-                print("--- [WARNING] ReID 模型未載入，回退到 CLIP embedding（512 維）---")
-                print("--- [WARNING] 注意：這會導致搜索結果可能不準確，建議安裝 ReID 模型 ---")
-                clip_embedding = generate_image_embedding(image_path)
-                if clip_embedding is not None:
-                    return clip_embedding, "clip"
-                else:
-                    return None, None
-            else:
-                # 不允許回退，拋出異常
-                error_msg = "ReID 模型未載入。請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 後端日誌中的詳細錯誤信息 3) 或設置環境變數 ALLOW_REID_FALLBACK_TO_CLIP=true 以允許回退到 CLIP"
-                print(f"--- [ERROR] {error_msg} ---")
-                raise RuntimeError(error_msg)
+            error_msg = "ReID 模型未載入。請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 後端日誌中的詳細錯誤信息"
+            print(f"--- [ERROR] {error_msg} ---")
+            raise RuntimeError(error_msg)
         
         import torch
         import torchvision.transforms as transforms
@@ -3801,31 +3786,13 @@ def generate_reid_embedding(image_path: str, allow_fallback: bool = None) -> tup
         if len(embedding) != 2048:
             error_msg = f"ReID embedding 維度錯誤: 預期 2048 維，實際 {len(embedding)} 維"
             print(f"--- [ERROR] {error_msg} ---")
-            if allow_fallback:
-                print("--- [WARNING] 回退到 CLIP embedding ---")
-                clip_embedding = generate_image_embedding(image_path)
-                if clip_embedding is not None:
-                    return clip_embedding, "clip"
             raise ValueError(error_msg)
         
         return embedding.tolist(), "reid"
     except (RuntimeError, ValueError) as e:
-        # 如果允許回退且是 RuntimeError（模型未載入），嘗試回退
-        if allow_fallback and isinstance(e, RuntimeError) and "ReID 模型未載入" in str(e):
-            print("--- [WARNING] ReID 模型未載入，回退到 CLIP embedding ---")
-            clip_embedding = generate_image_embedding(image_path)
-            if clip_embedding is not None:
-                return clip_embedding, "clip"
         # 否則重新拋出異常
         raise
     except Exception as e:
-        # 其他異常：如果允許回退，嘗試回退
-        if allow_fallback:
-            print(f"--- [WARNING] 生成 ReID embedding 失敗 ({image_path}): {e}，嘗試回退到 CLIP ---")
-            clip_embedding = generate_image_embedding(image_path)
-            if clip_embedding is not None:
-                return clip_embedding, "clip"
-        # 否則拋出異常
         error_msg = f"生成 ReID embedding 失敗 ({image_path}): {e}"
         print(f"--- [ERROR] {error_msg} ---")
         import traceback

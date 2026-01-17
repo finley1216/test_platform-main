@@ -3,10 +3,8 @@ import ImageSearchResults from "./ImageSearchResults";
 import apiService from "../services/api";
 
 const ImageSearch = ({ apiKey, authenticated }) => {
-  const [queryType, setQueryType] = useState("image"); // "image" 或 "text"
   const [imageFile, setImageFile] = useState(null);
   const [imagePreview, setImagePreview] = useState(null);
-  const [textQuery, setTextQuery] = useState("");
   const [topK, setTopK] = useState(10);
   const [threshold, setThreshold] = useState(0.7);
   const [labelFilter, setLabelFilter] = useState("");
@@ -34,13 +32,8 @@ const ImageSearch = ({ apiKey, authenticated }) => {
       return;
     }
 
-    if (queryType === "image" && !imageFile) {
+    if (!imageFile) {
       setSearchError("請選擇查詢圖片");
-      return;
-    }
-
-    if (queryType === "text" && !textQuery.trim()) {
-      setSearchError("請輸入文字描述");
       return;
     }
 
@@ -60,13 +53,8 @@ const ImageSearch = ({ apiKey, authenticated }) => {
     try {
       const formData = new FormData();
       
-      if (queryType === "image") {
-        setSearchProgress("上傳圖片中...");
-        formData.append("file", imageFile);
-      } else {
-        setSearchProgress("處理文字描述...");
-        formData.append("text_query", textQuery.trim());
-      }
+      setSearchProgress("上傳圖片中...");
+      formData.append("file", imageFile);
       
       formData.append("top_k", topK);
       formData.append("threshold", threshold);
@@ -237,7 +225,6 @@ const ImageSearch = ({ apiKey, authenticated }) => {
   const handleClear = () => {
     setImageFile(null);
     setImagePreview(null);
-    setTextQuery("");
     setSearchData(null);
     setSearchError(null);
   };
@@ -252,81 +239,32 @@ const ImageSearch = ({ apiKey, authenticated }) => {
       </div>
 
       <div className="form-grid" style={{ gap: "16px", marginBottom: "16px" }}>
-        {/* 查詢類型選擇 */}
-        <div className="form-group" style={{ margin: 0 }}>
-          <label className="form-label" style={{ marginTop: 0 }}>查詢方式</label>
-          <div style={{ display: "flex", gap: "12px" }}>
-            <label style={{ display: "flex", alignItems: "center", cursor: "pointer" }}>
-              <input
-                type="radio"
-                value="image"
-                checked={queryType === "image"}
-                onChange={(e) => {
-                  setQueryType(e.target.value);
-                  handleClear();
-                }}
-                style={{ marginRight: "6px" }}
-              />
-              圖片上傳
-            </label>
-            <label style={{ display: "flex", alignItems: "center", cursor: "pointer" }}>
-              <input
-                type="radio"
-                value="text"
-                checked={queryType === "text"}
-                onChange={(e) => {
-                  setQueryType(e.target.value);
-                  handleClear();
-                }}
-                style={{ marginRight: "6px" }}
-              />
-              文字描述
-            </label>
-          </div>
-        </div>
-
         {/* 圖片上傳 */}
-        {queryType === "image" && (
-          <div className="form-group" style={{ margin: 0 }}>
-            <label className="form-label" style={{ marginTop: 0 }}>查詢圖片</label>
-            <input
-              type="file"
-              accept="image/*"
-              onChange={handleImageChange}
-              className="form-input"
-              style={{ padding: "8px" }}
-            />
-            {imagePreview && (
-              <div style={{ marginTop: "12px", textAlign: "center" }}>
-                <img
-                  src={imagePreview}
-                  alt="預覽"
-                  style={{
-                    maxWidth: "300px",
-                    maxHeight: "200px",
-                    border: "1px solid var(--gray-300)",
-                    borderRadius: "8px",
-                    objectFit: "contain",
-                  }}
-                />
-              </div>
-            )}
-          </div>
-        )}
-
-        {/* 文字描述 */}
-        {queryType === "text" && (
-          <div className="form-group" style={{ margin: 0 }}>
-            <label className="form-label" style={{ marginTop: 0 }}>文字描述</label>
-            <input
-              className="form-input"
-              placeholder='例如："藍色衣服的人"、"紅色汽車"'
-              value={textQuery}
-              onChange={(e) => setTextQuery(e.target.value)}
-              onKeyPress={(e) => e.key === "Enter" && handleSearch()}
-            />
-          </div>
-        )}
+        <div className="form-group" style={{ margin: 0 }}>
+          <label className="form-label" style={{ marginTop: 0 }}>查詢圖片</label>
+          <input
+            type="file"
+            accept="image/*"
+            onChange={handleImageChange}
+            className="form-input"
+            style={{ padding: "8px" }}
+          />
+          {imagePreview && (
+            <div style={{ marginTop: "12px", textAlign: "center" }}>
+              <img
+                src={imagePreview}
+                alt="預覽"
+                style={{
+                  maxWidth: "300px",
+                  maxHeight: "200px",
+                  border: "1px solid var(--gray-300)",
+                  borderRadius: "8px",
+                  objectFit: "contain",
+                }}
+              />
+            </div>
+          )}
+        </div>
       </div>
 
       {/* 搜索參數 */}

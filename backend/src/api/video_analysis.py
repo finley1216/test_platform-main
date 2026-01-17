@@ -1214,27 +1214,21 @@ def search_by_image(
     request: Request,
     api_key: str = Depends(get_api_key),
     file: UploadFile = File(None),  # 上傳的查詢圖片
-    text_query: Optional[str] = Form(None),  # 文字描述（例如 "藍色衣服的人"）
     top_k: int = Form(10),  # 返回前 K 個最相似的結果
     threshold: float = Form(0.7),  # 相似度閾值（0.0-1.0，越高越嚴格）
     label_filter: Optional[str] = Form(None),  # 可選：過濾特定類別（例如 "person"）
 ):
     """
-    以圖搜圖 API：根據上傳的圖片或文字描述，找到外表相似的物件 crops
-    
-    支持兩種查詢方式：
-    1. 圖片上傳：上傳一張圖片，找到相似的物件
-    2. 文字描述：輸入文字描述（例如 "藍色衣服的人"），找到符合描述的物件
+    以圖搜圖 API：根據上傳的圖片，找到外表相似的物件 crops（僅 ReID 2048 維）
     
     參數:
-    - file: 上傳的查詢圖片（與 text_query 二選一）
-    - text_query: 文字描述（與 file 二選一）
+    - file: 上傳的查詢圖片
     - top_k: 返回前 K 個最相似的結果（預設 10）
     - threshold: 相似度閾值（0.0-1.0，預設 0.7，越高越嚴格）
     - label_filter: 可選，過濾特定類別（例如 "person", "car"）
     
     返回:
-    - query_type: 查詢類型（"image" 或 "text"）
+    - query_type: 查詢類型（"image"）
     - query_info: 查詢信息
     - results: 相似物件列表，每個包含：
       - crop_id: ObjectCrop ID
@@ -1259,7 +1253,6 @@ def search_by_image(
         raise HTTPException(status_code=503, detail="資料庫未連接，無法執行搜索")
     
     try:
-        from src.main import generate_image_embedding, generate_text_embedding
         from src.models import ObjectCrop, Summary
         import numpy as np
         import tempfile
@@ -1277,8 +1270,6 @@ def search_by_image(
         query_type = None
         query_info = {}
         embedding_type = None  # 實際使用的 embedding 類型（"reid" 或 "clip"）
-        uploaded_file_content = None  # 保存上傳的文件內容，以便後續可能需要重新生成 CLIP embedding
-        
         if file is not None:
             # 圖片查詢
             query_type = "image"
@@ -1291,7 +1282,6 @@ def search_by_image(
             try:
                 with os.fdopen(fd, "wb") as f:
                     file_content = file.file.read()
-                    uploaded_file_content = file_content  # 保存文件內容以便後續使用
                     f.write(file_content)
                 print(f"--- [Image Search] 圖片已保存到臨時文件: {tmp_path}, 大小: {len(file_content)} bytes ---")
                 sys.stdout.flush()
@@ -1320,10 +1310,12 @@ def search_by_image(
                                 status_code=500,
                                 detail=error_msg
                             )
-                        # 如果使用了 CLIP 回退，記錄警告
+                        # 嚴格只允許 ReID（2048 維）
                         if embedding_type == "clip":
-                            print("--- [Image Search] ⚠️  警告：使用了 CLIP embedding（512 維）而非 ReID（2048 維），搜索結果可能不準確 ---")
-                            print("--- [Image Search] ⚠️  建議：安裝 ReID 模型以獲得更好的搜索效果 ---")
+                            raise HTTPException(
+                                status_code=500,
+                                detail="目前只允許使用 ReID 2048 維 embedding，偵測到 CLIP 512 維回退。請檢查 ReID 模型是否正確載入。"
+                            )
                 except HTTPException:
                     # 重新拋出 HTTPException
                     raise
@@ -1360,28 +1352,13 @@ def search_by_image(
                 except Exception as e:
                     error_detail = f"無法生成查詢圖片的 ReID embedding。ReID 模型載入檢查失敗: {str(e)}。請檢查後端日誌以獲取詳細錯誤信息。"
                 raise HTTPException(status_code=500, detail=error_detail)
-            # 使用實際的 embedding 類型來顯示訊息
-            embedding_type_display = embedding_type.upper() if embedding_type else "UNKNOWN"
-            print(f"--- [Image Search] ✓ 圖片 {embedding_type_display} embedding 生成完成 (維度: {len(query_embedding)}) ---")
+            # 僅允許 ReID
+            print(f"--- [Image Search] ✓ 圖片 REID embedding 生成完成 (維度: {len(query_embedding)}) ---")
             print(f"--- [Image Search] 查詢向量前5個值: {query_embedding[:5] if len(query_embedding) >= 5 else query_embedding} ---")
             sys.stdout.flush()
                 
-        elif text_query and text_query.strip():
-            # 文字查詢（ReID 不支持文字，使用 CLIP）
-            query_type = "text"
-            embedding_type = "clip"  # 文字查詢固定使用 CLIP
-            query_info = {"text": text_query.strip()}
-            print(f"--- [Image Search] 步驟 1/3: 生成文字 CLIP embedding (文字: \"{text_query.strip()}\") ---")
-            print(f"--- [Image Search] 注意：文字查詢使用 CLIP（ReID 不支持文字輸入）---")
-            query_embedding = generate_text_embedding(text_query.strip())
-            
-            if query_embedding is None:
-                print("--- [Image Search] ✗ 無法生成文字 embedding ---")
-                raise HTTPException(status_code=500, detail="無法生成文字描述的 embedding")
-            print(f"--- [Image Search] ✓ 文字 embedding 生成完成 (維度: {len(query_embedding)}) ---")
-            print(f"--- [Image Search] 查詢向量前5個值: {query_embedding[:5] if len(query_embedding) >= 5 else query_embedding} ---")
         else:
-            raise HTTPException(status_code=422, detail="需要提供 file（圖片）或 text_query（文字描述）")
+            raise HTTPException(status_code=422, detail="需要提供 file（圖片）")
         
         # 2. 在資料庫中搜索相似的 crops（使用 PostgreSQL 向量搜索）
         print(f"--- [Image Search] 步驟 3/3: 在資料庫中搜索相似物件 (threshold: {threshold}, top_k: {top_k}) ---")
@@ -1400,76 +1377,24 @@ def search_by_image(
                 # 回退到舊的 Python 計算方式（這裡可以保留舊代碼作為備用）
                 raise NotImplementedError("pgvector not available, please install pgvector")
             
-            # 判斷使用哪種 embedding
-            # 如果圖片查詢返回的是 CLIP（回退情況），使用 CLIP
-            if query_type == "image":
-                # 檢查實際使用的 embedding 類型（可能因為回退而使用 CLIP）
-                use_reid = embedding_type == "reid"
-                embedding_column = "reid_embedding" if use_reid else "clip_embedding"
-                expected_dim = 2048 if use_reid else 512
-            else:
-                # 文字查詢使用 CLIP
-                use_reid = False
-                embedding_column = "clip_embedding"
-                expected_dim = 512
+            # 僅使用 ReID 2048 維向量
+            use_reid = True
+            embedding_column = "reid_embedding"
+            expected_dim = 2048
             
             # 檢查資料庫中是否有對應的 embedding
             reid_count = db.query(ObjectCrop).filter(
                 ObjectCrop.reid_embedding.isnot(None)
             ).count()
-            clip_count = db.query(ObjectCrop).filter(
-                ObjectCrop.clip_embedding.isnot(None)
-            ).count()
             
-            print(f"--- [Image Search] 資料庫統計: ReID embedding={reid_count} 筆, CLIP embedding={clip_count} 筆 ---")
+            print(f"--- [Image Search] 資料庫統計: ReID embedding={reid_count} 筆 ---")
             
-            # 如果查詢使用 ReID 但資料庫中沒有 ReID embedding，自動回退到 CLIP
-            if use_reid and reid_count == 0 and clip_count > 0:
-                print("--- [Image Search] ⚠️  警告：查詢使用 ReID（2048 維），但資料庫中沒有 ReID embedding ---")
-                print(f"--- [Image Search] ⚠️  自動回退到 CLIP embedding（資料庫中有 {clip_count} 筆 CLIP embedding）---")
-                print("--- [Image Search] ⚠️  注意：查詢向量是 2048 維（ReID），但資料庫中是 512 維（CLIP），無法直接比較 ---")
-                print("--- [Image Search] ⚠️  建議：重新生成查詢圖片的 CLIP embedding 以匹配資料庫 ---")
-                
-                # 重新生成查詢圖片的 CLIP embedding
-                if uploaded_file_content is not None:
-                    fd, tmp_path = tempfile.mkstemp(suffix=".jpg")
-                    try:
-                        with os.fdopen(fd, "wb") as f:
-                            f.write(uploaded_file_content)
-                        
-                        from src.main import generate_image_embedding
-                        query_embedding = generate_image_embedding(tmp_path)
-                        embedding_type = "clip"
-                        if query_embedding is None:
-                            raise HTTPException(status_code=500, detail="無法生成 CLIP embedding")
-                        print(f"--- [Image Search] ✓ 已重新生成 CLIP embedding（維度: {len(query_embedding)}）---")
-                    finally:
-                        try:
-                            os.remove(tmp_path)
-                        except:
-                            pass
-                else:
-                    raise HTTPException(
-                        status_code=500, 
-                        detail="無法回退到 CLIP：缺少上傳的圖片文件。請重新上傳圖片。"
-                    )
-                
-                # 更新為使用 CLIP
-                use_reid = False
-                embedding_column = "clip_embedding"
-                expected_dim = 512
-            
-            print(f"--- [Image Search] 使用 {embedding_column} 搜索（{'ReID' if use_reid else 'CLIP'}，{expected_dim} 維）---")
+            print(f"--- [Image Search] 使用 {embedding_column} 搜索（ReID，{expected_dim} 維）---")
             
             # 統計要使用的 embedding 記錄數
-            if use_reid:
-                total_count = reid_count
-            else:
-                total_count = clip_count
-            
+            total_count = reid_count
             if total_count == 0:
-                embedding_type_name = "ReID" if use_reid else "CLIP"
-                print(f"--- [Image Search] ⚠️  資料庫中沒有 {embedding_type_name} embedding 記錄，返回空結果 ---")
+                print("--- [Image Search] ⚠️  資料庫中沒有 ReID embedding 記錄，返回空結果 ---")
                 results_raw = []
             else:
                 # 將 query_embedding 轉換為 PostgreSQL 向量格式
@@ -1538,16 +1463,10 @@ def search_by_image(
                     # 使用參數綁定來防止 SQL 注入
                     label_filter_escaped = label_filter.strip().replace("'", "''")
                     base_sql += f" AND oc.label = '{label_filter_escaped}'"
-                    if use_reid:
-                        filtered_count = db.query(ObjectCrop).filter(
-                            ObjectCrop.reid_embedding.isnot(None),
-                            ObjectCrop.label == label_filter.strip()
-                        ).count()
-                    else:
-                        filtered_count = db.query(ObjectCrop).filter(
-                            ObjectCrop.clip_embedding.isnot(None),
-                            ObjectCrop.label == label_filter.strip()
-                        ).count()
+                    filtered_count = db.query(ObjectCrop).filter(
+                        ObjectCrop.reid_embedding.isnot(None),
+                        ObjectCrop.label == label_filter.strip()
+                    ).count()
                     print(f"--- [Image Search] 過濾類別 \"{label_filter.strip()}\" 後剩餘 {filtered_count} 筆記錄 ---")
                 
                 # 添加排序和限制
@@ -1584,8 +1503,7 @@ def search_by_image(
                             'timestamp': timestamp,
                             'frame': frame,
                             'box': box,
-                            'clip_embedding': None,  # 不再使用（全面使用 ReID）
-                            'reid_embedding': emb if use_reid else None,
+                            'reid_embedding': emb,
                             'similarity': float(similarity)
                         })()
                         
@@ -1613,48 +1531,26 @@ def search_by_image(
                     print("--- [Image Search] 嘗試回退到 Python 計算模式... ---")
                     try:
                         # 限制回退模式的資料量（最多 1000 筆）
-                        if use_reid:
-                            fallback_query = db.query(
-                                ObjectCrop.id,
-                                ObjectCrop.summary_id,
-                                ObjectCrop.crop_path,
-                                ObjectCrop.label,
-                                ObjectCrop.score,
-                                ObjectCrop.timestamp,
-                                ObjectCrop.frame,
-                                ObjectCrop.box,
-                                ObjectCrop.reid_embedding,
-                                Summary.video,
-                                Summary.segment,
-                                Summary.time_range,
-                                Summary.location,
-                                Summary.camera
-                            ).join(
-                                Summary, ObjectCrop.summary_id == Summary.id
-                            ).filter(
-                                ObjectCrop.reid_embedding.isnot(None)
-                            )
-                        else:
-                            fallback_query = db.query(
-                                ObjectCrop.id,
-                                ObjectCrop.summary_id,
-                                ObjectCrop.crop_path,
-                                ObjectCrop.label,
-                                ObjectCrop.score,
-                                ObjectCrop.timestamp,
-                                ObjectCrop.frame,
-                                ObjectCrop.box,
-                                ObjectCrop.clip_embedding,
-                                Summary.video,
-                                Summary.segment,
-                                Summary.time_range,
-                                Summary.location,
-                                Summary.camera
-                            ).join(
-                                Summary, ObjectCrop.summary_id == Summary.id
-                            ).filter(
-                                ObjectCrop.clip_embedding.isnot(None)
-                            )
+                    fallback_query = db.query(
+                        ObjectCrop.id,
+                        ObjectCrop.summary_id,
+                        ObjectCrop.crop_path,
+                        ObjectCrop.label,
+                        ObjectCrop.score,
+                        ObjectCrop.timestamp,
+                        ObjectCrop.frame,
+                        ObjectCrop.box,
+                        ObjectCrop.reid_embedding,
+                        Summary.video,
+                        Summary.segment,
+                        Summary.time_range,
+                        Summary.location,
+                        Summary.camera
+                    ).join(
+                        Summary, ObjectCrop.summary_id == Summary.id
+                    ).filter(
+                        ObjectCrop.reid_embedding.isnot(None)
+                    )
                         
                         if label_filter and label_filter.strip():
                             fallback_query = fallback_query.filter(ObjectCrop.label == label_filter.strip())
@@ -1672,10 +1568,7 @@ def search_by_image(
                         similarities = []
                         
                         for row in all_crops_data:
-                            if use_reid:
-                                crop_id, summary_id, crop_path, label, score, timestamp, frame, box, emb, video, segment, time_range, location, camera = row
-                            else:
-                                crop_id, summary_id, crop_path, label, score, timestamp, frame, box, emb, video, segment, time_range, location, camera = row
+                            crop_id, summary_id, crop_path, label, score, timestamp, frame, box, emb, video, segment, time_range, location, camera = row
                             
                             if emb:
                                 try:
@@ -1698,8 +1591,8 @@ def search_by_image(
                                         crop_obj = type('Crop', (), {
                                             'id': crop_id, 'summary_id': summary_id, 'crop_path': crop_path,
                                             'label': label, 'score': score, 'timestamp': timestamp,
-                                            'frame': frame, 'box': box, 'clip_embedding': None,
-                                            'reid_embedding': emb if use_reid else None,
+                                            'frame': frame, 'box': box,
+                                            'reid_embedding': emb,
                                             'similarity': similarity
                                         })()
                                         summary_obj = type('Summary', (), {
@@ -1748,14 +1641,9 @@ def search_by_image(
         first_crop_info = None
         try:
             print("--- [Image Search] 嘗試獲取第一筆資料的向量... ---")
-            if use_reid:
-                first_crop = db.query(ObjectCrop).filter(
-                    ObjectCrop.reid_embedding.isnot(None)
-                ).first()
-            else:
-                first_crop = db.query(ObjectCrop).filter(
-                    ObjectCrop.clip_embedding.isnot(None)
-                ).first()
+            first_crop = db.query(ObjectCrop).filter(
+                ObjectCrop.reid_embedding.isnot(None)
+            ).first()
             if first_crop:
                 print(f"--- [Image Search] 找到第一筆資料: ID={first_crop.id}, label={first_crop.label} ---")
                 first_crop_info = {
@@ -1763,11 +1651,8 @@ def search_by_image(
                     "label": first_crop.label,
                     "crop_path": first_crop.crop_path
                 }
-                # 處理 embedding（根據查詢類型選擇對應的欄位）
-                if use_reid:
-                    first_emb = first_crop.reid_embedding
-                else:
-                    first_emb = first_crop.clip_embedding
+                # 僅使用 ReID embedding
+                first_emb = first_crop.reid_embedding
                 print(f"--- [Image Search] 第一筆資料 embedding 類型: {type(first_emb)} ---")
                 
                 if isinstance(first_emb, str):
@@ -1797,8 +1682,7 @@ def search_by_image(
                 else:
                     print("--- [Image Search] 第一筆資料的 embedding 為 None ---")
             else:
-                embedding_type = "ReID" if use_reid else "CLIP"
-                print(f"--- [Image Search] 資料庫中沒有找到有 {embedding_type} embedding 的記錄 ---")
+                print("--- [Image Search] 資料庫中沒有找到有 ReID embedding 的記錄 ---")
         except Exception as e:
             print(f"--- [Image Search] 獲取第一筆資料向量失敗: {e} ---")
             import traceback
@@ -1812,12 +1696,8 @@ def search_by_image(
             if hasattr(crop, 'similarity'):
                 similarity = crop.similarity
             else:
-                # 處理 embedding（可能是 list、str 或其他格式）
-                # 根據查詢類型選擇對應的 embedding 欄位
-                if use_reid:
-                    crop_emb = crop.reid_embedding if hasattr(crop, 'reid_embedding') else None
-                else:
-                    crop_emb = crop.clip_embedding if hasattr(crop, 'clip_embedding') else None
+                # 僅使用 ReID embedding
+                crop_emb = crop.reid_embedding if hasattr(crop, 'reid_embedding') else None
                 
                 if isinstance(crop_emb, str):
                     try:
@@ -1853,11 +1733,9 @@ def search_by_image(
         
         print(f"--- [Image Search] ✓ 搜索完成，返回 {len(results)} 筆結果 ---")
         
-        # 準備調試信息
-        # 獲取實際使用的 embedding 類型（如果圖片查詢回退到 CLIP，這裡會是 "clip"）
-        actual_embedding_type = embedding_type if query_type == "image" else "clip"
+        # 準備調試信息（僅 ReID）
         debug_info = {
-            "query_embedding": query_embedding,  # 查詢向量（ReID: 2048 維，CLIP: 512 維）
+            "query_embedding": query_embedding,  # 查詢向量（ReID: 2048 維）
             "query_embedding_dim": len(query_embedding) if query_embedding else 0,
             "query_embedding_sample": query_embedding[:10] if query_embedding and len(query_embedding) >= 10 else query_embedding,  # 前10個值
             "first_crop_info": first_crop_info,
@@ -1865,8 +1743,8 @@ def search_by_image(
             "first_crop_embedding_dim": len(first_crop_embedding) if first_crop_embedding else 0,
             "first_crop_embedding_sample": first_crop_embedding[:10] if first_crop_embedding and len(first_crop_embedding) >= 10 else first_crop_embedding,  # 前10個值
             "expected_embedding_dim": expected_dim,  # 預期的向量維度
-            "embedding_type": actual_embedding_type.upper(),  # 實際使用的 embedding 類型（REID 或 CLIP）
-            "is_fallback": actual_embedding_type == "clip" and query_type == "image",  # 是否為回退情況
+            "embedding_type": "REID",  # 實際使用的 embedding 類型
+            "is_fallback": False,  # 僅允許 ReID
         }
         
         print(f"--- [Image Search] 準備返回結果，包含 {len(results)} 筆結果和調試信息 ---")
