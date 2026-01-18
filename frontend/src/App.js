@@ -17,6 +17,7 @@ import RAGSearch from "./components/RAGSearch";
 import ImageSearch from "./components/ImageSearch";
 import EventTagModal from "./components/EventTagModal";
 import DetectionItemsModal from "./components/DetectionItemsModal";
+import RTSPStatusModal from "./components/RTSPStatusModal";
 
 // Services
 import apiService from "./services/api";
@@ -38,6 +39,9 @@ function App() {
   
   // Detection Items Modal state
   const [showDetectionItemsModal, setShowDetectionItemsModal] = useState(false);
+
+  // RTSP Modal state
+  const [showRTSPModal, setShowRTSPModal] = useState(false);
 
   // Analysis
   const { isAnalyzing, analysisData, analysisError, runAnalysis } =
@@ -90,17 +94,14 @@ function App() {
     console.log(`[${type.toUpperCase()}] ${text}`);
   };
 
-  // Initialize default prompts
+  // Initialize default prompts and Ollama status sequentially
   useEffect(() => {
     if (authenticated && apiKey) {
-      apiService.getDefaultPrompts(apiKey).then(setDefaultPrompts);
-    }
-  }, [authenticated, apiKey]);
-
-  // Check Ollama status and log to console
-  useEffect(() => {
-    if (authenticated && apiKey) {
-      const checkOllama = async () => {
+      const initSequence = async () => {
+        // 1. 取得預設 Prompts
+        await apiService.getDefaultPrompts(apiKey).then(setDefaultPrompts);
+        
+        // 2. 檢查 Ollama 狀態 (放在最後，避免阻塞其他 API)
         console.log("%c" + "=".repeat(60), "color: #3b82f6; font-weight: bold; font-size: 14px");
         console.log("%c[Ollama 狀態檢查]", "color: #3b82f6; font-weight: bold; font-size: 14px");
         console.log("%c正在檢查 Ollama 服務狀態...", "color: #6b7280");
@@ -130,7 +131,7 @@ function App() {
         console.log("%c" + "=".repeat(60), "color: #3b82f6; font-weight: bold; font-size: 14px");
       };
       
-      checkOllama();
+      initSequence();
     }
   }, [authenticated, apiKey]);
 
@@ -275,6 +276,7 @@ function App() {
         isAdmin={isAdmin}
         onEventTagClick={() => setShowEventTagModal(true)}
         onDetectionItemsClick={() => setShowDetectionItemsModal(true)}
+        onRTSPClick={() => setShowRTSPModal(true)}
       />
 
       <main className="main-container">
@@ -417,6 +419,14 @@ function App() {
         onClose={() => setShowDetectionItemsModal(false)}
         apiKey={apiKey}
       />
+
+      {showRTSPModal && (
+        <RTSPStatusModal
+          isOpen={showRTSPModal}
+          onClose={() => setShowRTSPModal(false)}
+          apiKey={apiKey}
+        />
+      )}
     </div>
   );
 }

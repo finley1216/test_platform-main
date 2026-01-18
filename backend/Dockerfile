@@ -1,9 +1,15 @@
-FROM python:3.11-slim
+FROM docker.io/library/python:3.11-slim
 
-# Set working directory
+# 1. 設置 apt 參數：忽略過期檢查、重試次數增加
+RUN echo 'Acquire::Check-Valid-Until "false";' > /etc/apt/apt.conf.d/99no-check-valid-until && \
+    echo 'Acquire::Retries "5";' > /etc/apt/apt.conf.d/99retries
+
+# 2. 確保使用 HTTP 源 (相容性較好)
+RUN sed -i 's/https:/http:/g' /etc/apt/sources.list.d/debian.sources
+
 WORKDIR /app
 
-# 1. 合併系統依賴安裝與清理
+# 3. 安裝套件
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libgl1 \

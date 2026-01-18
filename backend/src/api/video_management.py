@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from src.main import (
     get_api_key, ADMIN_TOKEN, HAS_DB, get_db, VIDEO_LIB_DIR
 )
+from src.config import config
 
 # 導入資料庫模型
 if HAS_DB:
@@ -43,7 +44,7 @@ def _save_video_events(events: Dict[str, Dict[str, Any]]):
         json.dump(events, f, ensure_ascii=False, indent=2)
 
 def _get_video_lib_categories() -> Dict[str, List[str]]:
-    """獲取 video 資料夾中的分類和影片列表"""
+    """獲取 video 資料夾中的分類 and 影片列表"""
     categories = {}
     if VIDEO_LIB_DIR.exists() and VIDEO_LIB_DIR.is_dir():
         for category_dir in VIDEO_LIB_DIR.iterdir():
@@ -89,8 +90,24 @@ def list_videos():
                 if not video_name:
                     continue
                 
-                # 使用資料庫中的 video 欄位值作為 video_id 和 display_name
+                # 嘗試將 video_name (stem) 還原為 category/video_name 格式
+                # 例如 "Video_火災" -> "Video/火災"
                 video_id = video_name
+                if "_" in video_name:
+                    parts = video_name.split("_")
+                    # 嘗試所有可能的分割點，從最長的前綴開始（例如 A_B_C -> A/B_C 或 A_B/C）
+                    for i in range(1, len(parts)):
+                        potential_cat = "_".join(parts[:i])
+                        potential_name = "_".join(parts[i:])
+                        # 檢查 video_lib 中是否存在對應的資料夾和影片
+                        cat_dir = VIDEO_LIB_DIR / potential_cat
+                        if cat_dir.exists() and cat_dir.is_dir():
+                            # 檢查是否有任何以 potential_name 開頭的影片檔
+                            video_files = list(cat_dir.glob(f"{potential_name}.*"))
+                            if video_files:
+                                video_id = f"{potential_cat}/{potential_name}"
+                                break
+                
                 display_name = video_name
                 
                 # 檢查 segment 資料夾中是否有對應的資料夾（僅用於獲取額外信息）
@@ -317,7 +334,7 @@ async def move_video_to_category(video_id: str, request: Request):
             "moved_from": video_id
         }
     else:
-        # 如果已有事件標籤，只更新描述和移動記錄
+        # 如果已有事件標籤，只更新描述 and 移動記錄
         events[new_video_id]["moved_from"] = video_id
         if event_description:
             events[new_video_id]["event_description"] = event_description
@@ -454,4 +471,3 @@ def get_video_info(video_id: str):
             "event_set_at": event_info.get("set_at", ""),
             "category": None,
         }
-

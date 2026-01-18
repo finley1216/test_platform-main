@@ -43,7 +43,8 @@ def check_ollama_status():
     try:
         # 檢查 Ollama 服務是否可用
         url = f"{OLLAMA_BASE.rstrip('/')}/api/tags"
-        response = requests.get(url, timeout=5)
+        # 使用較短的 timeout 並確保是同步調用，FastAPI 會在 threadpool 中執行此函式
+        response = requests.get(url, timeout=5.0)
         
         if response.status_code == 200:
             data = response.json()
@@ -57,10 +58,10 @@ def check_ollama_status():
             
     except requests.exceptions.ConnectionError as e:
         result["status"] = "connection_error"
-        result["error"] = f"無法連接到 Ollama 服務 ({OLLAMA_BASE})：{str(e)}"
+        result["error"] = f"無法連接到 Ollama 服務 ({OLLAMA_BASE})"
     except requests.exceptions.Timeout as e:
         result["status"] = "timeout"
-        result["error"] = f"連接 Ollama 服務超時：{str(e)}"
+        result["error"] = f"連接 Ollama 服務超時"
     except Exception as e:
         result["status"] = "error"
         result["error"] = f"檢查 Ollama 狀態時發生錯誤：{str(e)}"

@@ -91,7 +91,8 @@ RAG_INDEX_PATH = config.RAG_INDEX_PATH  # [DEPRECATED] 不再使用，保留用�
 OLLAMA_EMBED_MODEL = config.OLLAMA_EMBED_MODEL
 
 from src.core.model_loader import (
-    get_embedding_model, get_clip_model, get_reid_model, get_yolo_model
+    get_embedding_model, get_clip_model, get_reid_model, get_yolo_model,
+    EMBEDDING_MODEL_NAME
 )
 
 def generate_image_embedding(image_path: str) -> Optional[List[float]]:
@@ -272,6 +273,33 @@ async def startup_event():
             import traceback
             traceback.print_exc()
             # 不中斷啟動，讓應用繼續運行
+        
+        # 預載入 ReID 模型（以圖搜圖功能）
+        try:
+            print("--- [啟動] 預載入 ReID 模型... ---")
+            # 設置超時，避免無限等待
+            try:
+                signal.signal(signal.SIGALRM, timeout_handler)
+                signal.alarm(60)  # 60 秒超時
+            except (AttributeError, ValueError):
+                pass
+            
+            try:
+                reid_model, reid_device = get_reid_model()
+                if reid_model is not None:
+                    print(f"✓ ReID 模型預載入完成 (device: {reid_device})")
+                else:
+                    print("⚠️  ReID 模型預載入失敗（模型為 None）")
+            finally:
+                try:
+                    signal.alarm(0)  # 取消超時
+                except (AttributeError, ValueError):
+                    pass
+        except TimeoutError:
+            print("⚠️  ReID 模型預載入超時（60秒），將在首次使用時載入")
+        except Exception as e:
+            print(f"⚠️  ReID 模型預載入失敗: {e}")
+            # 不中斷啟動
         
         print("--- [啟動] 模型預載入完成 ---")
         print("=" * 80)
@@ -3367,12 +3395,136 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             import traceback
             traceback.print_exc()
 
+def save_rtsp_result_to_postgres(db: Session, result: Dict[str, Any], video_id: str):
+    """
+    專為 RTSP 串流設計的結果儲存函式。
+    特色：
+    1. 單一片段儲存。
+    2. 從檔名 (e.g. 20250520_120001.mp4) 解析精確的 start_timestamp。
+    3. 自動生成 summary embedding。
+    4. 處理 YOLO ObjectCrops 與 Alerts。
+    """
+    if not HAS_DB or not db:
+        print("--- [PostgreSQL] HAS_DB=False 或 db=None，跳過保存 ---")
+        return None
+
+    # 1. 基本資料提取
+    segment = result.get("segment", "")
+    parsed = result.get("parsed", {})
+    summary_text = parsed.get("summary_independent", "")
+    raw_detection = result.get("raw_detection", {})
+    duration_sec = result.get("duration_sec")
+    time_sec = result.get("time_sec")
+    frame_analysis = parsed.get("frame_analysis", {})
+    events = frame_analysis.get("events", {})
+    success = result.get("success", False)
+    error_msg = result.get("error")
+
+    # 2. 解析時間戳 (從檔名)
+    # FFmpeg 格式: 20260118_123456.mp4
+    start_time = datetime.now()
+    if segment and "_" in segment:
+        try:
+            stem = Path(segment).stem
+            # 嘗試匹配 YYYYMMDD_HHMMSS
+            dt = datetime.strptime(stem, "%Y%m%d_%H%M%S")
+            start_time = dt
+        except:
+            pass
+    
+    end_time = start_time + timedelta(seconds=duration_sec) if duration_sec else None
+    time_range = f"{start_time.strftime('%H:%M:%S')} - {end_time.strftime('%H:%M:%S')}" if end_time else ""
+
+    # 3. 生成 Embedding (pgvector)
+    embedding = None
+    if summary_text and summary_text.strip():
+        try:
+            model = get_embedding_model()
+            if model:
+                embedding = model.encode(summary_text.strip(), normalize_embeddings=True).tolist()
+        except Exception as e:
+            print(f"--- [RTSP DB] Embedding 失敗: {e} ---")
+
+    # 4. 建立 Summary 記錄
+    # 決定顯示訊息：如果有摘要則顯示摘要，否則顯示錯誤或預設文字
+    display_message = summary_text.strip()
+    if not display_message:
+        if not success:
+            display_message = f"分析失敗: {error_msg}"
+        else:
+            display_message = "RTSP 分析片段 (無摘要內容)"
+
+    summary = Summary(
+        video=video_id,
+        segment=segment,
+        start_timestamp=start_time,
+        end_timestamp=end_time,
+        time_range=time_range,
+        message=display_message,
+        duration_sec=float(duration_sec) if duration_sec is not None else None,
+        time_sec=float(time_sec) if time_sec is not None else None,
+        embedding=embedding,
+        # 事件欄位
+        water_flood=bool(events.get("water_flood", False)),
+        fire=bool(events.get("fire", False)),
+        abnormal_attire_face_cover_at_entry=bool(events.get("abnormal_attire_face_cover_at_entry", False)),
+        person_fallen_unmoving=bool(events.get("person_fallen_unmoving", False)),
+        double_parking_lane_block=bool(events.get("double_parking_lane_block", False)),
+        smoking_outside_zone=bool(events.get("smoking_outside_zone", False)),
+        crowd_loitering=bool(events.get("crowd_loitering", False)),
+        security_door_tamper=bool(events.get("security_door_tamper", False)),
+        event_reason=events.get("reason", ""),
+        created_at=datetime.now(),
+        updated_at=datetime.now()
+    )
+
+    # 5. YOLO Detections
+    yolo_result = raw_detection.get("yolo")
+    if yolo_result:
+        summary.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
+        summary.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
+        summary.yolo_total_detections = yolo_result.get("total_detections", 0)
+        summary.yolo_total_frames_processed = yolo_result.get("total_frames_processed", 0)
+
+    try:
+        db.add(summary)
+        db.flush() # 取得 ID
+
+        # 6. ObjectCrops
+        if yolo_result and yolo_result.get("crop_paths"):
+            for crop_data in yolo_result["crop_paths"]:
+                if not isinstance(crop_data, dict): continue
+                oc = ObjectCrop(
+                    summary_id=summary.id,
+                    crop_path=crop_data.get("path"),
+                    label=crop_data.get("label"),
+                    score=crop_data.get("score"),
+                    timestamp=crop_data.get("timestamp"),
+                    frame=crop_data.get("frame"),
+                    box=json.dumps(crop_data.get("box", []), ensure_ascii=False) if crop_data.get("box") else None,
+                    clip_embedding=crop_data.get("clip_embedding"),
+                    reid_embedding=crop_data.get("reid_embedding"),
+                    created_at=datetime.now()
+                )
+                db.add(oc)
+
+        # 7. Alerts
+        _create_alert_if_needed(db, summary.id, events, video_id, segment)
+        
+        db.commit()
+        print(f"--- [RTSP DB] ✓ 成功保存片段 {segment} 到資料庫 (video: {video_id}) ---")
+        return summary
+    except Exception as e:
+        db.rollback()
+        print(f"--- [RTSP DB ERROR] ✗ 儲存失敗: {e} ---")
+        return None
+
 # ReID 模型（用於物件 re-identification）
 _reid_model = None
 _reid_device = None
 
 def get_reid_model():
-    """獲取或初始化 ReID 模型（用於物件 re-identification，優先使用 torchreid/FastReID）"""
+    """獲取或初始化 ReID 模型（嚴格使用 2048 維 ResNet50 模型，不考慮 OSNet）"""
     global _reid_model, _reid_device
     
     if _reid_model is not None:
@@ -3382,94 +3534,95 @@ def get_reid_model():
     device = "cuda" if torch.cuda.is_available() else "cpu"
     _reid_device = device
     
-    errors = []  # 記錄所有嘗試的錯誤
+    errors = []
     
-    # 優先使用 torchreid（FastReID 風格）
+    # 方案 1: 使用 torchreid 的 resnet50 (2048維)
     try:
         import torchreid
-        print(f"--- [ReID] 嘗試載入 torchreid 模型 (device: {device}) ---")
+        print(f"--- [ReID] 嘗試載入 torchreid ResNet50 模型 (device: {device}) ---")
         model = torchreid.models.build_model(
             name='resnet50',
-            num_classes=751,  # Market-1501 dataset classes
+            num_classes=751,
             loss='softmax',
             pretrained=True
         )
         model = model.to(device).eval()
-        model.classifier = None  # 移除分類層，只保留特徵提取器
+        model.classifier = None # 獲取 2048 維特徵
         
-        # 驗證模型輸出維度
+        # 驗證維度
         test_input = torch.randn(1, 3, 256, 128).to(device)
         with torch.no_grad():
             test_output = model(test_input)
-            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
-        
-        if output_dim != 2048:
-            error_msg = f"torchreid 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
-            print(f"--- [ReID] ✗ {error_msg} ---")
-            errors.append(f"torchreid: {error_msg}")
-            raise ValueError(error_msg)
-        
-        print(f"✓ torchreid ResNet50 模型載入完成（輸出維度: {output_dim}）")
-        _reid_model = model
-        return model, device
-    except ImportError as e:
-        error_msg = f"torchreid 未安裝: {e}"
-        print(f"--- [ReID] {error_msg}，嘗試備用方案... ---")
-        errors.append(error_msg)
+            output_dim = test_output.shape[1]
+            
+        if output_dim == 2048:
+            print(f"✓ torchreid ResNet50 載入成功 (維度: {output_dim})")
+            _reid_model = model
+            return model, device
+        else:
+            errors.append(f"torchreid 維度不符: {output_dim}")
     except Exception as e:
-        error_msg = f"torchreid 載入失敗: {e}"
-        print(f"--- [ReID] ✗ {error_msg}，嘗試備用方案... ---")
-        errors.append(error_msg)
-        import traceback
-        traceback.print_exc()
-    
-    # 備用：使用 timm ResNet50（設置離線模式避免長時間下載）
+        errors.append(f"torchreid 失敗: {e}")
+
+    # 方案 2: 使用 timm 的 resnet50 (2048維) - 強制離線
     try:
         import timm
-        import os
         print(f"--- [ReID] 嘗試載入 timm ResNet50 模型 (device: {device}) ---")
-        
-        # 設置 HuggingFace 為離線模式，避免網絡下載超時
         os.environ['HF_HUB_OFFLINE'] = '1'
-        
         try:
-            # 嘗試從本地緩存載入預訓練模型
             model = timm.create_model('resnet50', pretrained=True, num_classes=0)
-        except Exception as download_err:
-            # 如果本地沒有緩存，使用不預訓練的模型（避免網絡下載）
-            print(f"--- [ReID] 本地無緩存，使用未預訓練的 ResNet50: {download_err} ---")
+        except:
             model = timm.create_model('resnet50', pretrained=False, num_classes=0)
         finally:
-            # 恢復網絡模式
             os.environ.pop('HF_HUB_OFFLINE', None)
-        
+            
         model = model.to(device).eval()
         
-        # 驗證模型輸出維度
+        # 驗證維度
         test_input = torch.randn(1, 3, 256, 128).to(device)
         with torch.no_grad():
             test_output = model(test_input)
-            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
-        
-        if output_dim != 2048:
-            error_msg = f"timm 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
-            print(f"--- [ReID] ✗ {error_msg} ---")
-            errors.append(f"timm: {error_msg}")
-            raise ValueError(error_msg)
-        
-        print(f"✓ timm ResNet50 模型載入完成（輸出維度: {output_dim}）")
-        _reid_model = model
-        return model, device
-    except ImportError as e:
-        error_msg = f"timm 未安裝: {e}"
-        print(f"--- [ReID] {error_msg}，嘗試最後備用方案... ---")
-        errors.append(error_msg)
+            output_dim = test_output.shape[1]
+            
+        if output_dim == 2048:
+            print(f"✓ timm ResNet50 載入成功 (維度: {output_dim})")
+            _reid_model = model
+            return model, device
+        else:
+            errors.append(f"timm 維度不符: {output_dim}")
     except Exception as e:
-        error_msg = f"timm 載入失敗: {e}"
-        print(f"--- [ReID] ✗ {error_msg}，嘗試最後備用方案... ---")
-        errors.append(error_msg)
-        import traceback
-        traceback.print_exc()
+        errors.append(f"timm 失敗: {e}")
+
+    # 方案 3: 使用 torchvision 的 resnet50 (2048維)
+    try:
+        import torchvision.models as models
+        print(f"--- [ReID] 嘗試載入 torchvision ResNet50 模型 (device: {device}) ---")
+        try:
+            model = models.resnet50(weights='ResNet50_Weights.DEFAULT')
+        except:
+            model = models.resnet50(pretrained=True)
+            
+        model = model.to(device).eval()
+        model.fc = torch.nn.Identity() # 獲取 2048 維特徵
+        
+        # 驗證維度
+        test_input = torch.randn(1, 3, 256, 128).to(device)
+        with torch.no_grad():
+            test_output = model(test_input)
+            output_dim = test_output.shape[1]
+            
+        if output_dim == 2048:
+            print(f"✓ torchvision ResNet50 載入成功 (維度: {output_dim})")
+            _reid_model = model
+            return model, device
+        else:
+            errors.append(f"torchvision 維度不符: {output_dim}")
+    except Exception as e:
+        errors.append(f"torchvision 失敗: {e}")
+
+    print(f"--- [ReID] ✗ 所有方案均失敗: {errors} ---")
+    _reid_model = None
+    return None, device
     
     # 最後備用：使用 torchvision ResNet50（避免網絡下載）
     try:
@@ -4174,7 +4327,7 @@ def _merge_and_rank_results(
 
 # ================== 註冊 API 路由 ==================
 # 必須在所有函數定義之後註冊，避免循環導入
-from src.api import health, prompts, video_analysis, rag, video_management, detection_items
+from src.api import health, prompts, video_analysis, rag, video_management, detection_items, rtsp_control
 
 app.include_router(health.router)
 app.include_router(prompts.router)
@@ -4182,6 +4335,7 @@ app.include_router(video_analysis.router)
 app.include_router(rag.router)
 app.include_router(video_management.router)
 app.include_router(detection_items.router)
+app.include_router(rtsp_control.router)
 
 if __name__ == "__main__":
     import uvicorn

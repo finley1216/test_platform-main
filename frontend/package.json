@@ -9,7 +9,7 @@
     "web-vitals": "^4.2.4"
   },
   "scripts": {
-    "start": "WATCHPACK_POLLING=true FAST_REFRESH=true CHOKIDAR_USEPOLLING=true CHOKIDAR_INTERVAL=1000 WDS_SOCKET_HOST=localhost WDS_SOCKET_PORT=3000 react-scripts start",
+    "start": "PORT=3000 WATCHPACK_POLLING=true FAST_REFRESH=true CHOKIDAR_USEPOLLING=true react-scripts start",
     "build": "react-scripts build",
     "test": "react-scripts test",
     "eject": "react-scripts eject"

@@ -362,3 +362,15 @@ docker exec test_platform-main-backend-1 python3 /app/src/migrate_segments_to_db
 改為：SKIP_VLM = False
 重啟服務
 或者告訴我，我可以幫您恢復。
+
+
+
+
+
+
+
+
+
+ffmpeg -re -stream_loop -1 -i "Video_衛哨端出入口2.avi" -c:v libx264 -preset ultrafast -tune zerolatency -b:v 2000k -maxrate 2000k -bufsize 4000k -g 60 -f rtsp -rtsp_transport tcp rtsp://127.0.0.1:8554/live
+
+./mediamtx

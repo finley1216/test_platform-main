@@ -299,6 +299,30 @@ class ApiService {
     // 2. 或使用直接下載連結（但需要後端支援 CORS 和適當的 Content-Disposition 標頭）
   }
 
+  // RTSP 控制 API
+  async startRTSP(data, apiKey) {
+    return this.request("/v1/rtsp/start", {
+      method: "POST",
+      body: data,
+      apiKey,
+    });
+  }
+
+  async stopRTSP(data, apiKey) {
+    return this.request("/v1/rtsp/stop", {
+      method: "POST",
+      body: data,
+      apiKey,
+    });
+  }
+
+  async getRTSPStatus(apiKey) {
+    return this.request("/v1/rtsp/status", {
+      method: "GET",
+      apiKey,
+    });
+  }
+
   // 影片管理 API
   async listVideos(apiKey) {
     return this.request("/v1/videos/list", {

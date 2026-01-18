@@ -57,31 +57,11 @@ def get_clip_model():
     return _clip_model, _clip_processor
 
 # --- ReID ---
-_reid_model = None
-_reid_device = None
-
+# 統一從 src.main 獲取以保持一致性
 def get_reid_model():
-    """獲取或載入 ReID 模型（OSNet）"""
-    global _reid_model, _reid_device
-    if _reid_model is None:
-        try:
-            import torchreid
-            _reid_device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"--- [ReID] 正在載入 OSNet 模型 (device: {_reid_device})... ---")
-            
-            _reid_model = torchreid.models.build_model(
-                name='osnet_x1_0',
-                num_classes=1000,
-                pretrained=True,
-                use_gpu=torch.cuda.is_available()
-            )
-            _reid_model.to(_reid_device)
-            _reid_model.eval()
-            print("✓ ReID (OSNet) 模型載入完成")
-        except Exception as e:
-            print(f"--- [ReID] ✗ 模型載入失敗: {e} ---")
-            _reid_model, _reid_device = None, None
-    return _reid_model, _reid_device
+    """獲取或載入 ReID 模型（與 main.py 保持一致）"""
+    from src.main import get_reid_model as _get_reid
+    return _get_reid()
 
 # --- YOLO-World ---
 _yolo_world_model = None

@@ -73,9 +73,34 @@ def _extract_first_json_and_tail(text: str) -> Tuple[Dict, str]:
     return {}, text
 
 def _clean_summary_text(s: str) -> str:
-    """清理摘要文字"""
+    """清理摘要文字，處理 Markdown code blocks 及可能的 JSON 格式"""
     if not s: return ""
+    
+    # 1. 移除 Markdown code blocks 標籤
     s = re.sub(r'```[a-z]*\n?', '', s)
     s = s.replace('```', '')
-    s = re.sub(r'\{.*\}', '', s, flags=re.DOTALL)
+    
+    # 2. 檢查是否為純 JSON (有些模型會把摘要包在 JSON 裡)
+    try:
+        # 尋找第一個 { 和最後一個 }
+        start = s.find('{')
+        end = s.rfind('}')
+        if start != -1 and end != -1 and start < end:
+            json_str = s[start:end+1]
+            data = json.loads(json_str)
+            if isinstance(data, dict):
+                # 嘗試提取常見的摘要欄位
+                for key in ['summary', 'summary_independent', 'description', 'content']:
+                    if key in data and data[key]:
+                        return str(data[key]).strip()
+                # 如果是 JSON 但沒找到關鍵欄位，且 JSON 之外沒文字，則可能需要保留 JSON 或清理掉
+                # 這裡我們先不清除 JSON，交給後續步驟
+    except:
+        pass
+
+    # 3. 移除任何剩餘的 JSON 區塊（如果 JSON 之外還有文字）
+    # 但要注意不要誤刪包含大括號的正常文字
+    # 只有當大括號內看起來像 JSON 時才移除
+    s = re.sub(r'\{[^{}]*"[^{}]*":.*\}', '', s, flags=re.DOTALL)
+    
     return s.strip()

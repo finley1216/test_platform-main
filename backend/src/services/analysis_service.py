@@ -41,6 +41,7 @@ class AnalysisService:
             frames_pil = _sample_frames_evenly_to_pil(video_path, max_frames=frames_per_segment, sampling_fps=sampling_fps)
             images_b64 = [_pil_to_b64(_resize_short_side(img, target_short)) for img in frames_pil]
         except Exception as e:
+            print(f"--- [Qwen] ✗ 處理失敗: {e} ---")
             return {"error": f"影格擷取失敗: {e}"}, ""
 
         event_msgs = [
@@ -50,9 +51,12 @@ class AnalysisService:
         
         event_error = None
         try:
+            print(f"--- [Qwen] 呼叫 Ollama 進行事件偵測 (模型: {model_name})... ---")
             event_txt = _ollama_chat(model_name, event_msgs, images_b64=images_b64)
+            print(f"--- [Qwen] 事件偵測完成，長度: {len(event_txt)} ---")
         except Exception as e:
             event_txt, event_error = "", f"Ollama 失敗: {e}"
+            print(f"--- [Qwen] ✗ 事件偵測失敗: {e} ---")
 
         frame_obj = _safe_parse_json(event_txt) or _extract_first_json(event_txt) or {"events": {"reason": ""}, "persons": []}
         if event_error: frame_obj["error"] = event_error
@@ -64,10 +68,15 @@ class AnalysisService:
                 {"role": "user", "content": f"{summary_prompt}\n\n強制規則：只輸出 50–100 字中文。"}
             ]
             try:
+                print(f"--- [Qwen] 呼叫 Ollama 進行摘要產生 (模型: {model_name})... ---")
                 summary_raw = _ollama_chat(model_name, summary_msgs, images_b64=images_b64)
                 summary_txt = _clean_summary_text(summary_raw)
-            except Exception:
+                print(f"--- [Qwen] 摘要產生完成，長度: {len(summary_txt)} ---")
+            except Exception as e:
+                print(f"--- [Qwen] ✗ 摘要產生失敗: {e} ---")
                 summary_txt = ""
+        else:
+            print("--- [Qwen] 跳過摘要產生 (summary_prompt 為空) ---")
 
         return frame_obj, summary_txt
 
@@ -163,9 +172,12 @@ class AnalysisService:
 
     @staticmethod
     def analyze_segment(req) -> Dict:
-        """分析單一片段的完整邏輯"""
+        """分析單一片段的完整邏輯 (VLM + YOLO + ReID)"""
         p = req.segment_path
         tr = f"{_fmt_hms(req.start_time)} - {_fmt_hms(req.end_time)}"
+        print(f"--- [AnalysisService] 開始分析片段: {p} ({tr}) ---")
+        print(f"--- [AnalysisService] Model: {req.model_type}, Qwen Model: {getattr(req, 'qwen_model', 'N/A')} ---")
+        print(f"--- [AnalysisService] Event Prompt Len: {len(req.event_detection_prompt)}, Summary Prompt Len: {len(req.summary_prompt)} ---")
         t1 = time.time()
 
         result = {
@@ -180,6 +192,7 @@ class AnalysisService:
         }
 
         try:
+            # 1. 執行 VLM 分析 (Qwen 或 Gemini)
             if req.model_type in ("qwen", "gemini"):
                 if req.model_type == "qwen":
                     frame_obj, summary_txt = AnalysisService.infer_segment_qwen(
@@ -203,19 +216,29 @@ class AnalysisService:
                     "summary_independent": summary_txt
                 }
 
-            elif req.model_type == "yolo":
-                j = AnalysisService.infer_segment_yolo(
-                    p, 
-                    labels=req.yolo_labels or "person,car",
-                    every_sec=req.yolo_every_sec,
-                    score_thr=req.yolo_score_thr
-                )
+            # 2. 強制執行 YOLO-World + FastReID (作為正常流程的一部分)
+            # 即使是 Qwen 模型，也要跑 YOLO 以獲取物件追蹤資訊
+            yolo_labels = req.yolo_labels if hasattr(req, 'yolo_labels') and req.yolo_labels else "person,car"
+            yolo_every_sec = req.yolo_every_sec if hasattr(req, 'yolo_every_sec') else 2.0
+            yolo_score_thr = req.yolo_score_thr if hasattr(req, 'yolo_score_thr') else 0.25
+            
+            print(f"--- [AnalysisService] 執行 YOLO+ReID 正常流程 (Labels: {yolo_labels}) ---")
+            yolo_res = AnalysisService.infer_segment_yolo(
+                p, 
+                labels=yolo_labels,
+                every_sec=yolo_every_sec,
+                score_thr=yolo_score_thr
+            )
+            
+            # [修正] 必須包裝在 "yolo" key 下，後端資料庫保存邏輯才能抓到
+            result["raw_detection"] = {"yolo": yolo_res}
+            
+            # 如果原本不是 Qwen/Gemini，則根據 YOLO 結果決定 success
+            if req.model_type == "yolo":
                 result["success"] = True
-                result["raw_detection"] = j
-            else:
-                raise ValueError(f"不支援的模型類型: {req.model_type}")
 
         except Exception as ex:
+            print(f"--- [AnalysisService] ✗ 分析發生異常: {ex} ---")
             result["error"] = str(ex)
 
         result["time_sec"] = round(time.time() - t1, 2)
@@ -303,9 +326,16 @@ class AnalysisService:
 
     @staticmethod
     def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: float, batch_size: int = 16) -> Dict:
-        """使用 YOLO-World 進行物件偵測 (支援 Batch Inference)"""
+        """使用 YOLO-World 進行物件偵測並執行 FastReID 提取特徵，同時儲存物件切片"""
         model = get_yolo_model()
         if not model: raise RuntimeError("YOLO 模型未載入")
+        
+        reid_model, reid_device = get_reid_model()
+        
+        # 準備儲存切片的目錄
+        seg_dir = Path(seg_path).parent
+        crops_dir = seg_dir / "yolo_output" / "object_crops"
+        crops_dir.mkdir(parents=True, exist_ok=True)
         
         labels_list = [l.strip() for l in labels.split(",") if l.strip()] or ["person", "car"]
         model.set_classes(labels_list)
@@ -316,9 +346,12 @@ class AnalysisService:
         
         interval = max(1, int(round(fps * every_sec)))
         all_results = []
+        crop_paths = []
         
         # 收集需要處理的幀索引
         frame_indices = list(range(0, total_frames, interval))
+        
+        print(f"--- [YOLO] 開始處理片段: {seg_path}, 共 {len(frame_indices)} 幀 ---")
         
         # 批次處理
         for i in range(0, len(frame_indices), batch_size):
@@ -342,13 +375,61 @@ class AnalysisService:
             for idx, res in enumerate(batch_predict_res):
                 fi = valid_idxs[idx]
                 timestamp = round(fi / fps, 2)
-                for box in res.boxes:
-                    all_results.append({
-                        "timestamp": timestamp,
-                        "label": labels_list[int(box.cls)],
-                        "score": round(float(box.conf), 3),
-                        "box": [round(float(coord), 1) for coord in box.xyxy[0].tolist()]
-                    })
+                frame = batch_frames[idx]
+                
+                crops_imgs = []
+                temp_detections = []
+                
+                for b_idx, box in enumerate(res.boxes):
+                    cls_id = int(box.cls)
+                    label = labels_list[cls_id]
+                    conf = round(float(box.conf), 3)
+                    xyxy = [int(round(float(c))) for i, c in enumerate(box.xyxy[0].tolist())]
+                    
+                    # 提取切片
+                    x1, y1, x2, y2 = xyxy
+                    crop = frame[y1:y2, x1:x2]
+                    if crop.size > 0:
+                        # 儲存切片圖片
+                        crop_filename = f"crop_{fi}_{b_idx}_{label}.jpg"
+                        crop_path = crops_dir / crop_filename
+                        cv2.imwrite(str(crop_path), crop)
+                        
+                        rel_crop_path = str(crop_path.relative_to(Path(".")))
+                        
+                        crops_imgs.append(crop)
+                        temp_detections.append({
+                            "timestamp": timestamp,
+                            "label": label,
+                            "score": conf,
+                            "box": xyxy,
+                            "frame": fi,
+                            "path": rel_crop_path
+                        })
+                
+                # 如果有切片且 ReID 模型可用，執行批次特徵提取
+                if crops_imgs and reid_model:
+                    embeddings = AnalysisService.generate_reid_embeddings_batch(crops_imgs, reid_model, reid_device)
+                    for d_idx, emb in enumerate(embeddings):
+                        if emb:
+                            temp_detections[d_idx]["reid_embedding"] = emb
+                
+                all_results.extend(temp_detections)
+                crop_paths.extend(temp_detections) # 這裡 crop_paths 內容與 detections 類似，但為了相容 main.py
         
         cap.release()
-        return {"total_detections": len(all_results), "detections": all_results}
+        
+        # 計算物件統計
+        object_count = {}
+        for d in all_results:
+            label = d["label"]
+            object_count[label] = object_count.get(label, 0) + 1
+            
+        print(f"--- [YOLO] 處理完成，偵測到 {len(all_results)} 個物件，統計: {object_count} ---")
+        return {
+            "total_detections": len(all_results), 
+            "detections": all_results,
+            "crop_paths": crop_paths,
+            "object_count": object_count,
+            "total_frames_processed": len(frame_indices)
+        }
