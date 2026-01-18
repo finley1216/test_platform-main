@@ -59,35 +59,6 @@ services:
       postgres:
         condition: service_healthy
 
-  # OWL API Service
-  owl-api:
-    build:
-      context: ./owl-service
-      dockerfile: Dockerfile
-    restart: unless-stopped
-    environment:
-      - OWL_MODEL_ID=${OWL_MODEL_ID}
-      - OWL_DEVICE=${OWL_DEVICE}
-      - MEDIA_ROOT=/app/media
-    volumes:
-      - ./owl-service/media:/app/media
-    ports:
-      - "18001:18001"
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
-    extra_hosts:
-      - "huggingface.co:104.16.132.19"
-    networks:
-      - app-network
-    deploy:
-      resources:
-        reservations:
-          devices:
-            - driver: nvidia
-              count: all
-              capabilities: [gpu]
-
   backend:
     build:
       context: ./backend
@@ -108,7 +79,6 @@ services:
       - RAG_STORE_DIR=./rag_store
       - OLLAMA_EMBED_MODEL=bge-m3
       - OLLAMA_BASE=http://ollama:11434
-      - OWL_API_BASE=http://owl-api:18001
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
       - POSTGRES_USER=postgres
@@ -134,8 +104,6 @@ services:
       postgres:
         condition: service_healthy
       ollama:
-        condition: service_started
-      owl-api:
         condition: service_started
 
   frontend:

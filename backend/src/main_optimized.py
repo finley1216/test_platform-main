@@ -417,9 +417,6 @@ def process_segment_optimized(
         sampling_fps=sampling_fps,
         event_detection_prompt=event_detection_prompt,
         summary_prompt=summary_prompt,
-        owl_labels="",  # 不使用 OWL
-        owl_every_sec=0,
-        owl_score_thr=0,
         yolo_labels=yolo_labels,
         yolo_every_sec=yolo_every_sec,
         yolo_score_thr=yolo_score_thr

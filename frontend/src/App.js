@@ -12,7 +12,6 @@ import AuthCard from "./components/AuthCard";
 import ModelConfig from "./components/ModelConfig";
 import SegmentationParams from "./components/SegmentationParams";
 import DetectionSettings from "./components/DetectionSettings";
-import OWLSettings from "./components/OWLSettings";
 import AnalysisResults from "./components/AnalysisResults";
 import RAGSearch from "./components/RAGSearch";
 import ImageSearch from "./components/ImageSearch";
@@ -79,13 +78,6 @@ function App() {
   });
   const [showEventPromptModal, setShowEventPromptModal] = useState(false);
   const [showSummaryPromptModal, setShowSummaryPromptModal] = useState(false);
-
-  // OWL settings
-  const [owlLabels, setOwlLabels] = useState(
-    "person,pedestrian,motorcycle,car,bus,scooter,truck"
-  );
-  const [owlFps, setOwlFps] = useState(0.5);
-  const [owlThr, setOwlThr] = useState(0.15);
 
   // RAG settings
   const [ragQuery, setRagQuery] = useState("");
@@ -183,11 +175,6 @@ function App() {
       if (summaryPrompt.trim()) {
         formData.append("summary_prompt", summaryPrompt);
       }
-    } else {
-      formData.append("owl_labels", owlLabels);
-      const interval = owlFps > 0 ? 1 / owlFps : 2.0;
-      formData.append("owl_every_sec", interval);
-      formData.append("owl_score_thr", owlThr);
     }
 
     if (source === "upload") {
@@ -359,17 +346,6 @@ function App() {
                 setSummaryPrompt(prompt);
                 setShowSummaryPromptModal(false);
               }}
-            />
-          )}
-
-          {modelType === "owl" && (
-            <OWLSettings
-              owlLabels={owlLabels}
-              owlFps={owlFps}
-              owlThr={owlThr}
-              onLabelsChange={setOwlLabels}
-              onFpsChange={setOwlFps}
-              onThrChange={setOwlThr}
             />
           )}
 

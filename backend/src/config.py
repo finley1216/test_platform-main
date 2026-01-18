@@ -31,10 +31,6 @@ class Config:
         self.OLLAMA_BASE: str = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
         self.OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
 
-        # ================== OWL API Configuration ==================
-        self.OWL_API_BASE: str = os.getenv("OWL_API_BASE", "http://127.0.0.1:18001")
-        self.OWL_VIDEO_URL: str = f"{self.OWL_API_BASE}/video_detect"
-
         # ================== Gemini API Configuration ==================
         self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
 
@@ -108,7 +104,6 @@ class Config:
             f"reload={self.RELOAD}, "
             f"workers={self.WORKERS}, "
             f"ollama_base={self.OLLAMA_BASE}, "
-            f"owl_api_base={self.OWL_API_BASE}, "
             f"rag_dir={self.RAG_DIR}, "
             f"auto_rag_index={self.AUTO_RAG_INDEX}"
             f")"

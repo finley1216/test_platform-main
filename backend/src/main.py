@@ -53,7 +53,16 @@ except ImportError:
     HAS_DB = False
     print("--- [WARNING] 資料庫模組未找到，PostgreSQL 功能將無法使用 ---")
 
-# ================== 環境變數 ==================
+from src.utils.ollama_utils import (
+    _ollama_chat, _safe_parse_json, _extract_first_json, 
+    _clean_summary_text, _extract_first_json_and_tail
+)
+from src.utils.video_utils import (
+    _fmt_hms, _probe_duration_seconds, _split_one_video, _sample_frames_evenly_to_pil
+)
+from src.utils.image_utils import (
+    _resize_short_side, _pil_to_b64, _resize_frame_for_vlm
+)
 
 try:
     from prompts import EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
@@ -66,8 +75,6 @@ except Exception:
 ADMIN_TOKEN = config.ADMIN_TOKEN
 SESSION_TTL_SEC = config.SESSION_TTL_SEC
 OLLAMA_BASE = config.OLLAMA_BASE
-OWL_API_BASE = config.OWL_API_BASE
-OWL_VIDEO_URL = config.OWL_VIDEO_URL
 
 # RAG 索引開關（預設啟用）
 AUTO_RAG_INDEX = config.AUTO_RAG_INDEX
@@ -83,97 +90,9 @@ RAG_DIR = config.RAG_DIR  # [DEPRECATED] 不再使用，保留用於向後兼容
 RAG_INDEX_PATH = config.RAG_INDEX_PATH  # [DEPRECATED] 不再使用，保留用於向後兼容
 OLLAMA_EMBED_MODEL = config.OLLAMA_EMBED_MODEL
 
-# Initialize SentenceTransformer for embedding generation
-# Model: paraphrase-multilingual-MiniLM-L12-v2 (384 dimensions)
-_embedding_model = None
-EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
-
-def get_embedding_model():
-    """Get or initialize the SentenceTransformer model (CPU mode only)"""
-    global _embedding_model
-    if _embedding_model is None and HAS_SENTENCE_TRANSFORMER:
-        try:
-            # 強制使用 CPU 模式，避免 GPU 資源競爭
-            import os
-            os.environ['CUDA_VISIBLE_DEVICES'] = ''  # 隱藏 GPU，強制使用 CPU
-            # 嘗試使用本地緩存路徑
-            local_model_path = "/root/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/86741b4e3f5cb7765a600d3a3d55a0f6a6cb443d"
-            if os.path.exists(local_model_path) and os.path.exists(os.path.join(local_model_path, "modules.json")):
-                # 使用本地路徑載入
-                _embedding_model = SentenceTransformer(local_model_path, device='cpu')
-            else:
-                # 使用模型名稱載入（會嘗試從緩存讀取）
-                _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device='cpu')
-            print(f"✓ SentenceTransformer model loaded: {EMBEDDING_MODEL_NAME} (CPU Mode)")
-        except Exception as e:
-            print(f"⚠️  Failed to load SentenceTransformer model: {e}")
-            raise RuntimeError(f"無法載入 SentenceTransformer 模型: {e}")
-    return _embedding_model
-
-# CLIP 模型用於圖像 embedding（以圖搜圖）
-_clip_model = None
-_clip_processor = None
-CLIP_MODEL_NAME = "openai/clip-vit-base-patch32"  # 輸出 512 維向量
-
-def get_clip_model():
-    """獲取或初始化 CLIP 模型（用於圖像 embedding）"""
-    global _clip_model, _clip_processor
-    if _clip_model is None:
-        try:
-            from transformers import CLIPModel, CLIPProcessor
-            import torch
-            import os
-            device = "cuda" if torch.cuda.is_available() else "cpu"
-            print(f"--- [CLIP] 載入模型: {CLIP_MODEL_NAME} (device: {device}) ---")
-            
-            # 直接使用模型名稱載入，transformers 會自動從緩存讀取（如果可用）
-            # 如果緩存不完整，會嘗試從網路下載缺失的部分
-            try:
-                # 先嘗試只使用本地文件（如果緩存完整）
-                print("--- [CLIP] 嘗試從本地緩存載入模型和處理器... ---")
-                _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, local_files_only=True).to(device).eval()
-                print("--- [CLIP] 模型載入完成，載入處理器... ---")
-                _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, local_files_only=True)
-                print(f"✓ CLIP 模型和處理器從本地緩存載入完成")
-            except Exception as local_e:
-                # 如果本地緩存不完整，嘗試從網路下載（但可能因為網路問題失敗）
-                print(f"--- [CLIP] 本地緩存不完整或載入失敗: {type(local_e).__name__}: {str(local_e)[:200]} ---")
-                print("--- [CLIP] 嘗試從網路下載（如果網路可用，但可能很慢）... ---")
-                try:
-                    # 設置較短的超時，避免長時間等待
-                    import requests
-                    original_timeout = getattr(requests.adapters, 'DEFAULT_TIMEOUT', None)
-                    if hasattr(requests.adapters, 'DEFAULT_TIMEOUT'):
-                        requests.adapters.DEFAULT_TIMEOUT = 10  # 10 秒超時
-                    
-                    print("--- [CLIP] 從網路載入模型... ---")
-                    _clip_model = CLIPModel.from_pretrained(CLIP_MODEL_NAME, local_files_only=False).to(device).eval()
-                    print("--- [CLIP] 模型載入完成，從網路載入處理器... ---")
-                    _clip_processor = CLIPProcessor.from_pretrained(CLIP_MODEL_NAME, local_files_only=False)
-                    print(f"✓ CLIP 模型和處理器從網路載入完成")
-                    
-                    # 恢復原始超時設置
-                    if original_timeout is not None and hasattr(requests.adapters, 'DEFAULT_TIMEOUT'):
-                        requests.adapters.DEFAULT_TIMEOUT = original_timeout
-                except Exception as network_e:
-                    print(f"⚠️  CLIP 模型網路載入也失敗: {type(network_e).__name__}: {str(network_e)[:200]}")
-                    # 不拋出異常，讓應用繼續運行，但模型為 None
-                    _clip_model = None
-                    _clip_processor = None
-                    print("⚠️  CLIP 功能將無法使用（無法從緩存或網路載入模型），但應用可以繼續運行")
-                    print("⚠️  建議：檢查網路連線或確保模型緩存完整")
-        except ImportError:
-            print("--- [WARNING] transformers 未安裝，CLIP 功能將無法使用 ---")
-            _clip_model = None
-            _clip_processor = None
-        except Exception as e:
-            print(f"⚠️  Failed to load CLIP model: {e}")
-            import traceback
-            traceback.print_exc()
-            _clip_model = None
-            _clip_processor = None
-            print("⚠️  CLIP 功能將無法使用，但應用可以繼續運行")
-    return _clip_model, _clip_processor
+from src.core.model_loader import (
+    get_embedding_model, get_clip_model, get_reid_model, get_yolo_model
+)
 
 def generate_image_embedding(image_path: str) -> Optional[List[float]]:
     """
@@ -366,24 +285,7 @@ app.mount("/segment", StaticFiles(directory="segment"), name="segment")
 # ================== 小工具 ==================
 
 #從網路下載影片
-def _download_to_temp(url: str) -> str:
-  """
-  從網路下載影片並存到暫存資料夾 (/tmp 或類似位置)。
-  使用了 stream=True 和分塊寫入 (1024*1024 bytes)，這是為了防止下載超大影片時把記憶體塞爆。
-  """
-  r = requests.get(url, stream=True, timeout=600)
-  r.raise_for_status()
-  suffix = Path(url).suffix or ".mp4"
-  fd, path = tempfile.mkstemp(prefix="up_", suffix=suffix)
-  with os.fdopen(fd, "wb") as f:
-      for chunk in r.iter_content(1024*1024):
-          if chunk: f.write(chunk)
-  return path
-
-# 轉成人類可讀的時間 ex: 把 3665.5 秒轉成 01:01:05
-def _fmt_hms(sec: float) -> str:
-    h = int(sec // 3600); m = int((sec % 3600) // 60); s = int(sec % 60)
-    return f"{h:02d}:{m:02d}:{s:02d}"
+# --- Utils moved to src.utils ---
 
 # 精確查詢影片的總秒數。
 def _probe_duration_seconds(path: str) -> float:
@@ -819,28 +721,6 @@ def infer_segment_qwen(
     # 回傳格式、形容的句子
     return frame_obj, summary_txt
 
-# label 傳要偵測的目標，every_sec 是取樣頻率，score_thr 是信心門檻
-def infer_segment_owl(seg_path: str, labels: str, every_sec: float, score_thr: float) -> Dict:
-    with open(seg_path,"rb") as f:
-        files={"file":(os.path.basename(seg_path), f, "video/mp4")}
-        data={"every_sec":str(every_sec),"score_threshold":str(score_thr),"prompts":labels}
-        try:
-            r=requests.post(OWL_VIDEO_URL, files=files, data=data, timeout=3600)
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.HTTPError as e:
-            if r.status_code == 503:
-                error_detail = r.json().get("error", "Service Unavailable") if r.text else "Service Unavailable"
-                raise RuntimeError(
-                    f"OWL API 模型未載入 (503): {error_detail}\n"
-                    f"原因：無法從 Hugging Face 下載模型，網絡連接失敗。\n"
-                    f"解決方案：\n"
-                    f"  1. 檢查網絡連接：docker compose exec owl-api python -c \"import requests; requests.get('https://huggingface.co', timeout=10)\"\n"
-                    f"  2. 等待網絡恢復後，模型會自動在後台下載\n"
-                    f"  3. 或使用其他模型類型：將 model_type 改為 'qwen' 或 'gemini'"
-                ) from e
-            raise
-
 # YOLO-World 物件偵測（本地模型）
 _yolo_world_model = None
 def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: float) -> Dict:
@@ -1161,7 +1041,7 @@ class SegmentAnalysisRequest(BaseModel):
     end_time: float = 0.0
 
     # 模型設定
-    model_type: str # 'qwen', 'gemini', 'owl'
+    model_type: str # 'qwen', 'gemini', 'yolo'
     qwen_model: str = "qwen2.5-vl:7b"
     frames_per_segment: int = 8
     target_short: int = 720
@@ -1170,11 +1050,6 @@ class SegmentAnalysisRequest(BaseModel):
     # Prompt
     event_detection_prompt: str
     summary_prompt: str
-
-    # OWL 參數
-    owl_labels: Optional[str] = None
-    owl_every_sec: float = 2.0
-    owl_score_thr: float = 0.15
 
     # YOLO 參數
     yolo_labels: Optional[str] = None
@@ -1340,9 +1215,6 @@ def _segment_pipeline_multipart_legacy(
     target_short: int = Form(720),
     sampling_fps: Optional[float] = Form(None),  # 新增：取樣 FPS（如果提供則嚴格遵循）
     strict_segmentation: bool = Form(False),  # 新增：是否使用嚴格切割模式
-    owl_labels: str = Form("person,pedestrian,motorcycle,car,bus,scooter,truck"),
-    owl_every_sec: float = Form(2.0),
-    owl_score_thr: float = Form(0.15),
     event_detection_prompt: str = Form(EVENT_DETECTION_PROMPT),
     summary_prompt: str = Form(SUMMARY_PROMPT),
     save_json: bool = Form(True),
@@ -1499,12 +1371,9 @@ def _segment_pipeline_multipart_legacy(
                 qwen_model=qwen_model,
                 frames_per_segment=frames_per_segment,
                 target_short=target_short,
-            sampling_fps=sampling_fps,  # 傳遞取樣 FPS
+                sampling_fps=sampling_fps,  # 傳遞取樣 FPS
                 event_detection_prompt=event_detection_prompt,
-                summary_prompt=summary_prompt,
-                owl_labels=owl_labels,
-                owl_every_sec=owl_every_sec,
-                owl_score_thr=owl_score_thr
+                summary_prompt=summary_prompt
             )
 
             # 3.3 【關鍵步驟】Call API

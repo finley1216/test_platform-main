@@ -58,8 +58,7 @@ const ModelConfig = ({
             onChange={(e) => onModelTypeChange(e.target.value)}
           >
             <option value="qwen">Qwen (Multimodal via Ollama)</option>
-            {/* <option value="gemini">Google Gemini (Cloud API)</option>
-            <option value="owl">OWL-V2 (Object Detection)</option> */}
+            {/* <option value="gemini">Google Gemini (Cloud API)</option> */}
           </select>
         </div>
 
