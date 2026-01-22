@@ -278,6 +278,26 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
         </div>
       </div>
 
+      {/* 診斷資訊 (Point 11) */}
+      {data.diagnostics && (
+        <div
+          style={{
+            background: "#1a1a1a",
+            padding: "12px 16px",
+            borderRadius: "8px",
+            border: "1px dashed #444",
+            marginBottom: "24px",
+            fontSize: "12px",
+            color: "#888",
+            display: "flex",
+            justifyContent: "space-between"
+          }}
+        >
+          <span>🔍 伺服器診斷: 記憶體增量 {data.diagnostics.mem_delta_mb}MB | {data.diagnostics.strict_mode ? "已開啟重編碼 (嚴格模式)" : "快速串流複製模式"}</span>
+          <span style={{ color: "#10b981" }}>● 系統健康</span>
+        </div>
+      )}
+
       {/* YOLO 標註影片顯示 */}
       {modelType === "yolo" && yoloOutput && yoloOutput.annotated_video && (
         <div

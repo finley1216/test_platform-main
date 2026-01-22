@@ -15,6 +15,7 @@ from sqlalchemy.orm import Session
 from src.main import (
     get_api_key, ADMIN_TOKEN, HAS_DB, get_db, VIDEO_LIB_DIR
 )
+from src.database import SessionLocal
 from src.config import config
 
 # 導入資料庫模型
@@ -62,19 +63,12 @@ def _get_video_lib_categories() -> Dict[str, List[str]]:
 @router.get("/v1/videos/list", dependencies=[Depends(get_api_key)])
 def list_videos():
     """獲取已上傳的影片列表（完全從資料庫讀取，確保與資料庫中的 video 欄位一致）"""
-    # 手動獲取 db session（避免條件表達式導致 FastAPI 路由失敗）
-    db = None
-    if HAS_DB:
-        try:
-            db = next(get_db())
-        except Exception as e:
-            print(f"--- [WARNING] 無法獲取資料庫連接: {e} ---")
-    
     videos = []
     events = _load_video_events()
     
     # 只從資料庫讀取影片列表
-    if HAS_DB and db:
+    if HAS_DB:
+        db = SessionLocal()
         try:
             # 從資料庫查詢所有不同的 video 值及其統計信息
             video_stats = db.query(
@@ -170,8 +164,8 @@ def list_videos():
                 videos.append(video_info)
         except Exception as e:
             print(f"Warning: Failed to load videos from database: {e}")
-            import traceback
-            traceback.print_exc()
+        finally:
+            db.close()
     
     # 按最後修改時間排序
     videos.sort(key=lambda x: x["last_modified"], reverse=True)
@@ -350,46 +344,51 @@ async def move_video_to_category(video_id: str, request: Request):
 @router.get("/v1/videos/{video_id:path}", dependencies=[Depends(get_api_key)])
 def get_video_info(video_id: str):
     """獲取特定影片的詳細信息（支持 segment 和 video_lib 兩個來源）"""
+    # 統一使用 config 中定義的目錄
+    from src.config import config
+    segment_base = config.SEGMENT_DIR
+    
     if "/" in video_id:
         category, video_name = video_id.split("/", 1)
         # 先檢查 segment 中是否有對應的處理結果（格式：{category}_{video_name}）
         stem = f"{category}_{video_name}"
-        seg_dir = Path("segment") / stem
+        seg_dir = segment_base / stem
         
         # 如果 segment 中有結果，優先使用 segment 的結果
-        if seg_dir.exists() and list(seg_dir.glob("*.json")):
-            events = _load_video_events()
-            event_info = events.get(video_id, {})
-            
+        if seg_dir.exists():
             json_files = list(seg_dir.glob("*.json"))
-            latest_json = max(json_files, key=lambda p: p.stat().st_mtime)
-            try:
-                with open(latest_json, "r", encoding="utf-8") as f:
-                    video_data = json.load(f)
+            if json_files:
+                events = _load_video_events()
+                event_info = events.get(video_id, {})
                 
-                # 檢查 video_lib 中是否有原始影片
-                video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
-                if not video_path.exists():
-                    for ext in ['.avi', '.mov', '.mkv', '.flv']:
-                        video_path = VIDEO_LIB_DIR / category / f"{video_name}{ext}"
-                        if video_path.exists():
-                            break
-                
-                return {
-                    "video_id": video_id,
-                    "display_name": video_path.name if video_path.exists() else f"{video_name}.mp4",
-                    "source": "segment" if not video_path.exists() else "video_lib",
-                    "json_path": str(latest_json.relative_to(Path("."))),
-                    "analysis_data": video_data,
-                    "event_label": event_info.get("event_label"),  # 只使用實際設置的 event_label
-                    "event_description": event_info.get("event_description", ""),
-                    "event_set_by": event_info.get("set_by", ""),
-                    "event_set_at": event_info.get("set_at", ""),
-                    "category": category,
-                    "video_path": str(video_path.relative_to(VIDEO_LIB_DIR.parent)) if video_path.exists() else None,
-                }
-            except Exception as e:
-                raise HTTPException(status_code=500, detail=f"Failed to load video data: {e}")
+                latest_json = max(json_files, key=lambda p: p.stat().st_mtime)
+                try:
+                    with open(latest_json, "r", encoding="utf-8") as f:
+                        video_data = json.load(f)
+                    
+                    # 檢查 video_lib 中是否有原始影片
+                    video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
+                    if not video_path.exists():
+                        for ext in ['.avi', '.mov', '.mkv', '.flv']:
+                            video_path = VIDEO_LIB_DIR / category / f"{video_name}{ext}"
+                            if video_path.exists():
+                                break
+                    
+                    return {
+                        "video_id": video_id,
+                        "display_name": video_path.name if video_path.exists() else f"{video_name}.mp4",
+                        "source": "segment" if not video_path.exists() else "video_lib",
+                        "json_path": str(latest_json.relative_to(Path("."))),
+                        "analysis_data": video_data,
+                        "event_label": event_info.get("event_label"),  # 只使用實際設置的 event_label
+                        "event_description": event_info.get("event_description", ""),
+                        "event_set_by": event_info.get("set_by", ""),
+                        "event_set_at": event_info.get("set_at", ""),
+                        "category": category,
+                        "video_path": str(video_path.relative_to(VIDEO_LIB_DIR.parent)) if video_path.exists() else None,
+                    }
+                except Exception as e:
+                    raise HTTPException(status_code=500, detail=f"Failed to load video data: {e}")
         
         # 如果 segment 中沒有，檢查 video_lib
         video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
@@ -441,20 +440,66 @@ def get_video_info(video_id: str):
                 "video_path": str(video_path.relative_to(VIDEO_LIB_DIR.parent)),
             }
     else:
-        seg_dir = Path("segment") / video_id
-        if not seg_dir.exists():
+        seg_dir = segment_base / video_id
+        
+        # 1. 優先嘗試從資料庫抓取最新結果
+        db_results = []
+        if HAS_DB:
+            db = SessionLocal()
+            try:
+                # 抓取該影片最近的 50 筆片段
+                summaries = db.query(Summary).filter(
+                    Summary.video == video_id
+                ).order_by(Summary.start_timestamp.desc()).limit(50).all()
+                
+                for s in summaries:
+                    # 模擬 AnalysisService 的回傳格式
+                    db_results.append({
+                        "video": s.video,
+                        "segment": s.segment,
+                        "time_range": s.time_range,
+                        "success": True,
+                        "parsed": {
+                            "summary_independent": s.message,
+                            "frame_analysis": {
+                                "events": {
+                                    "fire": s.fire,
+                                    "water_flood": s.water_flood,
+                                    "person_fallen": s.person_fallen_unmoving,
+                                    "double_parking": s.double_parking_lane_block,
+                                    "smoking": s.smoking_outside_zone,
+                                    "crowd": s.crowd_loitering,
+                                    "security_door": s.security_door_tamper,
+                                    "abnormal_attire": s.abnormal_attire_face_cover_at_entry
+                                }
+                            }
+                        }
+                    })
+            except Exception as e:
+                print(f"--- [DEBUG] Failed to fetch RTSP results from DB: {e} ---")
+            finally:
+                db.close()
+
+        # 2. 如果有資料庫結果，優先使用
+        video_data = {"results": db_results} if db_results else None
+        json_path = None
+        
+        # 3. 如果資料庫沒結果，再看有沒有實體 JSON (相容舊流程)
+        if not video_data:
+            json_files = list(seg_dir.glob("*.json"))
+            if json_files:
+                latest_json = max(json_files, key=lambda p: p.stat().st_mtime)
+                try:
+                    with open(latest_json, "r", encoding="utf-8") as f:
+                        video_data = json.load(f)
+                    json_path = str(latest_json.relative_to(Path(".")))
+                except Exception as e:
+                    print(f"--- [DEBUG] Failed to load JSON for {video_id}: {e} ---")
+        
+        if not seg_dir.exists() and not db_results:
+            # [DEBUG] 記錄 404 原因
+            print(f"--- [DEBUG] video_info 404: {seg_dir} does not exist and no DB records ---")
             raise HTTPException(status_code=404, detail=f"Video {video_id} not found")
-        
-        json_files = list(seg_dir.glob("*.json"))
-        if not json_files:
-            raise HTTPException(status_code=404, detail=f"No analysis result found for {video_id}")
-        
-        latest_json = max(json_files, key=lambda p: p.stat().st_mtime)
-        try:
-            with open(latest_json, "r", encoding="utf-8") as f:
-                video_data = json.load(f)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"Failed to load video data: {e}")
         
         events = _load_video_events()
         event_info = events.get(video_id, {})
@@ -462,8 +507,8 @@ def get_video_info(video_id: str):
         return {
             "video_id": video_id,
             "display_name": video_id,
-            "source": "segment",
-            "json_path": str(latest_json.relative_to(Path("."))),
+            "source": "database" if db_results else "segment",
+            "json_path": json_path,
             "analysis_data": video_data,
             "event_label": event_info.get("event_label"),
             "event_description": event_info.get("event_description", ""),

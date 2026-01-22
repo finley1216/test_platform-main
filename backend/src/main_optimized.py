@@ -45,30 +45,15 @@ def infer_segment_yolo_optimized(
     返回:
     - Dict: 包含偵測結果和物件切片（內存中）的字典
     """
-    # 使用傳入的模型或全局模型（延遲導入避免循環依賴）
+    # 使用傳入的模型或從 model_loader 獲取
     if yolo_model is None:
         try:
-            from src.main import _yolo_world_model
-            yolo_model = _yolo_world_model
+            from src.core.model_loader import get_yolo_model
+            yolo_model = get_yolo_model()
             if yolo_model is None:
-                # 嘗試初始化模型
-                print("--- [YOLO Optimized] 模型未初始化，嘗試初始化 ---")
-                try:
-                    from ultralytics import YOLOWorld
-                    import os
-                    local_model_path = '/app/models/yolov8s-world.pt'
-                    if os.path.exists(local_model_path):
-                        yolo_model = YOLOWorld(local_model_path)
-                    else:
-                        yolo_model = YOLOWorld('yolov8s-world.pt')
-                    # 更新全局模型
-                    import src.main as main_module
-                    main_module._yolo_world_model = yolo_model
-                    print("--- [YOLO Optimized] 模型初始化完成 ---")
-                except Exception as init_e:
-                    raise RuntimeError(f"YOLO 模型初始化失敗: {init_e}") from init_e
+                raise RuntimeError("YOLO 模型載入失敗")
         except ImportError:
-            raise RuntimeError("無法導入 YOLO 模型，請確保 main.py 已正確初始化")
+            raise RuntimeError("無法導入 YOLO 模型，請確保 model_loader.py 已正確初始化")
     
     # 解析標籤
     labels_list = [l.strip() for l in labels.split(",") if l.strip()]
@@ -220,7 +205,7 @@ def infer_segment_yolo_optimized(
         try:
             # 只在 ReID 模型可用時才生成 embeddings（避免網路問題導致卡住）
             if reid_model is None or reid_device is None:
-                from src.main import get_reid_model
+                from src.core.model_loader import get_reid_model
                 reid_model, reid_device = get_reid_model()
             
             # 如果 ReID 模型仍然不可用，跳過（不阻塞處理）
@@ -417,6 +402,9 @@ def process_segment_optimized(
         sampling_fps=sampling_fps,
         event_detection_prompt=event_detection_prompt,
         summary_prompt=summary_prompt,
+        owl_labels="",  # 不使用 OWL
+        owl_every_sec=0,
+        owl_score_thr=0,
         yolo_labels=yolo_labels,
         yolo_every_sec=yolo_every_sec,
         yolo_score_thr=yolo_score_thr

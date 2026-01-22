@@ -175,9 +175,9 @@ async def rag_search(
         raise HTTPException(status_code=500, detail=f"Failed to generate embedding: {e}")
 
     # 3. 執行資料庫查詢
+    from src.database import SessionLocal
+    db = SessionLocal()
     try:
-        db = next(get_db())
-        
         # 使用 pgvector 的 <-> 運算符（L2 距離）或 <=>（餘弦相似度）
         # 這裡我們使用 1 - (embedding <=> query_vector) 來獲得餘弦相似度分數
         similarity = (1 - Summary.embedding.cosine_distance(query_vector)).label("similarity")
@@ -284,6 +284,8 @@ async def rag_search(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=f"Search failed: {e}")
+    finally:
+        db.close()
 
 @router.post("/rag/answer")
 async def rag_answer(

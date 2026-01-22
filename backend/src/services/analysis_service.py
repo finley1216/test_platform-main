@@ -25,6 +25,33 @@ try:
 except ImportError:
     HAS_GEMINI = False
 
+# [全局修復] 確保所有 ReID 模型都使用 FP32
+def _ensure_reid_model_fp32(reid_model, reid_device):
+    """強制將 ReID 模型轉換為 FP32，避免 c10::Half != float 錯誤"""
+    if reid_model is None:
+        return None
+    try:
+        first_param = next(reid_model.parameters())
+        if first_param.dtype == torch.float16:
+            print("--- [AnalysisService] 檢測到 ReID 模型為 FP16，強制轉換為 FP32 ---")
+            reid_model = reid_model.float()
+            if reid_device:
+                reid_model = reid_model.to(reid_device)
+            reid_model.eval()
+        else:
+            # 即使已經是 FP32，也確保在正確設備上
+            if reid_device:
+                reid_model = reid_model.to(reid_device)
+            reid_model.eval()
+    except (StopIteration, AttributeError) as e:
+        # 如果無法檢查，直接轉換為 FP32
+        print(f"--- [AnalysisService] 無法檢查 ReID 模型類型，強制轉換為 FP32: {e} ---")
+        reid_model = reid_model.float()
+        if reid_device:
+            reid_model = reid_model.to(reid_device)
+        reid_model.eval()
+    return reid_model
+
 class AnalysisService:
     @staticmethod
     def infer_segment_qwen(
@@ -145,29 +172,92 @@ class AnalysisService:
 
     @staticmethod
     def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=None, reid_device=None) -> List[Optional[List[float]]]:
-        """批量生成 ReID embeddings"""
-        if not reid_model:
-            reid_model, reid_device = get_reid_model()
-        if not reid_model or not crop_images:
+        """
+        批量生成 ReID embeddings (強制 FP32 版本)
+        確保模型與輸入都使用 FP32，徹底解決 c10::Half != float 錯誤。
+        """
+        if not crop_images:
+            return []
+
+        # 1. 確保模型與設備存在
+        if reid_model is None:
+            from src.core.model_loader import get_reid_model
+            reid_model, device_str = get_reid_model()
+            if reid_device is None:
+                reid_device = device_str
+        
+        if reid_model is None:
+            print("--- [AnalysisService] Warning: ReID model is None ---")
             return [None] * len(crop_images)
 
         try:
-            # 1. 預處理所有圖片
-            batch_tensors = []
-            for img_np in crop_images:
-                img_resized = cv2.resize(img_np, (128, 256))
-                img_t = torch.from_numpy(img_resized).permute(2, 0, 1).float().div(255)
-                batch_tensors.append(img_t)
+            import torch
+            import cv2
+            import numpy as np
             
-            # 2. 合併為 Batch Tensor
-            input_batch = torch.stack(batch_tensors).to(reid_device)
-            
-            # 3. 一次性推論
+            # 2. 【關鍵】強制模型為 FP32
+            reid_model = reid_model.float()
+            if reid_device:
+                reid_model = reid_model.to(reid_device)
+            reid_model.eval()
+
+            # 3. 批量預處理 (ImageNet 正規化)
+            processed_tensors = []
+            valid_indices = []
+
+            for i, img in enumerate(crop_images):
+                if img is None or img.size == 0:
+                    continue
+                try:
+                    # BGR -> RGB
+                    img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                    # Resize 到 ReID 標準大小 (W=128, H=256)
+                    img = cv2.resize(img, (128, 256))
+                    # 轉為 Float32 並歸一化到 [0, 1]
+                    img = img.astype(np.float32) / 255.0
+                    # ImageNet Mean/Std Normalize
+                    # Mean: [0.485, 0.456, 0.406], Std: [0.229, 0.224, 0.225]
+                    mean = np.array([0.485, 0.456, 0.406])
+                    std = np.array([0.229, 0.224, 0.225])
+                    img = (img - mean) / std
+                    # HWC -> CHW (PyTorch 格式)
+                    img = img.transpose(2, 0, 1)
+                    
+                    # 轉為 Tensor
+                    tensor = torch.from_numpy(img)
+                    processed_tensors.append(tensor)
+                    valid_indices.append(i)
+                except Exception as e:
+                    print(f"--- [ReID] Preprocessing error: {e} ---")
+
+            if not processed_tensors:
+                return [None] * len(crop_images)
+
+            # 4. 堆疊並轉型為 FP32
+            batch_tensor = torch.stack(processed_tensors)
+            if reid_device:
+                batch_tensor = batch_tensor.to(reid_device, dtype=torch.float32)
+            else:
+                batch_tensor = batch_tensor.type(torch.float32)
+
+            # 5. 推論
             with torch.no_grad():
-                features = reid_model(input_batch)
-                return features.cpu().tolist()
+                features = reid_model(batch_tensor)
+                # L2 Normalize
+                features = torch.nn.functional.normalize(features, p=2, dim=1)
+                embeddings = features.cpu().numpy()
+
+            # 6. 整理結果
+            result = [None] * len(crop_images)
+            for idx, valid_idx in enumerate(valid_indices):
+                result[valid_idx] = embeddings[idx].tolist()
+            
+            return result
+
         except Exception as e:
-            print(f"--- [ReID] ✗ 批量處理失敗: {e} ---")
+            print(f"--- [AnalysisService] Batch ReID failed: {e} ---")
+            import traceback
+            traceback.print_exc()
             return [None] * len(crop_images)
 
     @staticmethod
@@ -223,15 +313,20 @@ class AnalysisService:
             yolo_score_thr = req.yolo_score_thr if hasattr(req, 'yolo_score_thr') else 0.25
             
             print(f"--- [AnalysisService] 執行 YOLO+ReID 正常流程 (Labels: {yolo_labels}) ---")
-            yolo_res = AnalysisService.infer_segment_yolo(
-                p, 
-                labels=yolo_labels,
-                every_sec=yolo_every_sec,
-                score_thr=yolo_score_thr
-            )
-            
-            # [修正] 必須包裝在 "yolo" key 下，後端資料庫保存邏輯才能抓到
-            result["raw_detection"] = {"yolo": yolo_res}
+            try:
+                yolo_res = AnalysisService.infer_segment_yolo(
+                    p, 
+                    labels=yolo_labels,
+                    every_sec=yolo_every_sec,
+                    score_thr=yolo_score_thr
+                )
+                # [修正] 必須包裝在 "yolo" key 下，後端資料庫保存邏輯才能抓到
+                result["raw_detection"] = {"yolo": yolo_res}
+            except Exception as yolo_err:
+                error_msg = str(yolo_err)
+                print(f"--- [AnalysisService] YOLO 處理失敗: {error_msg} ---")
+                result["raw_detection"] = {"yolo": None}
+                result["error"] = error_msg  # 保留原有錯誤，同時記錄 YOLO 錯誤
             
             # 如果原本不是 Qwen/Gemini，則根據 YOLO 結果決定 success
             if req.model_type == "yolo":
@@ -327,18 +422,56 @@ class AnalysisService:
     @staticmethod
     def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: float, batch_size: int = 16) -> Dict:
         """使用 YOLO-World 進行物件偵測並執行 FastReID 提取特徵，同時儲存物件切片"""
+        
+        # 1. 獲取模型
         model = get_yolo_model()
-        if not model: raise RuntimeError("YOLO 模型未載入")
+        if not model: 
+            # 嘗試強制重載一次
+            from src.core.model_loader import get_yolo_model as retry_get_yolo
+            print("--- [AnalysisService] YOLO model not found, retrying... ---")
+            model = retry_get_yolo()
+            if not model:
+                return {"error": "YOLO model failed to load", "detections": []}
         
         reid_model, reid_device = get_reid_model()
         
-        # 準備儲存切片的目錄
+        # 準備目錄
         seg_dir = Path(seg_path).parent
         crops_dir = seg_dir / "yolo_output" / "object_crops"
         crops_dir.mkdir(parents=True, exist_ok=True)
         
         labels_list = [l.strip() for l in labels.split(",") if l.strip()] or ["person", "car"]
-        model.set_classes(labels_list)
+        
+        # 2. 安全設定類別
+        try:
+            model.set_classes(labels_list)
+        except AttributeError as e:
+            error_msg = str(e)
+            # 捕獲 'NoneType' object has no attribute 'names' 錯誤
+            if "'NoneType' object has no attribute 'names'" in error_msg or "'NoneType' object has no attribute" in error_msg:
+                print(f"--- [YOLO Error] 模型載入成功但內部結構損壞 ({error_msg})，強制重載... ---")
+                # 清空全域變數並重載
+                import src.core.model_loader
+                src.core.model_loader._yolo_world_model = None
+                model = src.core.model_loader.get_yolo_model()
+                if model:
+                    try:
+                        model.set_classes(labels_list)
+                        print("--- [YOLO] 模型重載成功，set_classes 執行完成 ---")
+                    except Exception as e2:
+                        print(f"--- [YOLO Error] 重載後仍然失敗: {e2} ---")
+                        return {"error": "YOLO model broken and reload failed", "detections": []}
+                else:
+                    print("--- [YOLO Error] 模型重載失敗，無法獲取模型實例 ---")
+                    return {"error": "YOLO model broken and reload failed", "detections": []}
+            else:
+                # 其他 AttributeError，直接返回錯誤
+                print(f"--- [YOLO Error] AttributeError in set_classes: {e} ---")
+                return {"error": f"YOLO set_classes failed: {str(e)}", "detections": []}
+        except Exception as e:
+            # 捕獲其他可能的錯誤
+            print(f"--- [YOLO Error] Unexpected error in set_classes: {e} ---")
+            return {"error": f"YOLO set_classes failed: {str(e)}", "detections": []}
         
         cap = cv2.VideoCapture(seg_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
@@ -369,8 +502,32 @@ class AnalysisService:
             if not batch_frames:
                 continue
                 
-            # YOLO 批次推論
-            batch_predict_res = model.predict(batch_frames, conf=score_thr, verbose=False)
+            # YOLO 批次推論 (加入錯誤處理)
+            try:
+                batch_predict_res = model.predict(batch_frames, conf=score_thr, verbose=False)
+            except Exception as predict_err:
+                error_msg = str(predict_err)
+                print(f"--- [YOLO Error] Predict failed: {error_msg} ---")
+                # 如果是 'names' 相關錯誤，嘗試重載模型
+                if "names" in error_msg.lower():
+                    print("--- [YOLO] Attempting model reload due to names error... ---")
+                    import src.core.model_loader
+                    src.core.model_loader._yolo_world_model = None
+                    model = src.core.model_loader.get_yolo_model()
+                    if model:
+                        try:
+                            model.set_classes(labels_list)
+                            # 重試一次推論
+                            batch_predict_res = model.predict(batch_frames, conf=score_thr, verbose=False)
+                        except Exception as retry_err:
+                            print(f"--- [YOLO Error] Retry failed: {retry_err} ---")
+                            continue  # 跳過這個批次
+                    else:
+                        print("--- [YOLO Error] Model reload failed, skipping batch ---")
+                        continue
+                else:
+                    # 其他類型的錯誤，跳過這個批次
+                    continue
             
             for idx, res in enumerate(batch_predict_res):
                 fi = valid_idxs[idx]

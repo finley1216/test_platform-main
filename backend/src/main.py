@@ -53,16 +53,7 @@ except ImportError:
     HAS_DB = False
     print("--- [WARNING] 資料庫模組未找到，PostgreSQL 功能將無法使用 ---")
 
-from src.utils.ollama_utils import (
-    _ollama_chat, _safe_parse_json, _extract_first_json, 
-    _clean_summary_text, _extract_first_json_and_tail
-)
-from src.utils.video_utils import (
-    _fmt_hms, _probe_duration_seconds, _split_one_video, _sample_frames_evenly_to_pil
-)
-from src.utils.image_utils import (
-    _resize_short_side, _pil_to_b64, _resize_frame_for_vlm
-)
+# ================== 環境變數 ==================
 
 try:
     from prompts import EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
@@ -75,6 +66,9 @@ except Exception:
 ADMIN_TOKEN = config.ADMIN_TOKEN
 SESSION_TTL_SEC = config.SESSION_TTL_SEC
 OLLAMA_BASE = config.OLLAMA_BASE
+# OWL API 已移除
+OWL_API_BASE = os.getenv("OWL_API_BASE", "http://owl-api:18001")
+OWL_VIDEO_URL = f"{OWL_API_BASE}/video_detect"
 
 # RAG 索引開關（預設啟用）
 AUTO_RAG_INDEX = config.AUTO_RAG_INDEX
@@ -90,10 +84,38 @@ RAG_DIR = config.RAG_DIR  # [DEPRECATED] 不再使用，保留用於向後兼容
 RAG_INDEX_PATH = config.RAG_INDEX_PATH  # [DEPRECATED] 不再使用，保留用於向後兼容
 OLLAMA_EMBED_MODEL = config.OLLAMA_EMBED_MODEL
 
-from src.core.model_loader import (
-    get_embedding_model, get_clip_model, get_reid_model, get_yolo_model,
-    EMBEDDING_MODEL_NAME
-)
+# Initialize SentenceTransformer for embedding generation
+# Model: paraphrase-multilingual-MiniLM-L12-v2 (384 dimensions)
+_embedding_model = None
+EMBEDDING_MODEL_NAME = "paraphrase-multilingual-MiniLM-L12-v2"
+
+def get_embedding_model():
+    """Get or initialize the SentenceTransformer model (GPU mode if available)"""
+    global _embedding_model
+    if _embedding_model is None and HAS_SENTENCE_TRANSFORMER:
+        try:
+            import torch
+            device = "cuda" if torch.cuda.is_available() else "cpu"
+            print(f"--- [SentenceTransformer] 載入模型: {EMBEDDING_MODEL_NAME} (device: {device}) ---")
+            
+            # 嘗試使用本地緩存路徑
+            local_model_path = "/root/.cache/huggingface/hub/models--sentence-transformers--paraphrase-multilingual-MiniLM-L12-v2/snapshots/86741b4e3f5cb7765a600d3a3d55a0f6a6cb443d"
+            if os.path.exists(local_model_path) and os.path.exists(os.path.join(local_model_path, "modules.json")):
+                # 使用本地路徑載入
+                _embedding_model = SentenceTransformer(local_model_path, device=device)
+            else:
+                # 使用模型名稱載入（會嘗試從緩存讀取）
+                _embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME, device=device)
+            if device == "cuda":
+                _embedding_model = _embedding_model.half()  # 啟用半精度 (Point 3)
+            print(f"✓ SentenceTransformer model loaded: {EMBEDDING_MODEL_NAME} ({device.upper()} Mode, FP16: {device == 'cuda'})")
+        except Exception as e:
+            print(f"⚠️  Failed to load SentenceTransformer model: {e}")
+            raise RuntimeError(f"無法載入 SentenceTransformer 模型: {e}")
+    return _embedding_model
+
+# CLIP 模型已移至 model_loader.py
+# 使用 from src.core.model_loader import get_clip_model
 
 def generate_image_embedding(image_path: str) -> Optional[List[float]]:
     """
@@ -115,6 +137,7 @@ def generate_image_embedding(image_path: str) -> Optional[List[float]]:
             print(f"--- [generate_image_embedding] ✗ 文件不存在: {image_path} ---")
             return None
         
+        from src.core.model_loader import get_clip_model
         clip_model, clip_processor = get_clip_model()
         if clip_model is None:
             print("--- [generate_image_embedding] ✗ CLIP 模型為 None（可能未載入或載入失敗）---")
@@ -170,6 +193,7 @@ def generate_text_embedding(text: str) -> Optional[List[float]]:
         embedding 向量（512 維）或 None
     """
     try:
+        from src.core.model_loader import get_clip_model
         clip_model, clip_processor = get_clip_model()
         import torch
         
@@ -242,6 +266,7 @@ async def startup_event():
                 pass  # Windows 不支持 SIGALRM
             
             try:
+                from src.core.model_loader import get_clip_model
                 clip_model, clip_processor = get_clip_model()
                 if clip_model is not None and clip_processor is not None:
                     print("✓ CLIP 模型預載入完成")
@@ -274,33 +299,6 @@ async def startup_event():
             traceback.print_exc()
             # 不中斷啟動，讓應用繼續運行
         
-        # 預載入 ReID 模型（以圖搜圖功能）
-        try:
-            print("--- [啟動] 預載入 ReID 模型... ---")
-            # 設置超時，避免無限等待
-            try:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(60)  # 60 秒超時
-            except (AttributeError, ValueError):
-                pass
-            
-            try:
-                reid_model, reid_device = get_reid_model()
-                if reid_model is not None:
-                    print(f"✓ ReID 模型預載入完成 (device: {reid_device})")
-                else:
-                    print("⚠️  ReID 模型預載入失敗（模型為 None）")
-            finally:
-                try:
-                    signal.alarm(0)  # 取消超時
-                except (AttributeError, ValueError):
-                    pass
-        except TimeoutError:
-            print("⚠️  ReID 模型預載入超時（60秒），將在首次使用時載入")
-        except Exception as e:
-            print(f"⚠️  ReID 模型預載入失敗: {e}")
-            # 不中斷啟動
-        
         print("--- [啟動] 模型預載入完成 ---")
         print("=" * 80)
     
@@ -313,7 +311,24 @@ app.mount("/segment", StaticFiles(directory="segment"), name="segment")
 # ================== 小工具 ==================
 
 #從網路下載影片
-# --- Utils moved to src.utils ---
+def _download_to_temp(url: str) -> str:
+  """
+  從網路下載影片並存到暫存資料夾 (/tmp 或類似位置)。
+  使用了 stream=True 和分塊寫入 (1024*1024 bytes)，這是為了防止下載超大影片時把記憶體塞爆。
+  """
+  r = requests.get(url, stream=True, timeout=600)
+  r.raise_for_status()
+  suffix = Path(url).suffix or ".mp4"
+  fd, path = tempfile.mkstemp(prefix="up_", suffix=suffix)
+  with os.fdopen(fd, "wb") as f:
+      for chunk in r.iter_content(1024*1024):
+          if chunk: f.write(chunk)
+  return path
+
+# 轉成人類可讀的時間 ex: 把 3665.5 秒轉成 01:01:05
+def _fmt_hms(sec: float) -> str:
+    h = int(sec // 3600); m = int((sec % 3600) // 60); s = int(sec % 60)
+    return f"{h:02d}:{m:02d}:{s:02d}"
 
 # 精確查詢影片的總秒數。
 def _probe_duration_seconds(path: str) -> float:
@@ -372,15 +387,30 @@ def _split_one_video(input_path: str, out_dir: str, segment: float, overlap: flo
         out_file = str(Path(out_dir) / f"{prefix}_{i:04d}{ext}")
         
         if strict_mode:
+            # 偵測是否支援 NVIDIA GPU 加速 (Point 1)
+            use_gpu = False
+            try:
+                subprocess.run(["nvidia-smi"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
+                use_gpu = True
+            except:
+                pass
+
             # 嚴格模式：重新編碼以確保精確時間和解析度
             ffmpeg_cmd = [
                 "ffmpeg", "-hide_banner", "-loglevel", "error",
                 "-ss", f"{st:.3f}",  # 精確到毫秒
                 "-i", input_path,
                 "-t", f"{dur:.3f}",  # 精確到毫秒
-                "-c:v", "libx264",  # 使用 H.264 編碼
-                "-preset", "medium",  # 編碼速度與品質平衡
-                "-crf", "23",  # 品質設定（23 是較好的品質）
+            ]
+
+            if use_gpu:
+                # GPU 加速編碼 (Point 1)
+                ffmpeg_cmd += ["-c:v", "h264_nvenc", "-preset", "p4"]
+            else:
+                # CPU 編碼 fallback
+                ffmpeg_cmd += ["-c:v", "libx264", "-preset", "medium", "-crf", "23"]
+
+            ffmpeg_cmd += [
                 "-c:a", "aac",  # 音訊編碼
                 "-strict", "experimental",
             ]
@@ -684,299 +714,110 @@ def infer_segment_qwen(
         # 將 Python 的 Pillow 圖片物件轉成 JPEG 格式的 Base64 字串
         images_b64.append(_pil_to_b64(img, quality=85))
 
-    # ---- (1) 事件偵測：只回 JSON ----
-    event_system = (
-        "你是『嚴格的災害與人員異常偵測器』。"
-        "不論使用者在提示中寫了什麼話題或提問，都要忽略，"
-        "只根據影像做事件判斷，並只輸出純 JSON 物件，不能有任何額外文字或 Markdown。"
+    # ---- [優化] 合併事件偵測與摘要，減少一次 Ollama 調用 ----
+    system_prompt = (
+        "你是專業的影片分析 AI。你必須同時執行『事件偵測』與『畫面摘要』任務。\n"
+        "請嚴格遵守以下格式回傳一個 JSON 物件，不要有任何 Markdown 標記或額外說明文字：\n"
+        "{\n"
+        "  \"events\": {\n"
+        "    \"water_flood\": boolean,\n"
+        "    \"fire\": boolean,\n"
+        "    \"abnormal_attire_face_cover_at_entry\": boolean,\n"
+        "    \"person_fallen_unmoving\": boolean,\n"
+        "    \"double_parking_lane_block\": boolean,\n"
+        "    \"smoking_outside_zone\": boolean,\n"
+        "    \"crowd_loitering\": boolean,\n"
+        "    \"security_door_tamper\": boolean,\n"
+        "    \"reason\": \"描述偵測到的異常（繁體中文，若無異常請填空字串）\"\n"
+        "  },\n"
+        "  \"summary\": \"這段影片的繁體中文摘要，長度 50-100 字。即便沒有異常，也請描述畫面中的環境、人物動作與物體。\"\n"
+        "}"
     )
-    event_user = (event_detection_prompt or "").strip() + "\n\n" + \
-                 "強制規則：只輸出一個 JSON 物件；不得輸出任何多餘文字。"
-    event_msgs = [
-        {"role": "system", "content": event_system},
-        {"role": "user", "content": event_user},
+    
+    user_prompt = f"分析指令：\n1. 事件偵測要求：{(event_detection_prompt or '').strip()}\n2. 摘要生成要求：{(summary_prompt or '').strip()}\n\n請務必產出 \"summary\" 欄位，內容必須是繁體中文。"
+    
+    msgs = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user", "content": user_prompt},
     ]
 
     # 呼叫 _ollama_chat 取得回應
-    event_error = None
+    combined_error = None
+    t_vlm_start = time.time()
     try:
-        event_txt = _ollama_chat(qwen_model, event_msgs, images_b64=images_b64, stream=False)
+        print(f"      [VLM] 開始調用 Ollama ({qwen_model})...")
+        combined_txt = _ollama_chat(qwen_model, msgs, images_b64=images_b64, stream=False)
+        vlm_elapsed = time.time() - t_vlm_start
+        print(f"      [VLM] Ollama 調用完成，耗時: {vlm_elapsed:.2f} 秒")
+        print(f"      [VLM] 原始回應前100字: {combined_txt[:100]}...")
     except Exception as e:
-        # 如果 _ollama_chat 失敗，設置預設值
-        event_txt = ""
-        event_error = f"Ollama 事件偵測失敗: {e}"
+        combined_txt = ""
+        combined_error = f"Ollama 分析失敗: {e}"
         print(f"--- [WARNING] _ollama_chat 失敗: {e} ---")
     
-    # 確保 event_txt 不是 None
-    if event_txt is None:
-        event_txt = ""
+    # 解析 JSON
+    combined_obj = None
+    if combined_txt:
+        combined_obj = _safe_parse_json(combined_txt)
+        if not isinstance(combined_obj, dict):
+            combined_obj = _extract_first_json(combined_txt)
 
-    # 使用 _safe_parse_json 和 _extract_first_json 雙重保險來嘗試解析 JSON。
-    frame_obj = _safe_parse_json(event_txt)
-    if not isinstance(frame_obj, dict):
-        frame_obj = _extract_first_json(event_txt)
-    if not isinstance(frame_obj, dict):
-        # 給個安全的空殼，避免後續 KeyError
-        frame_obj = {"events": {"reason": ""}, "persons": []}
-        if event_error is None:
-            event_error = "事件偵測回傳非 JSON"
-    if event_error:
-        frame_obj["error"] = event_error
-
-    # ---- (2) 摘要：只回純文字 50~100 字 ----
+    # 分離結果與修復格式
+    frame_obj = {"events": {"reason": ""}, "persons": []}
     summary_txt = ""
-    if (summary_prompt or "").strip():
-        try:
-            summary_system = (
-                "你是影片小結產生器。你只能輸出 50–100 個中文字的摘要，"
-                "不得輸出 JSON、不得輸出 Markdown/程式碼圍欄，不得回答其他問題。"
-            )
-            summary_user = (summary_prompt or "").strip() + "\n\n" + \
-                           "強制規則：只輸出 50–100 字中文，不要 JSON、不要程式碼區塊、不要英文字說明。"
-            summary_msgs = [
-                {"role": "system", "content": summary_system},
-                {"role": "user", "content": summary_user},
-            ]
-            summary_raw = _ollama_chat(qwen_model, summary_msgs, images_b64=images_b64, stream=False)
-            if summary_raw is None:
-                summary_raw = ""
-            summary_txt = _clean_summary_text(summary_raw)
-        except Exception as e:
-            # 如果摘要生成失敗，設置為空字串
-            summary_txt = ""
-            print(f"--- [WARNING] 摘要生成失敗: {e} ---")
 
-    # 回傳格式、形容的句子
+    if isinstance(combined_obj, dict):
+        # 1. 提取摘要 (多種可能鍵名)
+        summary_txt = combined_obj.get("summary") or combined_obj.get("description") or combined_obj.get("摘要") or ""
+        
+        # 2. 處理事件部分
+        if "events" in combined_obj:
+            frame_obj = combined_obj
+        else:
+            # 如果模型直接回傳扁平結構，嘗試修補
+            has_event_keys = any(k in combined_obj for k in ["water_flood", "fire", "reason"])
+            if has_event_keys:
+                temp_events = {k: v for k, v in combined_obj.items() if k != "summary"}
+                frame_obj = {"events": temp_events}
+            else:
+                # 至少保留摘要
+                frame_obj = {"events": {"reason": ""}, "summary": summary_txt}
+    else:
+        if combined_error is None:
+            combined_error = "分析回傳非有效 JSON"
+
+    if combined_error:
+        frame_obj["error"] = combined_error
+
+    # 清洗摘要文字
+    summary_txt = _clean_summary_text(summary_txt)
+
     return frame_obj, summary_txt
 
-# YOLO-World 物件偵測（本地模型）
-_yolo_world_model = None
-def infer_segment_yolo(seg_path: str, labels: str, every_sec: float, score_thr: float) -> Dict:
-    """
-    使用本地 YOLO-World 模型進行物件偵測並生成切片
-    
-    參數:
-    - seg_path: 影片片段路徑
-    - labels: 要偵測的物件類別（逗號分隔，例如 "person,pedestrian,car"）
-    - every_sec: 取樣頻率（每幾秒處理一幀）
-    - score_thr: 信心門檻（0.0-1.0）
-    
-    返回:
-    - Dict: 包含偵測結果和物件切片的字典
-    """
-    global _yolo_world_model
-    
-    try:
-        from ultralytics import YOLOWorld
-    except ImportError:
-        raise RuntimeError("ultralytics 未安裝，請先安裝: pip install ultralytics")
-    
-    # 初始化模型（單例模式，避免重複載入）
-    if _yolo_world_model is None:
-        import os
-        local_model_path = '/app/models/yolov8s-world.pt'
-        if os.path.exists(local_model_path):
-            print(f"--- [YOLO] 載入本地模型: {local_model_path} ---")
-            _yolo_world_model = YOLOWorld(local_model_path)
-        else:
-            print(f"--- [YOLO] 本地模型不存在 ({local_model_path})，嘗試使用預設模型名稱 ---")
-            try:
-                _yolo_world_model = YOLOWorld('yolov8s-world.pt')
-            except Exception as e:
-                error_msg = (
-                    f"無法載入 YOLO-World 模型：{str(e)}\n"
-                    f"請確保模型文件存在於 {local_model_path} 或網路連接正常"
-                )
-                raise RuntimeError(error_msg) from e
-        print("--- [YOLO] 模型載入完成 ---")
-    
-    # 解析標籤
-    labels_list = [l.strip() for l in labels.split(",") if l.strip()]
-    if not labels_list:
-        labels_list = ["person", "pedestrian", "car", "motorcycle", "bus", "truck"]
-    
-    # 設定要偵測的類別
-    try:
-        _yolo_world_model.set_classes(labels_list)
-        print(f"--- [YOLO] 設定偵測類別: {', '.join(labels_list)} ---")
-    except Exception as e:
-        error_msg = str(e)
-        if "name resolution" in error_msg or "Temporary failure" in error_msg or "urlopen" in error_msg.lower():
-            raise RuntimeError(
-                f"無法設定偵測類別：網路連接失敗，CLIP 模型無法下載\n"
-                f"錯誤詳情：{error_msg}\n"
-                f"解決方案：請確保 CLIP 模型已預先下載到 ~/.cache/clip/ 目錄"
-            ) from e
-        raise
-    
-    # 讀取影片
-    cap = cv2.VideoCapture(seg_path)
-    if not cap.isOpened():
-        raise RuntimeError(f"無法打開影片: {seg_path}")
-    
-    fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH) or 0)
-    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT) or 0)
-    
-    if total_frames <= 0:
-        cap.release()
-        raise RuntimeError("無效的影片或零幀影片")
-    
-    # 計算取樣間隔
-    frame_interval = max(1, int(round(fps * every_sec)))
-    
-    # 準備輸出目錄
-    seg_dir = Path(seg_path).parent
-    output_dir = seg_dir / "yolo_output"
-    output_dir.mkdir(exist_ok=True)
-    
-    # 物件切片目錄
-    crops_dir = output_dir / "object_crops"
-    crops_dir.mkdir(exist_ok=True)
-    
-    # 處理結果
-    detections = []
-    frame_count = 0
-    processed_count = 0
-    object_counter = {}
-    crop_paths = []  # 記錄所有生成的切片路徑
-    
-    # 批量處理：收集所有 crop 圖像用於批量 ReID embedding（全面使用 ReID）
-    reid_crops_batch = []  # 用於批量 ReID 處理的 crop 圖像
-    reid_crops_metadata = []  # 對應的元數據（用於後續映射）
-    
-    print(f"--- [YOLO] 開始處理影片: {seg_path} ---")
-    print(f"  - FPS: {fps:.2f}")
-    print(f"  - 總幀數: {total_frames}")
-    print(f"  - 取樣間隔: {frame_interval} 幀 (每 {every_sec} 秒)")
-    print(f"  - 輸出目錄: {output_dir}")
-    
-    while cap.isOpened():
-        ret, frame = cap.read()
-        if not ret:
-            break
-        
-        # 根據取樣間隔決定是否處理此幀
-        if frame_count % frame_interval != 0:
-            frame_count += 1
-            continue
-        
-        timestamp = frame_count / fps
-        
-        # 轉換為 RGB（YOLO 需要）
-        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        pil_image = Image.fromarray(frame_rgb)
-        
-        # 執行偵測
-        results = _yolo_world_model.predict(pil_image, verbose=False, conf=score_thr)
-        
-        # 處理偵測結果
-        frame_detections = []
-        if results and len(results) > 0:
-            result = results[0]
-            if result.boxes is not None and len(result.boxes) > 0:
-                for idx, box in enumerate(result.boxes):
-                    x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(float).tolist()
-                    confidence = float(box.conf[0].cpu().numpy())
-                    class_id = int(box.cls[0].cpu().numpy())
-                    class_name = labels_list[class_id] if class_id < len(labels_list) else f"class_{class_id}"
-                    
-                    # 確保座標在範圍內
-                    x1, y1 = max(0, int(x1)), max(0, int(y1))
-                    x2, y2 = min(width, int(x2)), min(height, int(y2))
-                    
-                    frame_detections.append({
-                        "box": [x1, y1, x2, y2],
-                        "score": confidence,
-                        "label": class_name,
-                        "label_idx": class_id
-                    })
-                    
-                    # 裁剪物件並保存
-                    if x2 > x1 and y2 > y1:
-                        crop = frame[y1:y2, x1:x2]
-                        if crop.size > 0:
-                            # 生成文件名：類別_時間戳_序號.jpg
-                            if class_name not in object_counter:
-                                object_counter[class_name] = 0
-                            object_counter[class_name] += 1
-                            
-                            timestamp_str = f"{timestamp:.3f}".replace(".", "_")
-                            crop_filename = f"{class_name}_{timestamp_str}_{object_counter[class_name]:03d}.jpg"
-                            crop_path = crops_dir / crop_filename
-                            
-                            # 保存物件切片圖片
-                            cv2.imwrite(str(crop_path), crop)
-                            
-                            # 收集所有 crop 圖像到批量處理列表（全面使用 ReID）
-                            reid_crops_batch.append(crop.copy())  # 複製 crop 圖像
-                            reid_crops_metadata.append({
-                                "index": len(crop_paths),  # 在 crop_paths 中的索引
-                                "filename": crop_filename,
-                                "label": class_name
-                            })
-                            
-                            # 先添加 crop_paths 條目（ReID embedding 稍後批量填充）
-                            crop_paths.append({
-                                "path": str(crop_path),
-                                "label": class_name,
-                                "score": confidence,
-                                "timestamp": timestamp,
-                                "frame": frame_count,
-                                "box": [x1, y1, x2, y2],
-                                "clip_embedding": None,  # 不再使用 CLIP（保留字段以兼容舊代碼）
-                                "reid_embedding": None  # ReID embedding（2048 維）- 稍後批量生成
-                            })
-        
-        if frame_detections:
-            detections.append({
-                "timestamp": timestamp,
-                "frame": frame_count,
-                "detections": frame_detections
-            })
-        
-        processed_count += 1
-        if processed_count % 10 == 0:
-            print(f"  - 進度: {frame_count}/{total_frames} 幀 ({frame_count/total_frames*100:.1f}%)")
-        
-        frame_count += 1
-    
-    cap.release()
-    
-    # 批量生成 ReID embedding（所有物件）
-    if reid_crops_batch:
-        print(f"--- [YOLO] 批量生成 ReID embedding（共 {len(reid_crops_batch)} 個物件 crops）---")
+# label 傳要偵測的目標，every_sec 是取樣頻率，score_thr 是信心門檻
+def infer_segment_owl(seg_path: str, labels: str, every_sec: float, score_thr: float) -> Dict:
+    with open(seg_path,"rb") as f:
+        files={"file":(os.path.basename(seg_path), f, "video/mp4")}
+        data={"every_sec":str(every_sec),"score_threshold":str(score_thr),"prompts":labels}
         try:
-            reid_embeddings = generate_reid_embeddings_batch(reid_crops_batch)
-            # 將批量生成的 ReID embedding 映射回對應的 crop_paths 條目
-            success_count = 0
-            for metadata, embedding in zip(reid_crops_metadata, reid_embeddings):
-                if embedding is not None:
-                    crop_paths[metadata["index"]]["reid_embedding"] = embedding
-                    success_count += 1
-                else:
-                    print(f"  ⚠️  ReID embedding 生成失敗: {metadata['filename']}")
-            print(f"--- [YOLO] ✓ 批量生成完成: {success_count}/{len(reid_crops_batch)} 個 ReID embedding 成功 ---")
-        except Exception as e:
-            print(f"--- [YOLO] ✗ 批量生成 ReID embedding 失敗: {e} ---")
-            import traceback
-            traceback.print_exc()
-    
-    print(f"--- [YOLO] 處理完成: 共處理 {processed_count} 幀，偵測到 {len(detections)} 個有物件的時間點，生成 {len(crop_paths)} 個物件切片 ---")
-    
-    # 返回格式
-    return {
-        "video_url": seg_path,
-        "fps_input": fps,
-        "every_sec": every_sec,
-        "size": [width, height],
-        "detections": detections,
-        "total_frames_processed": processed_count,
-        "total_detections": sum(len(d["detections"]) for d in detections),
-        "crop_paths": crop_paths,  # 新增：所有物件切片路徑
-        "object_count": object_counter
-    }
+            r=requests.post(OWL_VIDEO_URL, files=files, data=data, timeout=3600)
+            r.raise_for_status()
+            return r.json()
+        except requests.exceptions.HTTPError as e:
+            if r.status_code == 503:
+                error_detail = r.json().get("error", "Service Unavailable") if r.text else "Service Unavailable"
+                raise RuntimeError(
+                    f"OWL API 模型未載入 (503): {error_detail}\n"
+                    f"原因：無法從 Hugging Face 下載模型，網絡連接失敗。\n"
+                    f"解決方案：\n"
+                    f"  1. 檢查網絡連接：docker compose exec owl-api python -c \"import requests; requests.get('https://huggingface.co', timeout=10)\"\n"
+                    f"  2. 等待網絡恢復後，模型會自動在後台下載\n"
+                    f"  3. 或使用其他模型類型：將 model_type 改為 'qwen' 或 'gemini'"
+                ) from e
+            raise
+
+# YOLO-World 物件偵測已移至 analysis_service.py
+# 使用 AnalysisService.infer_segment_yolo() 或 from src.services.analysis_service import AnalysisService
 
 # gemini 的輸入和 qwen 不一樣，qwen 用到 base64 字串
 def infer_segment_gemini(model_name: str, seg_path: str, event_detection_prompt: str, summary_prompt: str, target_short: int=720, frames_per_segment: int=8, sampling_fps: Optional[float] = None) -> Tuple[Dict[str, Any], str]:
@@ -1069,7 +910,7 @@ class SegmentAnalysisRequest(BaseModel):
     end_time: float = 0.0
 
     # 模型設定
-    model_type: str # 'qwen', 'gemini', 'yolo'
+    model_type: str # 'qwen', 'gemini', 'owl'
     qwen_model: str = "qwen2.5-vl:7b"
     frames_per_segment: int = 8
     target_short: int = 720
@@ -1078,6 +919,11 @@ class SegmentAnalysisRequest(BaseModel):
     # Prompt
     event_detection_prompt: str
     summary_prompt: str
+
+    # OWL 參數
+    owl_labels: Optional[str] = None
+    owl_every_sec: float = 2.0
+    owl_score_thr: float = 0.15
 
     # YOLO 參數
     yolo_labels: Optional[str] = None
@@ -1243,6 +1089,9 @@ def _segment_pipeline_multipart_legacy(
     target_short: int = Form(720),
     sampling_fps: Optional[float] = Form(None),  # 新增：取樣 FPS（如果提供則嚴格遵循）
     strict_segmentation: bool = Form(False),  # 新增：是否使用嚴格切割模式
+    owl_labels: str = Form("person,pedestrian,motorcycle,car,bus,scooter,truck"),
+    owl_every_sec: float = Form(2.0),
+    owl_score_thr: float = Form(0.15),
     event_detection_prompt: str = Form(EVENT_DETECTION_PROMPT),
     summary_prompt: str = Form(SUMMARY_PROMPT),
     save_json: bool = Form(True),
@@ -1399,9 +1248,12 @@ def _segment_pipeline_multipart_legacy(
                 qwen_model=qwen_model,
                 frames_per_segment=frames_per_segment,
                 target_short=target_short,
-                sampling_fps=sampling_fps,  # 傳遞取樣 FPS
+            sampling_fps=sampling_fps,  # 傳遞取樣 FPS
                 event_detection_prompt=event_detection_prompt,
-                summary_prompt=summary_prompt
+                summary_prompt=summary_prompt,
+                owl_labels=owl_labels,
+                owl_every_sec=owl_every_sec,
+                owl_score_thr=owl_score_thr
             )
 
             # 3.3 【關鍵步驟】Call API
@@ -3395,361 +3247,105 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             import traceback
             traceback.print_exc()
 
-def save_rtsp_result_to_postgres(db: Session, result: Dict[str, Any], video_id: str):
-    """
-    專為 RTSP 串流設計的結果儲存函式。
-    特色：
-    1. 單一片段儲存。
-    2. 從檔名 (e.g. 20250520_120001.mp4) 解析精確的 start_timestamp。
-    3. 自動生成 summary embedding。
-    4. 處理 YOLO ObjectCrops 與 Alerts。
-    """
-    if not HAS_DB or not db:
-        print("--- [PostgreSQL] HAS_DB=False 或 db=None，跳過保存 ---")
-        return None
-
-    # 1. 基本資料提取
-    segment = result.get("segment", "")
-    parsed = result.get("parsed", {})
-    summary_text = parsed.get("summary_independent", "")
-    raw_detection = result.get("raw_detection", {})
-    duration_sec = result.get("duration_sec")
-    time_sec = result.get("time_sec")
-    frame_analysis = parsed.get("frame_analysis", {})
-    events = frame_analysis.get("events", {})
-    success = result.get("success", False)
-    error_msg = result.get("error")
-
-    # 2. 解析時間戳 (從檔名)
-    # FFmpeg 格式: 20260118_123456.mp4
-    start_time = datetime.now()
-    if segment and "_" in segment:
-        try:
-            stem = Path(segment).stem
-            # 嘗試匹配 YYYYMMDD_HHMMSS
-            dt = datetime.strptime(stem, "%Y%m%d_%H%M%S")
-            start_time = dt
-        except:
-            pass
-    
-    end_time = start_time + timedelta(seconds=duration_sec) if duration_sec else None
-    time_range = f"{start_time.strftime('%H:%M:%S')} - {end_time.strftime('%H:%M:%S')}" if end_time else ""
-
-    # 3. 生成 Embedding (pgvector)
-    embedding = None
-    if summary_text and summary_text.strip():
-        try:
-            model = get_embedding_model()
-            if model:
-                embedding = model.encode(summary_text.strip(), normalize_embeddings=True).tolist()
-        except Exception as e:
-            print(f"--- [RTSP DB] Embedding 失敗: {e} ---")
-
-    # 4. 建立 Summary 記錄
-    # 決定顯示訊息：如果有摘要則顯示摘要，否則顯示錯誤或預設文字
-    display_message = summary_text.strip()
-    if not display_message:
-        if not success:
-            display_message = f"分析失敗: {error_msg}"
-        else:
-            display_message = "RTSP 分析片段 (無摘要內容)"
-
-    summary = Summary(
-        video=video_id,
-        segment=segment,
-        start_timestamp=start_time,
-        end_timestamp=end_time,
-        time_range=time_range,
-        message=display_message,
-        duration_sec=float(duration_sec) if duration_sec is not None else None,
-        time_sec=float(time_sec) if time_sec is not None else None,
-        embedding=embedding,
-        # 事件欄位
-        water_flood=bool(events.get("water_flood", False)),
-        fire=bool(events.get("fire", False)),
-        abnormal_attire_face_cover_at_entry=bool(events.get("abnormal_attire_face_cover_at_entry", False)),
-        person_fallen_unmoving=bool(events.get("person_fallen_unmoving", False)),
-        double_parking_lane_block=bool(events.get("double_parking_lane_block", False)),
-        smoking_outside_zone=bool(events.get("smoking_outside_zone", False)),
-        crowd_loitering=bool(events.get("crowd_loitering", False)),
-        security_door_tamper=bool(events.get("security_door_tamper", False)),
-        event_reason=events.get("reason", ""),
-        created_at=datetime.now(),
-        updated_at=datetime.now()
-    )
-
-    # 5. YOLO Detections
-    yolo_result = raw_detection.get("yolo")
-    if yolo_result:
-        summary.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
-        summary.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
-        summary.yolo_total_detections = yolo_result.get("total_detections", 0)
-        summary.yolo_total_frames_processed = yolo_result.get("total_frames_processed", 0)
-
-    try:
-        db.add(summary)
-        db.flush() # 取得 ID
-
-        # 6. ObjectCrops
-        if yolo_result and yolo_result.get("crop_paths"):
-            for crop_data in yolo_result["crop_paths"]:
-                if not isinstance(crop_data, dict): continue
-                oc = ObjectCrop(
-                    summary_id=summary.id,
-                    crop_path=crop_data.get("path"),
-                    label=crop_data.get("label"),
-                    score=crop_data.get("score"),
-                    timestamp=crop_data.get("timestamp"),
-                    frame=crop_data.get("frame"),
-                    box=json.dumps(crop_data.get("box", []), ensure_ascii=False) if crop_data.get("box") else None,
-                    clip_embedding=crop_data.get("clip_embedding"),
-                    reid_embedding=crop_data.get("reid_embedding"),
-                    created_at=datetime.now()
-                )
-                db.add(oc)
-
-        # 7. Alerts
-        _create_alert_if_needed(db, summary.id, events, video_id, segment)
-        
-        db.commit()
-        print(f"--- [RTSP DB] ✓ 成功保存片段 {segment} 到資料庫 (video: {video_id}) ---")
-        return summary
-    except Exception as e:
-        db.rollback()
-        print(f"--- [RTSP DB ERROR] ✗ 儲存失敗: {e} ---")
-        return None
-
-# ReID 模型（用於物件 re-identification）
-_reid_model = None
-_reid_device = None
-
-def get_reid_model():
-    """獲取或初始化 ReID 模型（嚴格使用 2048 維 ResNet50 模型，不考慮 OSNet）"""
-    global _reid_model, _reid_device
-    
-    if _reid_model is not None:
-        return _reid_model, _reid_device
-    
-    import torch
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    _reid_device = device
-    
-    errors = []
-    
-    # 方案 1: 使用 torchreid 的 resnet50 (2048維)
-    try:
-        import torchreid
-        print(f"--- [ReID] 嘗試載入 torchreid ResNet50 模型 (device: {device}) ---")
-        model = torchreid.models.build_model(
-            name='resnet50',
-            num_classes=751,
-            loss='softmax',
-            pretrained=True
-        )
-        model = model.to(device).eval()
-        model.classifier = None # 獲取 2048 維特徵
-        
-        # 驗證維度
-        test_input = torch.randn(1, 3, 256, 128).to(device)
-        with torch.no_grad():
-            test_output = model(test_input)
-            output_dim = test_output.shape[1]
-            
-        if output_dim == 2048:
-            print(f"✓ torchreid ResNet50 載入成功 (維度: {output_dim})")
-            _reid_model = model
-            return model, device
-        else:
-            errors.append(f"torchreid 維度不符: {output_dim}")
-    except Exception as e:
-        errors.append(f"torchreid 失敗: {e}")
-
-    # 方案 2: 使用 timm 的 resnet50 (2048維) - 強制離線
-    try:
-        import timm
-        print(f"--- [ReID] 嘗試載入 timm ResNet50 模型 (device: {device}) ---")
-        os.environ['HF_HUB_OFFLINE'] = '1'
-        try:
-            model = timm.create_model('resnet50', pretrained=True, num_classes=0)
-        except:
-            model = timm.create_model('resnet50', pretrained=False, num_classes=0)
-        finally:
-            os.environ.pop('HF_HUB_OFFLINE', None)
-            
-        model = model.to(device).eval()
-        
-        # 驗證維度
-        test_input = torch.randn(1, 3, 256, 128).to(device)
-        with torch.no_grad():
-            test_output = model(test_input)
-            output_dim = test_output.shape[1]
-            
-        if output_dim == 2048:
-            print(f"✓ timm ResNet50 載入成功 (維度: {output_dim})")
-            _reid_model = model
-            return model, device
-        else:
-            errors.append(f"timm 維度不符: {output_dim}")
-    except Exception as e:
-        errors.append(f"timm 失敗: {e}")
-
-    # 方案 3: 使用 torchvision 的 resnet50 (2048維)
-    try:
-        import torchvision.models as models
-        print(f"--- [ReID] 嘗試載入 torchvision ResNet50 模型 (device: {device}) ---")
-        try:
-            model = models.resnet50(weights='ResNet50_Weights.DEFAULT')
-        except:
-            model = models.resnet50(pretrained=True)
-            
-        model = model.to(device).eval()
-        model.fc = torch.nn.Identity() # 獲取 2048 維特徵
-        
-        # 驗證維度
-        test_input = torch.randn(1, 3, 256, 128).to(device)
-        with torch.no_grad():
-            test_output = model(test_input)
-            output_dim = test_output.shape[1]
-            
-        if output_dim == 2048:
-            print(f"✓ torchvision ResNet50 載入成功 (維度: {output_dim})")
-            _reid_model = model
-            return model, device
-        else:
-            errors.append(f"torchvision 維度不符: {output_dim}")
-    except Exception as e:
-        errors.append(f"torchvision 失敗: {e}")
-
-    print(f"--- [ReID] ✗ 所有方案均失敗: {errors} ---")
-    _reid_model = None
-    return None, device
-    
-    # 最後備用：使用 torchvision ResNet50（避免網絡下載）
-    try:
-        import torchvision.models as models
-        print(f"--- [ReID] 嘗試載入 torchvision ResNet50 模型 (device: {device}) ---")
-        
-        try:
-            # 嘗試載入預訓練模型（從本地緩存）
-            model = models.resnet50(pretrained=True)
-        except Exception as download_err:
-            # 如果下載失敗，使用未預訓練的模型
-            print(f"--- [ReID] 無法載入預訓練權重，使用未預訓練的 ResNet50: {download_err} ---")
-            model = models.resnet50(pretrained=False)
-        
-        model.fc = torch.nn.Identity()  # 移除分類層
-        model = model.to(device).eval()
-        
-        # 驗證模型輸出維度
-        test_input = torch.randn(1, 3, 256, 128).to(device)
-        with torch.no_grad():
-            test_output = model(test_input)
-            output_dim = test_output.shape[1] if len(test_output.shape) > 1 else test_output.shape[0]
-        
-        if output_dim != 2048:
-            error_msg = f"torchvision 模型輸出維度錯誤: 預期 2048，實際 {output_dim}"
-            print(f"--- [ReID] ✗ {error_msg} ---")
-            errors.append(f"torchvision: {error_msg}")
-            raise ValueError(error_msg)
-        
-        print(f"✓ torchvision ResNet50 模型載入完成（輸出維度: {output_dim}）")
-        _reid_model = model
-        return model, device
-    except ImportError as e:
-        error_msg = f"torchvision 未安裝: {e}"
-        print(f"--- [ReID] ✗ {error_msg} ---")
-        errors.append(error_msg)
-    except Exception as e:
-        error_msg = f"torchvision 載入失敗: {e}"
-        print(f"--- [ReID] ✗ {error_msg} ---")
-        errors.append(error_msg)
-        import traceback
-        traceback.print_exc()
-    
-    # 所有方案都失敗
-    error_summary = "所有 ReID 模型載入方案都失敗：\n" + "\n".join(f"  - {err}" for err in errors)
-    print(f"--- [ReID] ✗ {error_summary} ---")
-    print("--- [ReID] 請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 或確保 timm/torchvision 已正確安裝 3) 檢查後端日誌以獲取詳細錯誤信息 ---")
-    return None, None
+# ReID 模型已移至 model_loader.py
+# 使用 from src.core.model_loader import get_reid_model
 
 def generate_reid_embeddings_batch(crop_images: List[np.ndarray], reid_model=None, reid_device=None) -> List[Optional[List[float]]]:
     """
-    批量生成 ReID embedding（優化版本，用於內存中的裁剪圖像）
-    
-    Args:
-        crop_images: 裁剪的圖像列表（numpy arrays，BGR 格式）
-        reid_model: ReID 模型（如果為 None 則自動獲取）
-        reid_device: 設備（如果為 None 則自動獲取）
-        
-    Returns:
-        embedding 向量列表（每個 2048 維）或 None
+    批量生成 ReID embeddings (終極修復版：動態型別適應)
+    自動偵測模型 dtype (FP16/FP32) 並將輸入轉為相同類型，徹底解決 c10::Half != float 錯誤。
     """
     if not crop_images:
         return []
+
+    # 1. 確保模型與設備存在
+    if reid_model is None:
+        # 嘗試從 model_loader 獲取
+        try:
+            from src.core.model_loader import get_reid_model
+            reid_model, device_str = get_reid_model()
+            if reid_device is None:
+                reid_device = device_str
+        except ImportError:
+            # Fallback for main.py where model_loader might not be structured same way or circular import
+            pass
     
+    if reid_model is None:
+        print("--- [AnalysisService] Warning: ReID model is None ---")
+        return [None] * len(crop_images)
+
     try:
-        if reid_model is None or reid_device is None:
-            reid_model, reid_device = get_reid_model()
-        
-        if reid_model is None:
-            # 備用：使用 CLIP（但 CLIP 不支持批量，需要逐個處理）
-            print("--- [WARNING] ReID 模型不可用，跳過批量 embedding 生成 ---")
-            return [None] * len(crop_images)
-        
         import torch
-        import torchvision.transforms as transforms
-        from PIL import Image
+        import cv2
+        import numpy as np
         
-        # 批量預處理
-        transform = transforms.Compose([
-            transforms.Resize((256, 128)),  # ReID 標準尺寸
-            transforms.ToTensor(),
-            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
-        ])
-        
-        # 轉換所有圖像為 tensor
-        tensors = []
+        # 2. 【關鍵】偵測模型當下的 dtype 與 device
+        # 不管模型是 FP16 還是 FP32，我們都配合它
+        try:
+            first_param = next(reid_model.parameters())
+            target_dtype = first_param.dtype
+            target_device = first_param.device
+            # 如果外部沒傳 device，就用模型自己的
+            if reid_device is None:
+                reid_device = target_device
+        except Exception as e:
+            print(f"--- [ReID] 無法偵測模型 dtype，預設使用 float32: {e} ---")
+            target_dtype = torch.float32
+
+        # Debug Log: 這行能救命，讓我們知道到底發生什麼事
+        print(f"--- [ReID DEBUG] Model dtype: {target_dtype}, Device: {reid_device} ---")
+
+        reid_model.eval()
+
+        # 3. 批量預處理
+        processed_tensors = []
         valid_indices = []
-        for i, crop in enumerate(crop_images):
+
+        for i, img in enumerate(crop_images):
+            if img is None or img.size == 0:
+                continue
             try:
-                # 轉換 BGR 到 RGB
-                if len(crop.shape) == 3 and crop.shape[2] == 3:
-                    rgb_image = cv2.cvtColor(crop, cv2.COLOR_BGR2RGB)
-                else:
-                    rgb_image = crop
+                # BGR -> RGB
+                img = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)
+                # Resize
+                img = cv2.resize(img, (128, 256))
+                # Normalize (ImageNet)
+                img = img.astype(np.float32) / 255.0
+                img = (img - np.array([0.485, 0.456, 0.406])) / np.array([0.229, 0.224, 0.225])
+                # HWC -> CHW
+                img = img.transpose(2, 0, 1)
                 
-                # 轉換為 PIL Image
-                pil_image = Image.fromarray(rgb_image)
-                
-                # 預處理
-                tensor = transform(pil_image)
-                tensors.append(tensor)
+                # 轉為 Tensor (暫時保持 float32，堆疊時再轉 target_dtype 以保證精度)
+                tensor = torch.from_numpy(img)
+                processed_tensors.append(tensor)
                 valid_indices.append(i)
             except Exception as e:
-                print(f"--- [WARNING] 預處理圖像失敗 (index {i}): {e} ---")
-                valid_indices.append(None)
-        
-        if not tensors:
+                print(f"--- [ReID] Preprocessing error: {e} ---")
+
+        if not processed_tensors:
             return [None] * len(crop_images)
-        
-        # 批量推理
-        batch_tensor = torch.stack(tensors).to(reid_device)
-        
+
+        # 4. 【關鍵】堆疊並轉型
+        # 使用 target_dtype 強制將輸入轉為與模型一致的類型 (FP16 or FP32)
+        batch_tensor = torch.stack(processed_tensors).to(reid_device, dtype=target_dtype)
+
+        # 5. 推論
         with torch.no_grad():
             features = reid_model(batch_tensor)
-            # L2 正規化
-            features = features / (torch.norm(features, dim=1, keepdim=True) + 1e-12)
-            embeddings = features.cpu().numpy()
-        
-        # 映射回原始索引
+            # L2 Normalize
+            features = torch.nn.functional.normalize(features, p=2, dim=1)
+            # 轉回 CPU numpy (float32) 方便後續處理
+            embeddings = features.float().cpu().numpy()
+
+        # 6. 整理結果
         result = [None] * len(crop_images)
         for idx, valid_idx in enumerate(valid_indices):
-            if valid_idx is not None:
-                result[valid_idx] = embeddings[idx].tolist()
+            result[valid_idx] = embeddings[idx].tolist()
         
         return result
+
     except Exception as e:
-        print(f"--- [WARNING] 批量生成 ReID embedding 失敗: {e} ---")
+        print(f"--- [AnalysisService] Batch ReID failed: {e} ---")
         import traceback
         traceback.print_exc()
         return [None] * len(crop_images)
@@ -3770,6 +3366,7 @@ def generate_reid_embedding(image_path: str) -> tuple[Optional[List[float]], str
         RuntimeError: 如果 ReID 模型未載入
     """
     try:
+        from src.core.model_loader import get_reid_model
         reid_model, reid_device = get_reid_model()
         if reid_model is None:
             error_msg = "ReID 模型未載入。請檢查：1) 是否安裝 torchreid: pip install torchreid 2) 後端日誌中的詳細錯誤信息"
@@ -4327,7 +3924,7 @@ def _merge_and_rank_results(
 
 # ================== 註冊 API 路由 ==================
 # 必須在所有函數定義之後註冊，避免循環導入
-from src.api import health, prompts, video_analysis, rag, video_management, detection_items, rtsp_control
+from src.api import health, prompts, video_analysis, rag, video_management, detection_items, monitor
 
 app.include_router(health.router)
 app.include_router(prompts.router)
@@ -4335,7 +3932,7 @@ app.include_router(video_analysis.router)
 app.include_router(rag.router)
 app.include_router(video_management.router)
 app.include_router(detection_items.router)
-app.include_router(rtsp_control.router)
+app.include_router(monitor.router)
 
 if __name__ == "__main__":
     import uvicorn

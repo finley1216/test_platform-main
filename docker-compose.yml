@@ -7,6 +7,10 @@ services:
       - "8554:8554"   # RTSP 埠
       - "8888:8888"   # HLS 埠 (可選用)
       - "8889:8889"   # WebRTC 埠 (可選用)
+    environment:
+      - MTX_HLSVARIANT=fmp4
+      - MTX_HLSALLOWORIGINS=*
+      - MTX_WEBRTC=yes
     networks:
       - app-network
 
@@ -21,13 +25,16 @@ services:
       - ../video:/videos:ro  # 掛載實體影片路徑
     networks:
       - app-network
-    # 循環推流指令：使用 -stream_loop -1 達到無限循環
-    # 使用 -re 確保以真實影片速率推流，避免時間戳混亂與檔案過大
+    # 最終穩定版推流：240p, 10fps, 使用 setpts 強制時間戳連續，解決循環播放斷線問題
     command: >
       -re -stream_loop -1 
-      -i "/videos/門禁遮臉入場/Video_衛哨端出入口2.avi" 
-      -c copy 
+      -i "/videos/門禁遮臉入場/Video_衛哨端出入口.avi" 
+      -vf "scale=426:240,fps=10,setpts=N/(10*TB)"
+      -c:v libx264 -preset ultrafast -tune zerolatency -profile:v baseline -level 3.0 -g 20 -b:v 200k -maxrate 200k -bufsize 400k
+      -bsf:v h264_mp4toannexb
+      -an
       -f rtsp 
+      -rtsp_transport tcp
       rtsp://rtsp-server:8554/live
 
   # Ollama Service
@@ -41,8 +48,8 @@ services:
     networks:
       - app-network
     extra_hosts:
-      - "registry.ollama.ai:104.16.55.3"
-      - "registry.ollama.ai:104.16.54.3"
+      - "registry.ollama.ai:104.16.55.3"  # 加這行，直接用 IP
+      - "registry.ollama.ai:104.16.54.3"  # Cloudflare 的備用 IP
     deploy:
       resources:
         reservations:
@@ -51,9 +58,9 @@ services:
               count: all
               capabilities: [gpu]
 
-  # PostgreSQL Database
+  # PostgreSQL Database with pgvector extension
   postgres:
-    image: pgvector/pgvector:pg15
+    image: pgvector/pgvector:pg15  # 使用包含 pgvector 的官方映像
     restart: unless-stopped
     environment:
       - POSTGRES_USER=postgres
@@ -71,7 +78,7 @@ services:
       timeout: 5s
       retries: 5
 
-  # pgAdmin
+  # pgAdmin - PostgreSQL 圖形化管理工具
   pgadmin:
     image: dpage/pgadmin4:latest
     restart: unless-stopped
@@ -90,18 +97,25 @@ services:
       postgres:
         condition: service_healthy
 
-  # Backend API
   backend:
     build:
       context: ./backend
       dockerfile: Dockerfile
+      network: host
     restart: unless-stopped
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
     environment:
       - PROJECT_ROOT=${PROJECT_ROOT}
       - HOST=${HOST}
       - PORT=8080
       - RELOAD=${RELOAD}
-      - WORKERS=${WORKERS}
+      - WORKERS=1
       - LOG_LEVEL=${LOG_LEVEL}
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - SESSION_TTL_SEC=${SESSION_TTL_SEC}
@@ -123,7 +137,12 @@ services:
       - ./backend/rag_store:/app/rag_store
       - ./backend/prompts:/app/prompts
       - ../video:/app/video:ro
-      - ~/.cache/huggingface:/root/.cache/huggingface:ro
+      - ~/.cache/huggingface:/root/.cache/huggingface:ro  # 掛載 Hugging Face 模型緩存
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    # ports:
+    #   - "8080:8080"  # 移除對外暴露，改由 nginx 反向代理
     networks:
       - app-network
     depends_on:
@@ -133,31 +152,40 @@ services:
         condition: service_started
       rtsp-server: # 確保 backend 知道 rtsp-server 存在
         condition: service_started
-  # Frontend
+
   frontend:
     build:
       context: ./frontend
       dockerfile: Dockerfile
+      network: host
     restart: unless-stopped
     environment:
+      # 不設置 REACT_APP_API_BASE，讓前端根據 hostname 自動選擇
+      # - REACT_APP_API_BASE=http://localhost:8080  # 已移除，改為自動檢測
       - WDS_SOCKET_HOST=localhost
       - WDS_SOCKET_PORT=3000
     volumes:
       - ./frontend:/app:delegated
-      - node_modules_data:/app/node_modules
+      # - node_modules_data:/app/node_modules
+    dns:
+      - 8.8.8.8
+      - 8.8.4.4
+    # ports:
+    #   - "3000:3000"  # 移除對外暴露，改由 nginx 反向代理
     networks:
       - app-network
     depends_on:
       - backend
 
-  # Nginx Reverse Proxy
+  # Nginx Reverse Proxy - 統一入口
   nginx:
     image: nginx:alpine
     restart: unless-stopped
     volumes:
       - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
     ports:
-      - "3000:80"
+      - "3000:80"      # 廠商開放 3000，所以 Nginx 監聽 3000（映射到容器內部的 80）
+      # - "8080:80"    # 備用：如果廠商也開放 8080，可以同時監聽兩個端口
     networks:
       - app-network
     depends_on:
@@ -173,3 +201,4 @@ volumes:
   ollama_data:
   postgres_data:
   pgadmin_data:
+

@@ -15,6 +15,8 @@ engine = create_engine(
     SQLALCHEMY_DATABASE_URL,
     pool_pre_ping=True,  # Verify connections before using them
     pool_recycle=3600,   # Recycle connections after 1 hour
+    pool_size=20,        # Increase pool size to handle concurrent polling
+    max_overflow=30      # Allow more overflow connections
 )
 
 # Ensure pgvector extension is created

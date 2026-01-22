@@ -194,7 +194,28 @@ class VideoService:
         # 為了確保「全新處理」，清理舊的片段資料夾
         if seg_dir.exists():
             print(f"--- [VideoService] 清理舊資料夾，確保重新處理: {seg_dir} ---")
-            shutil.rmtree(seg_dir)
+            
+            # 檢查 source_path 是否就在要刪除的目錄內
+            is_source_inside = False
+            if source_path:
+                try:
+                    is_source_inside = Path(source_path).resolve().is_relative_to(seg_dir.resolve())
+                except ValueError:
+                    is_source_inside = False
+            
+            if is_source_inside:
+                # 如果原始檔在裡面，我們不能直接 rmtree，否則原始檔會消失
+                # 改為刪除除了原始檔以外的所有檔案和子目錄
+                for item in seg_dir.iterdir():
+                    if source_path and item.resolve() == Path(source_path).resolve():
+                        continue
+                    if item.is_file():
+                        item.unlink()
+                    elif item.is_dir():
+                        shutil.rmtree(item)
+            else:
+                shutil.rmtree(seg_dir)
+        
         seg_dir.mkdir(parents=True, exist_ok=True)
 
         # 如果是上傳的檔案，保存一份原始檔在 segment 目錄供日後重新處理

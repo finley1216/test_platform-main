@@ -33,5 +33,7 @@ torchvision>=0.15.0  # 備用方案：使用 torchvision ResNet50（輸出 2048 
 
 # YOLO object detection
 ultralytics>=8.0.0  # YOLO 物件偵測模型（用於影片分析）
-git+https://github.com/ultralytics/CLIP.git  # YOLO-World 需要的 CLIP 模組
+# Monitoring and Diagnostics
+psutil==5.9.6
+pynvml==11.5.0  # NVIDIA GPU monitoring
 

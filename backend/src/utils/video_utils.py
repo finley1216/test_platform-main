@@ -14,12 +14,29 @@ def _fmt_hms(seconds: float) -> str:
 
 def _probe_duration_seconds(video_path: str) -> float:
     """使用 ffprobe 獲取影片長度"""
+    if not video_path or not Path(video_path).exists():
+        print(f"--- [VideoUtils] 錯誤：影片檔案不存在: {video_path} ---")
+        return 0.0
+        
     cmd = [
         "ffprobe", "-v", "error", "-show_entries", "format=duration",
         "-of", "default=noprint_wrappers=1:nokey=1", video_path
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
-    return float(res.stdout.strip())
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        out = res.stdout.strip()
+        if not out:
+            print(f"--- [VideoUtils] 警告：ffprobe 回傳空值，嘗試使用 OpenCV 獲取長度 ---")
+            cap = cv2.VideoCapture(video_path)
+            if not cap.isOpened(): return 0.0
+            fps = cap.get(cv2.CAP_PROP_FPS)
+            count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
+            cap.release()
+            return count / fps if fps > 0 else 0.0
+        return float(out)
+    except Exception as e:
+        print(f"--- [VideoUtils] 獲取影片長度失敗: {e} ---")
+        return 0.0
 
 def _split_one_video(video_path: str, out_dir: Path, segment_duration: float, overlap: float, prefix: str = "segment", resolution: Optional[int] = None, strict_mode: bool = False) -> List[Path]:
     """將影片切割成多個片段"""
