@@ -6,13 +6,26 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   const [videoId, setVideoId] = useState("CAM_01");
   const [activeStreams, setActiveStreams] = useState({});
   const [logs, setLogs] = useState([]);
+  const [hlsStatus, setHlsStatus] = useState({ 
+    canPlay: false, 
+    message: "等待串流啟動...",
+    streamEnded: false 
+  });
+  const [systemStatus, setSystemStatus] = useState({
+    cpu: 0,
+    ram: 0,
+    gpu: null,
+    models: { yolo_world: false, reid_model: false },
+    modelsStr: "YOLO: ❌ Not Loaded | ReID: ❌ Not Loaded",
+    disk: 0
+  });
 
   // 為了讓前端能看到影片，我們需要用 MediaMTX 的 HLS 功能
-  // 自動根據目前的網域動態生成 HLS URL
+  // 直接使用 /live 路徑（stream-simulator 已經在推流）
   const [hlsUrl, setHlsUrl] = useState(`http://${window.location.hostname}:8888/live`);
 
   useEffect(() => {
-    // 監聽網域變化（通常不會變，但初始化時很重要）
+    // 固定使用 /live 路徑
     setHlsUrl(`http://${window.location.hostname}:8888/live`);
   }, []);
 
@@ -33,8 +46,18 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
     return () => clearInterval(releaseInterval);
   }, []);
 
+  // 移除 HLS manifest 檢查，直接顯示畫面
+  // 因為 MediaMTX 的 HLS 播放器頁面在 /live/，不需要檢查 manifest
+
   useEffect(() => {
-    // 只有在視窗開啟且有 apiKey 時才啟動
+    // 視窗打開時立即允許顯示 HLS（使用 stream-simulator 的推流）
+    if (isOpen) {
+      setHlsStatus({ canPlay: true, message: "串流運行中", streamEnded: false });
+      setHlsUrl(`http://${window.location.hostname}:8888/live`);
+      console.log("🚀 [HLS] Modal opened, using stream-simulator feed at /live");
+    }
+    
+    // 只有在視窗開啟且有 apiKey 時才啟動輪詢
     if (!isOpen || !apiKey) {
       isFirstPollRef.current = true;
       logBufferRef.current = [];
@@ -43,9 +66,57 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
 
     const pollTask = async () => {
       try {
+        // 0. 獲取系統狀態（CPU、GPU、RAM 等）
+        try {
+          const sysStatus = await apiService.getSystemStatus(apiKey);
+          if (sysStatus) {
+            // 格式化 GPU 狀態（與後端格式一致）
+            let gpuStatusStr = null;
+            if (sysStatus.gpu?.devices && sysStatus.gpu.devices.length > 0) {
+              const gpu = sysStatus.gpu.devices[0];
+              // 計算記憶體使用百分比
+              const memPercent = gpu.mem_util_percent !== null && gpu.mem_util_percent !== undefined
+                ? gpu.mem_util_percent
+                : ((gpu.mem_used_mb / gpu.mem_total_mb) * 100);
+              gpuStatusStr = `${gpu.name}: Mem ${memPercent.toFixed(2)}%`;
+            }
+            
+            // 格式化模型狀態（與後端格式一致）
+            const modelsStr = `YOLO: ${sysStatus.models?.yolo_world ? '✅ Loaded' : '❌ Not Loaded'} | ReID: ${sysStatus.models?.reid_model ? '✅ Loaded' : '❌ Not Loaded'}`;
+            
+            setSystemStatus({
+              cpu: sysStatus.cpu?.percent || 0,
+              ram: sysStatus.memory?.percent || 0,
+              gpu: gpuStatusStr,
+              models: sysStatus.models || { yolo_world: false, reid_model: false },
+              modelsStr: modelsStr,
+              disk: sysStatus.disk?.free_gb || 0
+            });
+          }
+        } catch (e) {
+          console.warn("Failed to fetch system status:", e);
+        }
+
         // 1. 同步獲取串流狀態
         const status = await apiService.getRTSPStatus(apiKey);
         setActiveStreams(status || {});
+
+        // 1.5. 直接允許播放 HLS（使用 stream-simulator 的推流）
+        // 不需要檢查後端串流狀態，直接顯示 /live 的 HLS
+        setHlsStatus(prev => {
+          if (!prev.canPlay) {
+            console.log("🚀 [HLS] Using stream-simulator feed at /live");
+            return { 
+              canPlay: true, 
+              message: "串流運行中",
+              streamEnded: false 
+            };
+          }
+          return prev;
+        });
+        
+        // 確保 HLS URL 正確設置
+        setHlsUrl(`http://${window.location.hostname}:8888/live`);
 
         // 2. 獲取分析進度 (改為併行請求以減少卡頓)
         const idsToTrack = [videoId, ...Object.keys(status || {})].filter(id => id);
@@ -173,16 +244,63 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
             
             {/* 左側：影片與控制 */}
             <div style={{ flex: '1.4', display: 'flex', flexDirection: 'column' }}>
-              <div style={{ background: 'black', flex: 1, minHeight: '360px', marginBottom: '20px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #333', position: 'relative' }}>
-                 <iframe
-                   src={`http://${window.location.hostname}:8888/live/`}
-                   style={{ width: '100%', height: '100%', border: 'none' }}
-                   title="RTSP Preview"
-                   allow="autoplay; fullscreen"
-                 />
-                 <div style={{ position: 'absolute', top: '10px', right: '10px', background: 'rgba(0,0,0,0.5)', padding: '2px 8px', borderRadius: '4px', fontSize: '10px', color: '#ff9800' }}>
-                   LIVE (HLS)
-                 </div>
+              <div style={{ background: 'black', flex: 1, minHeight: '360px', marginBottom: '20px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #333', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
+                {hlsStatus.canPlay ? (
+                  <>
+                    <iframe
+                      src={`${hlsUrl}/`}
+                      style={{ width: '100%', height: '100%', border: 'none', position: 'absolute', top: 0, left: 0 }}
+                      title="RTSP Preview"
+                      allow="autoplay; fullscreen"
+                      onError={(e) => {
+                        // 處理 iframe 載入錯誤（雖然 iframe 的 onError 不總是觸發）
+                        console.warn("⚠️ [HLS] Iframe load error detected");
+                        // 檢查是否是因為串流已結束
+                        const currentStream = activeStreams?.[videoId];
+                        if (currentStream?.ended || currentStream?.status === "ended") {
+                          setHlsStatus({ 
+                            canPlay: false, 
+                            message: "分析完成，串流已關閉",
+                            streamEnded: true 
+                          });
+                        } else {
+                          setHlsStatus({ 
+                            canPlay: false, 
+                            message: "HLS 串流載入失敗，請檢查 MediaMTX 服務",
+                            streamEnded: false 
+                          });
+                        }
+                      }}
+                    />
+                    <div style={{ position: 'absolute', top: '10px', right: '10px', background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: '4px', fontSize: '11px', color: '#4CAF50', fontWeight: 'bold', zIndex: 10 }}>
+                      ● LIVE (HLS) - GPU加速
+                    </div>
+                  </>
+                ) : (
+                  <div style={{ 
+                    textAlign: 'center', 
+                    color: hlsStatus.streamEnded ? '#4CAF50' : '#888',
+                    padding: '40px',
+                    width: '100%'
+                  }}>
+                    <div style={{ fontSize: '48px', marginBottom: '20px' }}>
+                      {hlsStatus.streamEnded ? '✅' : '⏳'}
+                    </div>
+                    <div style={{ fontSize: '18px', marginBottom: '10px', fontWeight: 'bold' }}>
+                      {hlsStatus.message}
+                    </div>
+                    {hlsStatus.streamEnded && (
+                      <div style={{ fontSize: '14px', color: '#666', marginTop: '10px' }}>
+                        串流已正常結束，分析結果已保存
+                      </div>
+                    )}
+                    {!hlsStatus.streamEnded && !hlsStatus.canPlay && (
+                      <div style={{ fontSize: '12px', color: '#555', marginTop: '10px' }}>
+                        請先啟動 AI 分析以開始串流
+                      </div>
+                    )}
+                  </div>
+                )}
               </div>
 
               <div style={{ background: '#2d2d2d', padding: '15px', borderRadius: '8px', marginBottom: '15px' }}>
@@ -207,15 +325,99 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
                 </button>
               </div>
 
+              {/* 系統監控面板 */}
+              <div style={{ background: '#252525', padding: '15px', borderRadius: '8px', marginBottom: '15px', flex: '0 0 auto' }}>
+                <h4 style={{ fontSize: '14px', marginBottom: '12px', color: '#60a5fa', display: 'flex', alignItems: 'center', gap: '8px' }}>
+                  📊 系統監控
+                </h4>
+                <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '10px', fontSize: '12px' }}>
+                  <div style={{ background: '#1a1a1a', padding: '10px', borderRadius: '6px', border: '1px solid #333' }}>
+                    <div style={{ color: '#888', marginBottom: '4px' }}>CPU (%)</div>
+                    <div style={{ color: '#4CAF50', fontSize: '18px', fontWeight: 'bold' }}>
+                      {systemStatus.cpu.toFixed(1)}
+                    </div>
+                  </div>
+                  <div style={{ background: '#1a1a1a', padding: '10px', borderRadius: '6px', border: '1px solid #333' }}>
+                    <div style={{ color: '#888', marginBottom: '4px' }}>RAM (%)</div>
+                    <div style={{ color: '#ff9800', fontSize: '18px', fontWeight: 'bold' }}>
+                      {systemStatus.ram.toFixed(1)}
+                    </div>
+                  </div>
+                  <div style={{ background: '#1a1a1a', padding: '10px', borderRadius: '6px', border: '1px solid #333', gridColumn: '1 / -1' }}>
+                    <div style={{ color: '#888', marginBottom: '4px' }}>GPU Status</div>
+                    <div style={{ color: '#a78bfa', fontSize: '13px', fontWeight: 'bold' }}>
+                      {systemStatus.gpu || 'N/A'}
+                    </div>
+                  </div>
+                  <div style={{ background: '#1a1a1a', padding: '10px', borderRadius: '6px', border: '1px solid #333', gridColumn: '1 / -1' }}>
+                    <div style={{ color: '#888', marginBottom: '4px' }}>Models Loaded</div>
+                    <div style={{ color: '#4CAF50', fontSize: '12px', fontWeight: 'bold' }}>
+                      {systemStatus.modelsStr || 'YOLO: ❌ Not Loaded | ReID: ❌ Not Loaded'}
+                    </div>
+                  </div>
+                  <div style={{ background: '#1a1a1a', padding: '10px', borderRadius: '6px', border: '1px solid #333', gridColumn: '1 / -1' }}>
+                    <div style={{ color: '#888', marginBottom: '4px' }}>Disk Free</div>
+                    <div style={{ color: '#60a5fa', fontSize: '13px', fontWeight: 'bold' }}>
+                      {systemStatus.disk.toFixed(2)} GB
+                    </div>
+                  </div>
+                </div>
+              </div>
+
               <div style={{ background: '#252525', padding: '15px', borderRadius: '8px', flex: '0 0 auto' }}>
                 <h4 style={{ fontSize: '14px', marginBottom: '10px', color: '#4CAF50' }}>● 運行中串流</h4>
-                <div style={{ maxHeight: '100px', overflowY: 'auto' }}>
-                  {Object.entries(activeStreams).map(([id, info]) => (
-                    <div key={id} style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '6px', padding: '8px', background: '#333', borderRadius: '4px', fontSize: '13px' }}>
-                      <span>{id} <small style={{ color: '#888', marginLeft: '5px' }}>({info.uptime}s)</small></span>
-                      <button onClick={() => handleStop(id)} className="btn btn-danger" style={{ padding: '2px 10px', fontSize: '11px' }}>停止</button>
+                <div style={{ maxHeight: '120px', overflowY: 'auto' }}>
+                  {Object.entries(activeStreams).length === 0 ? (
+                    <div style={{ color: '#666', fontSize: '12px', textAlign: 'center', padding: '10px' }}>
+                      目前沒有運行中的串流
                     </div>
-                  ))}
+                  ) : (
+                    Object.entries(activeStreams).map(([id, info]) => {
+                      const statusColor = info.status === "running" ? "#4CAF50" : 
+                                        info.status === "ended" ? "#888" : "#ff4444";
+                      const statusText = info.status === "running" ? "運行中" : 
+                                        info.status === "ended" ? "已結束" : "錯誤";
+                      return (
+                        <div key={id} style={{ 
+                          display: 'flex', 
+                          justifyContent: 'space-between', 
+                          alignItems: 'center', 
+                          marginBottom: '6px', 
+                          padding: '8px', 
+                          background: '#333', 
+                          borderRadius: '4px', 
+                          fontSize: '13px',
+                          borderLeft: `3px solid ${statusColor}`
+                        }}>
+                          <div style={{ flex: 1 }}>
+                            <div style={{ display: 'flex', alignItems: 'center', gap: '8px' }}>
+                              <span style={{ fontWeight: 'bold' }}>{id}</span>
+                              <span style={{ 
+                                fontSize: '10px', 
+                                color: statusColor,
+                                background: `${statusColor}20`,
+                                padding: '2px 6px',
+                                borderRadius: '3px'
+                              }}>
+                                {statusText}
+                              </span>
+                            </div>
+                            <small style={{ color: '#888', display: 'block', marginTop: '2px' }}>
+                              {info.uptime}s | PID: {info.pid}
+                            </small>
+                            {info.error_message && (
+                              <small style={{ color: '#ff6666', display: 'block', marginTop: '2px', fontSize: '11px' }}>
+                                {info.error_message}
+                              </small>
+                            )}
+                          </div>
+                          {info.status === "running" && (
+                            <button onClick={() => handleStop(id)} className="btn btn-danger" style={{ padding: '2px 10px', fontSize: '11px' }}>停止</button>
+                          )}
+                        </div>
+                      );
+                    })
+                  )}
                 </div>
               </div>
             </div>

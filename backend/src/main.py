@@ -3924,7 +3924,7 @@ def _merge_and_rank_results(
 
 # ================== 註冊 API 路由 ==================
 # 必須在所有函數定義之後註冊，避免循環導入
-from src.api import health, prompts, video_analysis, rag, video_management, detection_items, monitor
+from src.api import health, prompts, video_analysis, rag, video_management, detection_items, monitor, rtsp_control
 
 app.include_router(health.router)
 app.include_router(prompts.router)
@@ -3933,6 +3933,7 @@ app.include_router(rag.router)
 app.include_router(video_management.router)
 app.include_router(detection_items.router)
 app.include_router(monitor.router)
+app.include_router(rtsp_control.router)
 
 if __name__ == "__main__":
     import uvicorn
