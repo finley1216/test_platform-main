@@ -442,37 +442,44 @@ class AnalysisService:
         
         labels_list = [l.strip() for l in labels.split(",") if l.strip()] or ["person", "car"]
         
-        # 2. 安全設定類別
+        # 2. 安全設定類別 (包含設備同步與重載邏輯)
+        device = "cuda" if torch.cuda.is_available() else "cpu"
         try:
+            # [關鍵修復 1] 設定前先確保模型在 GPU
+            model.to(device)
             model.set_classes(labels_list)
+            # [關鍵修復 2] 設定後再次同步，確保產生的 Embedding 也在 GPU
+            model.to(device)
+            print(f"--- [YOLO] 成功在 {device} 設定類別: {labels_list} ---")
+            
         except AttributeError as e:
             error_msg = str(e)
-            # 捕獲 'NoneType' object has no attribute 'names' 錯誤
-            if "'NoneType' object has no attribute 'names'" in error_msg or "'NoneType' object has no attribute" in error_msg:
-                print(f"--- [YOLO Error] 模型載入成功但內部結構損壞 ({error_msg})，強制重載... ---")
-                # 清空全域變數並重載
+            if "'NoneType' object has no attribute 'names'" in error_msg:
+                print(f"--- [YOLO Error] 偵測到殭屍模型，強制重載... ---")
                 import src.core.model_loader
                 src.core.model_loader._yolo_world_model = None
                 model = src.core.model_loader.get_yolo_model()
                 if model:
-                    try:
-                        model.set_classes(labels_list)
-                        print("--- [YOLO] 模型重載成功，set_classes 執行完成 ---")
-                    except Exception as e2:
-                        print(f"--- [YOLO Error] 重載後仍然失敗: {e2} ---")
-                        return {"error": "YOLO model broken and reload failed", "detections": []}
-                else:
-                    print("--- [YOLO Error] 模型重載失敗，無法獲取模型實例 ---")
-                    return {"error": "YOLO model broken and reload failed", "detections": []}
+                    model.to(device)
+                    model.set_classes(labels_list)
+                    model.to(device)
             else:
-                # 其他 AttributeError，直接返回錯誤
-                print(f"--- [YOLO Error] AttributeError in set_classes: {e} ---")
-                return {"error": f"YOLO set_classes failed: {str(e)}", "detections": []}
-        except Exception as e:
-            # 捕獲其他可能的錯誤
-            print(f"--- [YOLO Error] Unexpected error in set_classes: {e} ---")
-            return {"error": f"YOLO set_classes failed: {str(e)}", "detections": []}
-        
+                return {"error": f"YOLO AttributeError: {error_msg}", "detections": []}
+
+        except RuntimeError as e:
+            # [關鍵修復 3] 專門處理 "Expected all tensors to be on the same device"
+            if "same device" in str(e):
+                print(f"--- [YOLO] 偵測到設備不一致，執行降級同步修復... ---")
+                try:
+                    model.cpu() # 先全部退回 CPU
+                    model.set_classes(labels_list) # 在 CPU 設定標籤
+                    model.to(device) # 再整台搬回 GPU
+                    print("--- [YOLO] 設備同步修復完成 ---")
+                except Exception as e2:
+                    return {"error": f"YOLO Device Sync Failed: {str(e2)}", "detections": []}
+            else:
+                return {"error": f"YOLO RuntimeError: {str(e)}", "detections": []}
+
         cap = cv2.VideoCapture(seg_path)
         fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
         total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
