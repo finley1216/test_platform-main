@@ -41,8 +41,8 @@ services:
   ollama:
     image: ollama/ollama:latest
     restart: unless-stopped
-    ports:
-      - "11434:11434"
+    # ports:
+    #   - "11434:11434"  # 移除端口映射，避免衝突。backend 可通過服務名 ollama:11434 訪問
     volumes:
       - ollama_data:/root/.ollama
     networks:
