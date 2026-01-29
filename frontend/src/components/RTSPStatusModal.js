@@ -21,12 +21,14 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   });
 
   // 為了讓前端能看到影片，我們需要用 MediaMTX 的 HLS 功能
-  // 直接使用 /live 路徑（stream-simulator 已經在推流）
-  const [hlsUrl, setHlsUrl] = useState(`http://${window.location.hostname}:8888/live`);
+  // 通過 nginx 代理訪問 HLS 流（避免防火牆問題）
+  // 使用 /live/ 路徑，mediamtx 會自動提供 HLS 播放器頁面
+  const [hlsUrl, setHlsUrl] = useState(`http://${window.location.hostname}:${window.location.port || 3000}/hls/live/`);
 
   useEffect(() => {
-    // 固定使用 /live 路徑
-    setHlsUrl(`http://${window.location.hostname}:8888/live`);
+    // 使用 nginx 代理的 HLS 路徑，自動使用當前 hostname 和 port
+    const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+    setHlsUrl(`http://${window.location.hostname}:${port}/hls/live/`);
   }, []);
 
   const seenResultsRef = useRef(new Set());
@@ -52,9 +54,11 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   useEffect(() => {
     // 視窗打開時立即允許顯示 HLS（使用 stream-simulator 的推流）
     if (isOpen) {
+      const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+      const hlsPath = `http://${window.location.hostname}:${port}/hls/live/`;
       setHlsStatus({ canPlay: true, message: "串流運行中", streamEnded: false });
-      setHlsUrl(`http://${window.location.hostname}:8888/live`);
-      console.log("🚀 [HLS] Modal opened, using stream-simulator feed at /live");
+      setHlsUrl(hlsPath);
+      console.log("🚀 [HLS] Modal opened, using stream-simulator feed at", hlsPath);
     }
     
     // 只有在視窗開啟且有 apiKey 時才啟動輪詢
@@ -115,8 +119,9 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
           return prev;
         });
         
-        // 確保 HLS URL 正確設置
-        setHlsUrl(`http://${window.location.hostname}:8888/live`);
+        // 確保 HLS URL 正確設置（使用 nginx 代理）
+        const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
+        setHlsUrl(`http://${window.location.hostname}:${port}/hls/live/`);
 
         // 2. 獲取分析進度 (改為併行請求以減少卡頓)
         const idsToTrack = [videoId, ...Object.keys(status || {})].filter(id => id);
@@ -248,7 +253,7 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
                 {hlsStatus.canPlay ? (
                   <>
                     <iframe
-                      src={`${hlsUrl}/`}
+                      src={hlsUrl.endsWith('/') ? hlsUrl : `${hlsUrl}/`}
                       style={{ width: '100%', height: '100%', border: 'none', position: 'absolute', top: 0, left: 0 }}
                       title="RTSP Preview"
                       allow="autoplay; fullscreen"
