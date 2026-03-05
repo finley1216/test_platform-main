@@ -1,13 +1,19 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-資料庫遷移腳本 - 修復 summaries 表結構
+資料庫遷移腳本 - 重建/修復資料表（summaries, object_crops, detection_items, alerts）
+PostgreSQL 資料清空後，在專案根目錄執行：
+  docker compose exec backend python src/migrate_database.py
+或本機（需能連到 Postgres）：
+  cd backend && PYTHONPATH=. python src/migrate_database.py
 """
 import os
 import sys
 
-# 將 src 目錄加入 Python 路徑
-sys.path.insert(0, os.path.dirname(__file__))
+# 確保 backend 根目錄在 path，才能 import src.database / src.models
+_backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
 
 def migrate_database():
     """執行資料庫遷移"""
@@ -16,11 +22,13 @@ def migrate_database():
     print("=" * 80)
     
     try:
-        from src.database import engine, Base
+        from src.database import engine, Base, ensure_pgvector_extension
         from src.models import Summary, ObjectCrop, DetectionItem, Alert
-        import sqlalchemy as sa
         from sqlalchemy import text, inspect
-        
+
+        print("\n[0/4] 確保 pgvector 擴展...")
+        ensure_pgvector_extension()
+
         print("\n[1/4] 連接到資料庫...")
         with engine.connect() as conn:
             # 檢查連接
@@ -46,13 +54,15 @@ def migrate_database():
             if 'detection_items' in missing_tables:
                 print("\n初始化 detection_items 預設資料...")
                 try:
-                    # 執行初始化腳本
                     import subprocess
+                    cwd = os.environ.get("PROJECT_ROOT", _backend_root)
                     result = subprocess.run(
-                        ["python", "src/init_detection_items.py"],
-                        cwd="/app",
+                        [sys.executable, "src/init_detection_items.py"],
+                        cwd=cwd,
+                        env={**os.environ, "PYTHONPATH": cwd},
                         capture_output=True,
-                        text=True
+                        text=True,
+                        timeout=60,
                     )
                     if result.returncode == 0:
                         print("✓ detection_items 預設資料初始化完成")

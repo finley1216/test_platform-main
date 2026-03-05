@@ -55,9 +55,14 @@ const ModelConfig = ({
           <select
             className="form-select"
             value={modelType}
-            onChange={(e) => onModelTypeChange(e.target.value)}
+            onChange={(e) => {
+              const v = e.target.value;
+              onModelTypeChange(v);
+              if (v === "moondream") onQwenModelChange("moondream3-preview");
+            }}
           >
             <option value="qwen">Qwen (Multimodal via Ollama)</option>
+            <option value="moondream">Moondream (Local)</option>
             {/* <option value="gemini">Google Gemini (Cloud API)</option> */}
           </select>
         </div>
@@ -85,6 +90,20 @@ const ModelConfig = ({
                   <option value="qwen2.5vl:latest">qwen2.5vl:latest</option>
                 </>
               )}
+            </select>
+          </div>
+        )}
+
+        {modelType === "moondream" && (
+          <div className="form-group">
+            <label className="form-label">Model Version</label>
+            <select
+              className="form-select"
+              value={qwenModel}
+              onChange={(e) => onQwenModelChange(e.target.value)}
+            >
+              <option value="moondream3-preview">moondream3-preview</option>
+              <option value="moondream-2b-2025-04-14">moondream-2b-2025-04-14</option>
             </select>
           </div>
         )}

@@ -454,42 +454,28 @@ class RTSPStreamManager:
 
     @staticmethod
     def _analyze_file(video_id, file_path, duration):
-        # 1. 獲取系統預設的 Event Prompt
-        from src.main import EVENT_DETECTION_PROMPT
-        
-        # 2. 建立 Request 物件 (只進行事件偵測，跳過摘要以加速)
-        stem = file_path.stem 
-        
-        req = SegmentAnalysisRequest(
-            segment_path=str(file_path),
-            segment_index=0, # RTSP 流不需要 index
-            start_time=0.0,  # 這些在 RTSP 場景相對不重要，可填 0
-            end_time=float(duration),
-            model_type="qwen", # 預設模型
-            qwen_model="qwen2.5vl:latest",
-            frames_per_segment=8,
-            target_short=720,
-            event_detection_prompt=EVENT_DETECTION_PROMPT,
-            summary_prompt="",  # [加速] 空字串代表跳過摘要生成
-            yolo_labels="person,car", # 預設 YOLO
-            yolo_every_sec=2.0,
-            yolo_score_thr=0.25
-        )
-
-        # 2. 執行分析 (Blocking)
+        """使用與 POST /v1/analyze_segment_result 相同的單一入口，不重複實作分析與寫 DB。"""
+        stem = file_path.stem
+        req = {
+            "segment_path": str(file_path),
+            "segment_index": 0,
+            "start_time": 0.0,
+            "end_time": float(duration),
+            "model_type": "qwen",
+            "qwen_model": "qwen2.5vl:latest",
+            "frames_per_segment": 8,
+            "target_short": 720,
+            "event_detection_prompt": EVENT_DETECTION_PROMPT,
+            "summary_prompt": "",
+            "yolo_labels": "person,car",
+            "yolo_every_sec": 2.0,
+            "yolo_score_thr": 0.25,
+        }
         print(f"--- [RTSP] ⚡ 極速模式分析中: {file_path.name}... ---")
-        result = AnalysisService.analyze_segment(req)
-        
-        # 補上 video_id 資訊，確保 DB 知道這是哪個 stream
-        # 注意：我們使用 video_id 作為 summary 表的 video 欄位
-        result["video"] = video_id 
-        result["time_range"] = stem # 用檔名當時間標記
-
-        # 3. 存入資料庫
-        db = SessionLocal()
-        try:
-            # 這裡我們把單一結果包成 list 傳進去
-            _save_results_to_postgres(db, [result], video_id)
-            print(f"--- [RTSP] ✓ 分析完成並存檔: {file_path.name} ---")
-        finally:
-            db.close()
+        analyze_segment_and_optionally_save(
+            req,
+            save_to_db=True,
+            video_id=video_id,
+            time_range=stem,
+        )
+        print(f"--- [RTSP] ✓ 分析完成並存檔: {file_path.name} ---")

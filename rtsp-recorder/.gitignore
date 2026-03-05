@@ -1,0 +1,10 @@
+backup/
+dataset/
+dataset_detection/
+dataset_test/
+dataset_test_video/
+frames/
+videos/
+__pycache__/
+*.pyc
+video/

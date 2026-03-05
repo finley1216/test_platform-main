@@ -12,6 +12,7 @@ def _fmt_hms(seconds: float) -> str:
     h, m = divmod(m, 60)
     return f"{h:02d}:{m:02d}:{s:02d}"
 
+# 使用 ffprobe 取得影片長度
 def _probe_duration_seconds(video_path: str) -> float:
     """使用 ffprobe 獲取影片長度"""
     if not video_path or not Path(video_path).exists():
@@ -38,6 +39,7 @@ def _probe_duration_seconds(video_path: str) -> float:
         print(f"--- [VideoUtils] 獲取影片長度失敗: {e} ---")
         return 0.0
 
+# 用 ffmpeg 依 segment_duration、overlap 把影片切成多段 segment_000.mp4
 def _split_one_video(video_path: str, out_dir: Path, segment_duration: float, overlap: float, prefix: str = "segment", resolution: Optional[int] = None, strict_mode: bool = False) -> List[Path]:
     """將影片切割成多個片段"""
     duration = _probe_duration_seconds(video_path)

@@ -7,6 +7,8 @@ services:
       - "8554:8554"   # RTSP 埠
       - "8888:8888"   # HLS 埠 (可選用)
       - "8889:8889"   # WebRTC 埠 (可選用)
+    volumes:
+      - ./mediamtx/mediamtx.yml:/mediamtx.yml:ro
     environment:
       - MTX_HLSVARIANT=fmp4
       - MTX_HLSALLOWORIGINS=*
@@ -25,7 +27,7 @@ services:
       - ../video:/videos:ro  # 掛載實體影片路徑
     networks:
       - app-network
-    # 最終穩定版推流：240p, 10fps, 使用 setpts 強制時間戳連續，解決循環播放斷線問題
+    # 推流到 /simulator，避免覆蓋監控用的 /live（/live 改由外部 RTSP 拉流）
     command: >
       -re -stream_loop -1 
       -i "/videos/門禁遮臉入場/Video_衛哨端出入口.avi" 
@@ -35,7 +37,7 @@ services:
       -an
       -f rtsp 
       -rtsp_transport tcp
-      rtsp://rtsp-server:8554/live
+      rtsp://rtsp-server:8554/simulator
 
   # Ollama Service
   ollama:
@@ -43,6 +45,10 @@ services:
     restart: unless-stopped
     # ports:
     #   - "11434:11434"  # 移除端口映射，避免衝突。backend 可通過服務名 ollama:11434 訪問
+    environment:
+      - OLLAMA_MAX_LOADED_MODELS=1
+      # -1=永久預載；0=不預載（關閉後即卸載）；正數=閒置 N 分鐘後卸載。要省 GPU 可設 0
+      - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
     volumes:
       - ollama_data:/root/.ollama
     networks:
@@ -103,8 +109,11 @@ services:
       dockerfile: Dockerfile
       network: host
     restart: unless-stopped
+    shm_size: "2gb"  # 電腦視覺/多 worker 需較大 shared memory
     deploy:
       resources:
+        limits:
+          memory: 16G
         reservations:
           devices:
             - driver: nvidia
@@ -114,8 +123,13 @@ services:
       - PROJECT_ROOT=${PROJECT_ROOT}
       - HOST=${HOST}
       - PORT=8080
-      - RELOAD=${RELOAD}
+      - RELOAD=${RELOAD:-false}
+      # 每個 worker 為獨立 process，各載一份 Qwen+YOLO+ReID（約 17GB/process）。要改多 worker 請改下面為 WORKERS=2 或改用 ${WORKERS:-1} 並在 .env 設 WORKERS
+      # - WORKERS=4
       - WORKERS=1
+      - PRELOAD_CLIP=${PRELOAD_CLIP:-false}
+      - PRELOAD_YOLO_REID=${PRELOAD_YOLO_REID:-true}
+      - PRELOAD_SENTENCE_TRANSFORMER=${PRELOAD_SENTENCE_TRANSFORMER:-true}
       - LOG_LEVEL=${LOG_LEVEL}
       - ADMIN_TOKEN=${ADMIN_TOKEN}
       - SESSION_TTL_SEC=${SESSION_TTL_SEC}
@@ -123,7 +137,9 @@ services:
       - RAG_DIR=./rag_store
       - RAG_STORE_DIR=./rag_store
       - OLLAMA_EMBED_MODEL=bge-m3
+      - OLLAMA_LLM_MODEL=qwen2.5vl:latest
       - OLLAMA_BASE=http://ollama:11434
+      - OLLAMA_REQUEST_TIMEOUT=600
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
       - POSTGRES_USER=postgres
@@ -131,13 +147,28 @@ services:
       - POSTGRES_DB=postgres
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
+      - MOONDREAM_MODELS_DIR=/app/models
+      # 離線或無法下載時：先在本機執行 mkdir -p yolo_weights && wget -O yolo_weights/yolov8s-world.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-world.pt
+      - YOLO_WEIGHTS_PATH=/app/yolo_weights/yolov8s-world.pt
+      # Moondream 等 trust_remote_code 會寫入 cache；若主機 cache 唯讀，改寫到容器內可寫路徑
+      # 與下方 volume 對應，讓本機已下載的 Qwen 被容器使用
+      - HF_HOME=/root/.cache/huggingface
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      # 容器無外網：huggingface_hub 與 transformers 皆不連線
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+      - QWEN_25VL_SNAPSHOT_PATH=${QWEN_25VL_SNAPSHOT_PATH:-}
     volumes:
+      - ./models:/app/models
+      - ./yolo_weights:/app/yolo_weights
+      - backend_hf_cache:/app/.cache/huggingface
       - ./backend/src:/app/src:delegated
       - ./backend/segment:/app/segment
       - ./backend/rag_store:/app/rag_store
       - ./backend/prompts:/app/prompts
       - ../video:/app/video:ro
-      - ~/.cache/huggingface:/root/.cache/huggingface:ro  # 掛載 Hugging Face 模型緩存
+      # 本機 HF cache：用與 download 腳本相同使用者的 $HOME，或於 .env 設 HF_CACHE_HOST=/mnt/10THDD/M133040024/.cache/huggingface
+      - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -152,6 +183,13 @@ services:
         condition: service_started
       rtsp-server: # 確保 backend 知道 rtsp-server 存在
         condition: service_started
+    healthcheck:
+      # 當 worker 全死導致 API 無回應時，healthcheck 失敗會觸發容器重啟
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8080/health', timeout=10)"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 90s
 
   frontend:
     build:
@@ -201,4 +239,5 @@ volumes:
   ollama_data:
   postgres_data:
   pgadmin_data:
+  backend_hf_cache:
 

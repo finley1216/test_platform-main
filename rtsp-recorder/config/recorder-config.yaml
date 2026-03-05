@@ -1,0 +1,26 @@
+project:
+  name: recorder
+  root: ${PROJECT_ROOT}
+
+output:
+  directory: ${PROJECT_ROOT}/video
+
+recording:
+  enabled: true
+  segment_duration: 10  # 每段 10 秒，與 API pipeline 對接
+  max_duration: 3600    # in seconds (1 hour)
+  retry_delay: 5        # in seconds
+
+housekeeping:
+  enabled: false
+  days_to_keep: 30
+  cleanup_time: "02:00"
+
+stream:
+  reconnect_delay: 5
+  max_consecutive_failures: 1000
+  frame_read_timeout: 0.5
+  buffer_size: 3
+  expected_fps: 30
+  expected_width: 1920
+  expected_height: 1080

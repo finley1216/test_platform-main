@@ -197,6 +197,16 @@ class ApiService {
     if (data.date_parsed || data.keywords_found || data.event_types_found || data.embedding_query) {
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
       console.log("%c[查詢解析] 原始查詢: " + query, "color: #60a5fa; font-weight: bold");
+      if (data.date_parsed) {
+        const d = data.date_parsed;
+        console.log("%c[查詢解析] 日期: 模式=" + (d.mode || "—") + (d.time_start ? " | " + d.time_start + " ~ " + (d.time_end || "—") : ""), "color: #34d399; font-weight: bold");
+      }
+      if (data.event_types_found && data.event_types_found.length > 0) {
+        console.log("%c[查詢解析] 事件類型: " + data.event_types_found.join("、"), "color: #f59e0b; font-weight: bold");
+      }
+      if (data.keywords_found && data.keywords_found.length > 0) {
+        console.log("%c[查詢解析] 關鍵字/特殊詞白名單對應: " + data.keywords_found.join("、"), "color: #a78bfa; font-weight: bold");
+      }
       if (data.embedding_query) console.log("%c[向量搜索] Embedding 查詢文本: " + data.embedding_query, "color: #a78bfa; font-weight: bold");
       console.log("%c" + "=".repeat(60), "color: #60a5fa; font-weight: bold");
     }

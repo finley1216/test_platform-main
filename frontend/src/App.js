@@ -165,7 +165,7 @@ function App() {
     formData.append("segment_duration", segDur);
     formData.append("overlap", overlap);
 
-    if (modelType === "qwen" || modelType === "gemini") {
+    if (modelType === "qwen" || modelType === "gemini" || modelType === "moondream") {
       formData.append("qwen_model", qwenModel);
       const calculatedFrames = Math.max(1, Math.ceil(samplingFps * segDur));
       formData.append("frames_per_segment", calculatedFrames);

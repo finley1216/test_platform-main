@@ -1,0 +1,10 @@
+# MediaMTX 設定：監控畫面 /live 從外部 RTSP 拉流
+# 前端透過 /hls/live/ 播放
+
+readTimeout: 30s
+writeTimeout: 30s
+
+paths:
+  live:
+    source: rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream
+    rtspTransport: tcp

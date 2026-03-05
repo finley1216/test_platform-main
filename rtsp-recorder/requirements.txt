@@ -1,0 +1,6 @@
+opencv-python-headless
+numpy
+schedule
+PyYAML>=6.0
+python-dotenv
+requests

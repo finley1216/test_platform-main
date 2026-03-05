@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
 import os
+import subprocess
 import requests
 import tempfile
 import shutil
@@ -126,6 +127,31 @@ class VideoService:
                     f.write(chunk)
         return tmp
 
+    @staticmethod
+    def capture_rtsp_to_temp(rtsp_url: str, duration_sec: float) -> str:
+        """從 RTSP 串流擷取指定秒數到暫存檔，供後續切割與分析。回傳暫存檔路徑。"""
+        fd, tmp = tempfile.mkstemp(prefix="rtsp_capture_", suffix=".mp4")
+        os.close(fd)
+        cmd = [
+            "ffmpeg", "-y",
+            "-rtsp_transport", "tcp",
+            "-i", rtsp_url,
+            "-t", str(duration_sec),
+            "-c", "copy",
+            "-movflags", "+faststart",
+            tmp,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=int(duration_sec) + 60)
+        if proc.returncode != 0:
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            err = (proc.stderr or proc.stdout or "")[-500:]
+            raise ValueError(f"FFmpeg RTSP capture failed: {err}")
+        return tmp
+
+    # 取得原始檔、準備輸出目錄並呼叫切割
     @staticmethod
     def prepare_segments(
         video_path: Optional[str],

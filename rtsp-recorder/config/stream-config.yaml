@@ -1,0 +1,52 @@
+# 若多路使用「同一個 URL」，設備可能只接受有限連線，其餘會排隊/逾時。
+# 若出現 Stream timeout：先確認沒有殘留的錄影程序（見 README 或下方註解）。
+rtsp_streams:
+  - location: "Test_Site"
+    camera: "Ch1"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site2"
+    camera: "Ch2"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site3"
+    camera: "Ch3"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site4"
+    camera: "Ch4"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site5"
+    camera: "Ch5"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site6"
+    camera: "Ch6"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site7"
+    camera: "Ch7"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site8"
+    camera: "Ch8"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site9"
+    camera: "Ch9"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true
+
+  - location: "Test_Site10"
+    camera: "Ch10"
+    url: "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"
+    enabled: true

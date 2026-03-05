@@ -30,6 +30,11 @@ class Config:
         # ================== Ollama Configuration ==================
         self.OLLAMA_BASE: str = os.getenv("OLLAMA_BASE", "http://127.0.0.1:11434")
         self.OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
+        self.OLLAMA_LLM_MODEL: str = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5vl:latest")
+        self.OLLAMA_REQUEST_TIMEOUT: int = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "600"))  # VLM 運算較久時避免連線中斷（秒）
+        # RAG 回答優化配置
+        self.RAG_ANSWER_TOP_K: int = int(os.getenv("RAG_ANSWER_TOP_K", "5"))  # 生成回答時使用的片段數量（預設5個以確保完整性）
+        self.RAG_ANSWER_SUMMARY_MAX_LEN: int = int(os.getenv("RAG_ANSWER_SUMMARY_MAX_LEN", "500"))  # 每個摘要的最大長度（增加到500以保留更多資訊）
 
         # ================== Gemini API Configuration ==================
         self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
@@ -55,6 +60,14 @@ class Config:
         # ================== ReID Configuration ==================
         # 是否允許在 ReID 模型不可用時回退到 CLIP（預設為 false，強制使用 ReID）
         self.ALLOW_REID_FALLBACK_TO_CLIP: bool = os.getenv("ALLOW_REID_FALLBACK_TO_CLIP", "false").lower() in ("true", "1", "yes")
+
+        # ================== Startup / Preload ==================
+        # 是否在啟動時預載入 CLIP（以圖搜圖）。關閉可避免離線環境連線 Huggingface 導致 DNS 重試與卡住
+        self.PRELOAD_CLIP: bool = os.getenv("PRELOAD_CLIP", "false").lower() in ("true", "1", "yes")
+        # 是否在啟動時預載入 YOLO+ReID（segment_pipeline 用）。關閉可省 GPU，改為首次請求時載入
+        self.PRELOAD_YOLO_REID: bool = os.getenv("PRELOAD_YOLO_REID", "true").lower() in ("true", "1", "yes")
+        # 是否在啟動時預載入 SentenceTransformer（RAG 用）。關閉可省 GPU
+        self.PRELOAD_SENTENCE_TRANSFORMER: bool = os.getenv("PRELOAD_SENTENCE_TRANSFORMER", "true").lower() in ("true", "1", "yes")
 
         # ================== File Paths ==================
         self.SEGMENT_DIR: Path = Path(os.getenv("SEGMENT_DIR", "./segment"))

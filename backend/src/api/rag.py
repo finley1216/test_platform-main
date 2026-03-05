@@ -157,7 +157,7 @@ async def rag_search(
     
     payload = await request.json()
     query = payload.get("query", "").strip()
-    top_k = int(payload.get("top_k", 5))
+    top_k = int(payload.get("top_k", 5))  # 預設搜索5個，但生成回答時可能只用前3個
     score_threshold = float(payload.get("score_threshold", 0.35))
     
     if not query:
@@ -307,35 +307,88 @@ async def rag_answer(
             "hits": [],
             "success": True
         }
-        
-    # 2. 構建上下文
-    context = _results_to_docs(hits)
+    
+    # 2. 決定傳給 LLM 的片段數量
+    # 如果查詢包含特定關鍵字（顏色、服裝等），使用更多片段以確保完整性
+    from src.config import config
     payload = await request.json()
     query = payload.get("query", "")
     
-    prompt = f"""
-    你是一個專業的安控系統助手。請根據以下從影片分析資料庫中檢索到的片段資訊，回答使用者的問題。
+    # 檢查查詢是否包含需要詳細分析的關鍵字
+    detail_keywords = ["顏色", "衣服", "上衣", "褲子", "帽子", "藍色", "紅色", "黃色", "綠色", "黑色", "白色", "灰色"]
+    needs_more_context = any(kw in query for kw in detail_keywords)
     
-    檢索到的相關片段：
-    {context}
+    # 根據查詢類型決定使用的片段數量
+    base_top_k = config.RAG_ANSWER_TOP_K
+    if needs_more_context:
+        # 對於需要詳細分析的查詢，使用更多片段
+        top_k_for_answer = min(int(payload.get("top_k_for_answer", base_top_k * 2)), len(hits))
+    else:
+        top_k_for_answer = min(int(payload.get("top_k_for_answer", base_top_k)), len(hits))
     
-    使用者問題：{query}
+    # 只使用最相關的 top_k_for_answer 個片段來生成回答
+    hits_for_answer = hits[:top_k_for_answer]
     
-    請注意：
-    1. 如果資訊不足以回答問題，請誠實說明。
-    2. 請用繁體中文回答。
-    3. 盡量提及具體的影片名稱和時間範圍。
-    """
+    # 3. 構建上下文（保留完整摘要，不截斷關鍵資訊）
+    context_blocks = []
+    summary_max_len = config.RAG_ANSWER_SUMMARY_MAX_LEN
+    for i, hit in enumerate(hits_for_answer, start=1):
+        video = hit.get("video", "未知影片")
+        time_range = hit.get("time_range", "")
+        summary = hit.get("summary", "")
+        score = hit.get("score", 0.0)
+        
+        # 如果摘要超過長度限制，嘗試智能截斷（保留完整句子）
+        if len(summary) > summary_max_len:
+            # 找到最後一個句號、問號或驚嘆號的位置
+            truncated = summary[:summary_max_len]
+            last_sentence_end = max(
+                truncated.rfind("。"),
+                truncated.rfind("！"),
+                truncated.rfind("？"),
+                truncated.rfind("."),
+                truncated.rfind("!"),
+                truncated.rfind("?")
+            )
+            if last_sentence_end > summary_max_len * 0.7:  # 如果最後一個句子結束位置在70%之後，使用該位置
+                summary_short = summary[:last_sentence_end + 1] + "..."
+            else:
+                summary_short = truncated + "..."
+        else:
+            summary_short = summary
+        
+        context_blocks.append(
+            f"[{i}] 影片：{video}  時間：{time_range}  相似度：{score:.1%}\n摘要：{summary_short}"
+        )
     
-    # 3. 呼叫 Ollama 生成回答
+    context = "\n\n".join(context_blocks)
+    
+    # 4. 改進 prompt：強調要仔細閱讀所有片段
+    prompt = f"""你是一個專業的安控系統助手。請仔細閱讀以下所有片段摘要，根據實際內容回答問題。
+
+重要提醒：
+1. 請仔細檢查每個片段的完整摘要內容
+2. 如果任何片段中包含與問題相關的資訊，請明確指出
+3. 用繁體中文回答，並附上你參考的片段編號（例如 [1]、[2]）
+4. 如果資料中確實有相關資訊，請不要說「沒有資料」或「找不到」
+
+片段摘要：
+{context}
+
+使用者問題：{query}
+
+請根據上述片段摘要回答問題。"""
+    
+    # 5. 呼叫 Ollama 生成回答
     try:
-        from src.config import config
         messages = [{"role": "user", "content": prompt}]
-        answer = _ollama_chat(config.OLLAMA_EMBED_MODEL, messages)
+        # 使用 LLM 模型生成回答，而不是 embedding 模型
+        # 減少 timeout 到 5 分鐘（原本是10分鐘），加快錯誤檢測
+        answer = _ollama_chat(config.OLLAMA_LLM_MODEL, messages, timeout=300)
         
         return {
             "answer": answer,
-            "hits": hits,
+            "hits": hits,  # 返回所有搜索結果
             "success": True,
             "date_parsed": search_resp.get("date_parsed"),
             "keywords_found": search_resp.get("keywords_found"),

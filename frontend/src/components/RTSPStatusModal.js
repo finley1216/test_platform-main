@@ -1,8 +1,18 @@
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect, useRef, useMemo } from 'react';
 import apiService from '../services/api';
+import { getApiBaseUrl } from '../utils/constants';
+
+// 本地影片路徑（供「本地影片」模式播放，之後可接切割 API）
+const LOCAL_VIDEO_PATH = '門禁遮臉入場/Video_衛哨端出入口.avi';
+const getLocalVideoUrl = () => {
+  const base = getApiBaseUrl();
+  return `${base}/v1/stream_video?path=${encodeURIComponent(LOCAL_VIDEO_PATH)}`;
+};
 
 const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
-  const [url, setUrl] = useState("rtsp://rtsp-server:8554/live"); // Docker 內部地址
+  // const [url, setUrl] = useState("rtsp://rtsp-server:8554/live"); // Docker 內部地址
+
+  const [url, setUrl] = useState("rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream"); // Docker 內部地址
   const [videoId, setVideoId] = useState("CAM_01");
   const [activeStreams, setActiveStreams] = useState({});
   const [logs, setLogs] = useState([]);
@@ -24,6 +34,13 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   // 通過 nginx 代理訪問 HLS 流（避免防火牆問題）
   // 使用 /live/ 路徑，mediamtx 會自動提供 HLS 播放器頁面
   const [hlsUrl, setHlsUrl] = useState(`http://${window.location.hostname}:${window.location.port || 3000}/hls/live/`);
+  // 檢視模式：'rtsp' = 即時 HLS 串流（原有），'local' = 本地影片（門禁遮臉入場）
+  const [viewMode, setViewMode] = useState('rtsp');
+  // 本地影片載入錯誤（無法播放時顯示）
+  const [localVideoError, setLocalVideoError] = useState(null);
+  const [localVideoReady, setLocalVideoReady] = useState(false);
+  // 穩定 URL，避免每次 re-render 都變動導致影片重載或卡頓
+  const localVideoUrl = useMemo(() => getLocalVideoUrl(), []);
 
   useEffect(() => {
     // 使用 nginx 代理的 HLS 路徑，自動使用當前 hostname 和 port
@@ -249,8 +266,71 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
             
             {/* 左側：影片與控制 */}
             <div style={{ flex: '1.4', display: 'flex', flexDirection: 'column' }}>
+              {/* 切換：即時串流 / 本地影片 */}
+              <div style={{ display: 'flex', gap: '8px', marginBottom: '10px' }}>
+                <button
+                  type="button"
+                  onClick={() => setViewMode('rtsp')}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: '6px',
+                    border: viewMode === 'rtsp' ? '2px solid #4CAF50' : '1px solid #444',
+                    background: viewMode === 'rtsp' ? 'rgba(76, 175, 80, 0.2)' : '#2d2d2d',
+                    color: viewMode === 'rtsp' ? '#4CAF50' : '#aaa',
+                    fontWeight: viewMode === 'rtsp' ? 'bold' : 'normal',
+                    cursor: 'pointer',
+                    fontSize: '13px'
+                  }}
+                >
+                  ● 即時串流 (HLS)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => { setViewMode('local'); setLocalVideoError(null); setLocalVideoReady(false); }}
+                  style={{
+                    padding: '8px 16px',
+                    borderRadius: '6px',
+                    border: viewMode === 'local' ? '2px solid #2196F3' : '1px solid #444',
+                    background: viewMode === 'local' ? 'rgba(33, 150, 243, 0.2)' : '#2d2d2d',
+                    color: viewMode === 'local' ? '#2196F3' : '#aaa',
+                    fontWeight: viewMode === 'local' ? 'bold' : 'normal',
+                    cursor: 'pointer',
+                    fontSize: '13px'
+                  }}
+                >
+                  📁 本地影片（門禁遮臉入場）
+                </button>
+              </div>
               <div style={{ background: 'black', flex: 1, minHeight: '360px', marginBottom: '20px', borderRadius: '8px', overflow: 'hidden', border: '1px solid #333', position: 'relative', display: 'flex', alignItems: 'center', justifyContent: 'center' }}>
-                {hlsStatus.canPlay ? (
+                {viewMode === 'local' ? (
+                  <>
+                    {localVideoError ? (
+                      <div style={{ padding: '24px', textAlign: 'center', color: '#ff9800' }}>
+                        <div style={{ fontSize: '14px', marginBottom: '8px' }}>⚠️ {localVideoError}</div>
+                        <div style={{ fontSize: '12px', color: '#888' }}>若為 AVI 格式，部分瀏覽器可能不支援，可改用 Chrome 或將影片轉為 MP4。</div>
+                      </div>
+                    ) : (
+                      <video
+                        key="local-video"
+                        src={localVideoUrl}
+                        controls
+                        preload="auto"
+                        style={{ width: '100%', height: '100%', objectFit: 'contain' }}
+                        title="本地影片"
+                        onLoadedData={() => { setLocalVideoReady(true); setLocalVideoError(null); }}
+                        onCanPlay={() => { setLocalVideoReady(true); setLocalVideoError(null); }}
+                        onError={(e) => {
+                          const msg = e?.target?.error?.message || '無法載入影片';
+                          setLocalVideoError(msg);
+                          setLocalVideoReady(false);
+                        }}
+                      />
+                    )}
+                    <div style={{ position: 'absolute', top: '10px', right: '10px', background: 'rgba(0,0,0,0.7)', padding: '4px 10px', borderRadius: '4px', fontSize: '11px', color: '#2196F3', fontWeight: 'bold', zIndex: 10 }}>
+                      📁 本地影片 - {LOCAL_VIDEO_PATH}
+                    </div>
+                  </>
+                ) : hlsStatus.canPlay ? (
                   <>
                     <iframe
                       src={hlsUrl.endsWith('/') ? hlsUrl : `${hlsUrl}/`}

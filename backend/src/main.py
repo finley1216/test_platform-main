@@ -249,55 +249,73 @@ async def startup_event():
         print("=" * 80)
         print("--- [啟動] 開始預載入模型（背景執行）... ---")
         
-        # 預載入 CLIP 模型（以圖搜圖功能）
-        try:
-            print("--- [啟動] 預載入 CLIP 模型... ---")
-            # 設置超時，避免無限等待
-            import signal
-            
-            def timeout_handler(signum, frame):
-                raise TimeoutError("CLIP 模型載入超時")
-            
-            # 只在非 Windows 系統上使用 signal
+        # 預載入 CLIP 模型（以圖搜圖功能）；PRELOAD_CLIP=false 時跳過，避免離線環境連線 Huggingface 導致 DNS 重試與卡住
+        if config.PRELOAD_CLIP:
             try:
-                signal.signal(signal.SIGALRM, timeout_handler)
-                signal.alarm(60)  # 60 秒超時
-            except (AttributeError, ValueError):
-                pass  # Windows 不支持 SIGALRM
-            
-            try:
-                from src.core.model_loader import get_clip_model
-                clip_model, clip_processor = get_clip_model()
-                if clip_model is not None and clip_processor is not None:
-                    print("✓ CLIP 模型預載入完成")
-                else:
-                    print("⚠️  CLIP 模型預載入失敗（模型為 None）")
-            finally:
+                print("--- [啟動] 預載入 CLIP 模型... ---")
+                import signal
+                def timeout_handler(signum, frame):
+                    raise TimeoutError("CLIP 模型載入超時")
                 try:
-                    signal.alarm(0)  # 取消超時
+                    signal.signal(signal.SIGALRM, timeout_handler)
+                    signal.alarm(60)
                 except (AttributeError, ValueError):
                     pass
-        except TimeoutError:
-            print("⚠️  CLIP 模型預載入超時（60秒），將在首次使用時載入")
-        except Exception as e:
-            print(f"⚠️  CLIP 模型預載入失敗: {e}")
-            import traceback
-            traceback.print_exc()
-            # 不中斷啟動，讓應用繼續運行
+                try:
+                    from src.core.model_loader import get_clip_model
+                    clip_model, clip_processor = get_clip_model()
+                    if clip_model is not None and clip_processor is not None:
+                        print("✓ CLIP 模型預載入完成")
+                    else:
+                        print("⚠️  CLIP 模型預載入失敗（模型為 None）")
+                finally:
+                    try:
+                        signal.alarm(0)
+                    except (AttributeError, ValueError):
+                        pass
+            except TimeoutError:
+                print("⚠️  CLIP 模型預載入超時（60秒），將在首次使用時載入")
+            except Exception as e:
+                print(f"⚠️  CLIP 模型預載入失敗: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("--- [啟動] 略過 CLIP 預載入（PRELOAD_CLIP=false）---")
+        
+        # 預載入 YOLO 與 ReID 單例（segment_pipeline 必用，僅載入一次供所有請求共用）
+        if config.PRELOAD_YOLO_REID:
+            try:
+                print("--- [啟動] 預載入 YOLO 與 ReID 模型（單例）... ---")
+                from src.core.model_loader import get_yolo_model, get_reid_model
+                yolo = get_yolo_model()
+                reid_m, reid_d = get_reid_model()
+                if yolo and reid_m is not None:
+                    print("✓ YOLO 與 ReID 模型預載入完成")
+                else:
+                    print("⚠️  YOLO 或 ReID 預載入未完全成功，將在首次請求時再試")
+            except Exception as e:
+                print(f"⚠️  YOLO/ReID 預載入失敗: {e}")
+                import traceback
+                traceback.print_exc()
+        else:
+            print("--- [啟動] 略過 YOLO/ReID 預載入（PRELOAD_YOLO_REID=false）---")
         
         # 預載入 SentenceTransformer 模型（RAG 搜索功能）
-        try:
-            print("--- [啟動] 預載入 SentenceTransformer 模型... ---")
-            embedding_model = get_embedding_model()
-            if embedding_model is not None:
-                print("✓ SentenceTransformer 模型預載入完成")
-            else:
-                print("⚠️  SentenceTransformer 模型預載入失敗（模型為 None）")
-        except Exception as e:
-            print(f"⚠️  SentenceTransformer 模型預載入失敗: {e}")
-            import traceback
-            traceback.print_exc()
-            # 不中斷啟動，讓應用繼續運行
+        if config.PRELOAD_SENTENCE_TRANSFORMER:
+            try:
+                print("--- [啟動] 預載入 SentenceTransformer 模型... ---")
+                embedding_model = get_embedding_model()
+                if embedding_model is not None:
+                    print("✓ SentenceTransformer 模型預載入完成")
+                else:
+                    print("⚠️  SentenceTransformer 模型預載入失敗（模型為 None）")
+            except Exception as e:
+                print(f"⚠️  SentenceTransformer 模型預載入失敗: {e}")
+                import traceback
+                traceback.print_exc()
+                # 不中斷啟動，讓應用繼續運行
+        else:
+            print("--- [啟動] 略過 SentenceTransformer 預載入（PRELOAD_SENTENCE_TRANSFORMER=false）---")
         
         print("--- [啟動] 模型預載入完成 ---")
         print("=" * 80)

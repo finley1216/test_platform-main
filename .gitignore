@@ -54,5 +54,7 @@ backend/segment/
 *.pt
 *.pth
 *.onnx
+*.safetensors
 backend/clip_cache/
 backend/models/
+models/

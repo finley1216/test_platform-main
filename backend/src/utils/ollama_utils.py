@@ -6,7 +6,8 @@ from typing import List, Dict, Any, Optional, Tuple
 from src.config import config
 
 def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[List[str]] = None, stream: bool = False) -> str:
-    """與 Ollama API 進行對話"""
+    
+    # 構建發送給 Ollama API 的 JSON 資料主體。
     payload = {
         "model": model_name,
         "messages": messages,
@@ -14,21 +15,35 @@ def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[Lis
         "options": {
             "temperature": 0.1,
             "top_p": 0.9,
-            "num_predict": 1024
+            # qwen3 等有 thinking 的模型會先把 token 用在 reasoning，需留足空間給實際 content（JSON+摘要）
+            "num_predict": 2048
         }
     }
+
+    # 如果傳入的圖片 Base64 字串列表存在，則將其附加到最後一個 user message 的 images 欄位。
     if images_b64:
         for msg in messages:
             if msg["role"] == "user":
                 msg["images"] = images_b64
                 break
     
+    # 構建 Ollama API 的 URL。
     url = f"{config.OLLAMA_BASE.rstrip('/')}/api/chat"
     try:
-        r = requests.post(url, json=payload, timeout=3600)
+
+        # 設定 HTTP 請求超時時間，預設為 600 秒（10 分鐘）。
+        timeout = getattr(config, "OLLAMA_REQUEST_TIMEOUT", 600)
+
+        # 發送 HTTP POST 請求到 Ollama API。
+        r = requests.post(url, json=payload, timeout=timeout)
+
+        # 檢查 HTTP 請求是否成功。
         r.raise_for_status()
+
+        # 如果 stream 為 True，則處理串流回應。
         if stream:
-            # 這裡簡單處理串流，實際使用可能需要更複雜的邏輯
+
+            # 初始化一個空字串，用於累積串流回應的文字。
             full_txt = ""
             for line in r.iter_lines():
                 if line:
@@ -36,8 +51,26 @@ def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[Lis
                     full_txt += j.get("message", {}).get("content", "")
                     if j.get("done"): break
             return full_txt
+
+        # 非串流，直接等待模型全部跑完，一次性拿回 JSON 結果並取出文字內容。
         else:
-            return r.json().get("message", {}).get("content", "")
+            data = r.json()
+            msg = data.get("message", {}) or {}
+            content = msg.get("content", "") or ""
+            thinking = msg.get("thinking", "") or ""
+            # qwen3 等模型會把整段輸出放在 thinking，content 為空；改為用 thinking 當作可解析文字
+            if not content and thinking:
+                print("--- [Ollama] content 為空，改使用 thinking 作為回應內容以供解析 ---")
+                content = thinking
+            # 若內容仍為空，印出完整 API 回應以便除錯
+            elif not content and data:
+                print("--- [Ollama] 回應內容為空，完整 API 回應如下 ---")
+                try:
+                    print(json.dumps(data, ensure_ascii=False, indent=2))
+                except Exception:
+                    print(data)
+                print("--- [Ollama] 以上為空回應時的完整 body ---")
+            return content
     except Exception as e:
         print(f"--- [Ollama] ✗ 請求失敗: {e} ---")
         raise
