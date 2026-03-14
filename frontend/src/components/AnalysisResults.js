@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useMemo, useRef } from "react";
-import { EVENT_MAP, getApiBaseUrl } from "../utils/constants";
+import { EVENT_MAP, getApiBaseUrl, getSegmentBaseUrl } from "../utils/constants";
 import apiService from "../services/api";
 
 const AnalysisResults = ({ data, apiKey, authenticated }) => {
@@ -343,7 +343,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
               }}
             >
               <source
-                src={`${getApiBaseUrl()}/${yoloOutput.annotated_video}`}
+                src={`${getSegmentBaseUrl()}/${yoloOutput.annotated_video}`}
                 type="video/mp4"
               />
               您的瀏覽器不支援影片播放
@@ -393,7 +393,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
           >
             {yoloOutput.object_crops_dir && (
               <a
-                href={`${getApiBaseUrl()}/${yoloOutput.object_crops_dir}`}
+                href={`${getSegmentBaseUrl()}/${yoloOutput.object_crops_dir}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{
@@ -413,7 +413,7 @@ const AnalysisResults = ({ data, apiKey, authenticated }) => {
             )}
             {yoloOutput.timestamp_file && (
               <a
-                href={`${getApiBaseUrl()}/${yoloOutput.timestamp_file}`}
+                href={`${getSegmentBaseUrl()}/${yoloOutput.timestamp_file}`}
                 target="_blank"
                 rel="noopener noreferrer"
                 style={{

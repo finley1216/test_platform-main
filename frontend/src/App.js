@@ -60,7 +60,7 @@ function App() {
 
   // Model configuration
   const [modelType, setModelType] = useState("qwen");
-  const [qwenModel, setQwenModel] = useState("qwen3-vl:8b");
+  const [qwenModel, setQwenModel] = useState("qwen2.5vl:latest");
   const [source, setSource] = useState("upload");
   const [videoUrl, setVideoUrl] = useState("");
   const [videoFile, setVideoFile] = useState(null);
@@ -140,7 +140,7 @@ function App() {
     if (modelType === "gemini") {
       setQwenModel("gemini-2.5-flash");
     } else if (modelType === "qwen") {
-      setQwenModel("qwen3-vl:8b");
+      setQwenModel("qwen2.5vl:latest");
     }
   }, [modelType]);
 

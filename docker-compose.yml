@@ -158,6 +158,9 @@ services:
       - TRANSFORMERS_OFFLINE=1
       - HF_HUB_OFFLINE=1
       - QWEN_25VL_SNAPSHOT_PATH=${QWEN_25VL_SNAPSHOT_PATH:-}
+      - QWEN_USE_QUANTIZATION=1
+      # TorchAO 量化與 torch.compile 衝突會導致 meta/cuda 錯誤，從 process 啟動就停用 dynamo
+      - TORCHDYNAMO_DISABLE=1
     volumes:
       - ./models:/app/models
       - ./yolo_weights:/app/yolo_weights

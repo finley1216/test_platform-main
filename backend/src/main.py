@@ -948,6 +948,30 @@ class SegmentAnalysisRequest(BaseModel):
     yolo_every_sec: float = 2.0
     yolo_score_thr: float = 0.25
 
+
+def analyze_segment_and_optionally_save(
+    req: Dict[str, Any],
+    save_to_db: bool = True,
+    video_id: Optional[str] = None,
+    time_range: Optional[str] = None,
+):
+    """
+    RTSP 串流用：分析單一片段並可選寫入 PostgreSQL。
+    影片會依 segment 慢慢送入，每產生一個 segment 就分析一個，而不是整段抓完再一起輸出。
+    """
+    from src.services.analysis_service import AnalysisService
+    request_obj = SegmentAnalysisRequest(**req)
+    result = AnalysisService.analyze_segment(request_obj)
+    if save_to_db and result and HAS_DB:
+        from src.database import SessionLocal
+        db = SessionLocal()
+        try:
+            _save_results_to_postgres(db, [result], video_id or "rtsp")
+        finally:
+            db.close()
+    return result
+
+
 # 影片分析相關 API 已移至 src.api.video_analysis
 
 # 它不親自做分析，而是負責調度資源與流程控制。影片，切割，片段影片填入標準格式，片段 API 處理，打包成大的 JSON
@@ -1102,7 +1126,7 @@ def _segment_pipeline_multipart_legacy(
     video_id: str = Form(None),  # 新增：重新分析已存在的影片
     segment_duration: float = Form(10.0),
     overlap: float = Form(0.0),
-    qwen_model: str = Form("qwen3-vl:8b"),
+    qwen_model: str = Form("qwen2.5vl:latest"),
     frames_per_segment: int = Form(8),
     target_short: int = Form(720),
     sampling_fps: Optional[float] = Form(None),  # 新增：取樣 FPS（如果提供則嚴格遵循）

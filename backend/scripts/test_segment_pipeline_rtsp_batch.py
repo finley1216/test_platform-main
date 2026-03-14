@@ -278,24 +278,57 @@ def _run_batch_mode(
                         )
                         results = api_resp.get("results") or []
                         t_end = time.time()
+                        api_process_sec = api_resp.get("process_time_sec")
+                        api_total_sec = api_resp.get("total_time_sec")
                         for j, (vid, _path, fname, put_time) in enumerate(batch):
+                            r = results[j] if j < len(results) else {}
+                            wait_in_queue = round(t_upload - put_time, 3)
+                            upload_plus_backend = round(t_end - t_upload, 3)
                             rec = {
                                 "video_id": vid,
                                 "filename": fname,
                                 "segment_sec": segment_sec,
                                 "queue_to_db_sec": round(t_end - put_time, 3),
-                                "success": results[j].get("success", False) if j < len(results) else False,
-                                "time_sec": results[j].get("total_api_time", 0) if j < len(results) else 0,
+                                "success": r.get("success", False),
+                                "time_sec": r.get("total_api_time", 0),
+                                "vlm_time_sec": r.get("vlm_time"),
+                                "yolo_reid_time_sec": r.get("yolo_reid_time"),
+                                "put_time_sec": round(put_time, 3),
+                                "batch_upload_start_sec": round(t_upload, 3),
+                                "batch_upload_end_sec": round(t_end, 3),
+                                "wait_in_queue_sec": wait_in_queue,
+                                "client_upload_plus_backend_sec": upload_plus_backend,
+                                "api_batch_process_time_sec": api_process_sec,
+                                "api_batch_total_time_sec": api_total_sec,
+                                "time_breakdown": (
+                                    "queue_to_db_sec = wait_in_queue_sec + client_upload_plus_backend_sec ("
+                                    + f"{wait_in_queue} + {upload_plus_backend} = {round(t_end - put_time, 3)}). "
+                                    + "time_sec = 後端該段 total_api_time（同一批內多段共用同一批處理時間）。"
+                                ),
                             }
                             with timing_lock:
                                 timing_records.append(rec)
                     except Exception as e:
                         print(f"  [API] Batch 失敗: {e}")
+                        t_end_ex = time.time()
                         for (_vid, _p, fname, put_time) in batch:
+                            wait_in_queue = round(t_upload - put_time, 3)
+                            upload_plus_backend = round(t_end_ex - t_upload, 3)
                             with timing_lock:
                                 timing_records.append({
                                     "video_id": _vid, "filename": fname, "segment_sec": segment_sec,
-                                    "queue_to_db_sec": round(time.time() - put_time, 3), "success": False, "time_sec": 0,
+                                    "queue_to_db_sec": round(t_end_ex - put_time, 3), "success": False, "time_sec": 0,
+                                    "vlm_time_sec": None, "yolo_reid_time_sec": None,
+                                    "put_time_sec": round(put_time, 3),
+                                    "batch_upload_start_sec": round(t_upload, 3),
+                                    "batch_upload_end_sec": round(t_end_ex, 3),
+                                    "wait_in_queue_sec": wait_in_queue,
+                                    "client_upload_plus_backend_sec": upload_plus_backend,
+                                    "api_batch_process_time_sec": None, "api_batch_total_time_sec": None,
+                                    "time_breakdown": (
+                                        "queue_to_db_sec = wait_in_queue_sec + client_upload_plus_backend_sec (失敗批次). "
+                                        + f"wait_in_queue_sec={wait_in_queue}, client_upload_plus_backend_sec={upload_plus_backend}"
+                                    ),
                                 })
                     for _, p, _, _ in batch:
                         if Path(p).exists():
@@ -324,25 +357,58 @@ def _run_batch_mode(
                     )
                     results = api_resp.get("results") or []
                     t_end = time.time()
+                    api_process_sec = api_resp.get("process_time_sec")
+                    api_total_sec = api_resp.get("total_time_sec")
                     for j, (vid, _path, fname, put_time) in enumerate(batch):
+                        r = results[j] if j < len(results) else {}
+                        wait_in_queue = round(t_upload - put_time, 3)
+                        upload_plus_backend = round(t_end - t_upload, 3)
                         rec = {
                             "video_id": vid,
                             "filename": fname,
                             "segment_sec": segment_sec,
                             "queue_to_db_sec": round(t_end - put_time, 3),
-                            "success": results[j].get("success", False) if j < len(results) else False,
-                            "time_sec": results[j].get("total_api_time", 0) if j < len(results) else 0,
+                            "success": r.get("success", False),
+                            "time_sec": r.get("total_api_time", 0),
+                            "vlm_time_sec": r.get("vlm_time"),
+                            "yolo_reid_time_sec": r.get("yolo_reid_time"),
+                            "put_time_sec": round(put_time, 3),
+                            "batch_upload_start_sec": round(t_upload, 3),
+                            "batch_upload_end_sec": round(t_end, 3),
+                            "wait_in_queue_sec": wait_in_queue,
+                            "client_upload_plus_backend_sec": upload_plus_backend,
+                            "api_batch_process_time_sec": api_process_sec,
+                            "api_batch_total_time_sec": api_total_sec,
+                            "time_breakdown": (
+                                "queue_to_db_sec = wait_in_queue_sec + client_upload_plus_backend_sec ("
+                                + f"{wait_in_queue} + {upload_plus_backend} = {round(t_end - put_time, 3)}). "
+                                + "time_sec = 後端該段 total_api_time（同一批內多段共用同一批處理時間）。"
+                            ),
                         }
                         with timing_lock:
                             timing_records.append(rec)
                     print(f"  [API] Batch 已分析 {len(batch)} 段並寫入 DB")
                 except Exception as e:
                     print(f"  [API] Batch 失敗: {e}")
+                    t_end_ex = time.time()
                     for (_vid, _p, fname, put_time) in batch:
+                        wait_in_queue = round(t_upload - put_time, 3)
+                        upload_plus_backend = round(t_end_ex - t_upload, 3)
                         with timing_lock:
                             timing_records.append({
                                 "video_id": _vid, "filename": fname, "segment_sec": segment_sec,
-                                "queue_to_db_sec": round(time.time() - put_time, 3), "success": False, "time_sec": 0,
+                                "queue_to_db_sec": round(t_end_ex - put_time, 3), "success": False, "time_sec": 0,
+                                "vlm_time_sec": None, "yolo_reid_time_sec": None,
+                                "put_time_sec": round(put_time, 3),
+                                "batch_upload_start_sec": round(t_upload, 3),
+                                "batch_upload_end_sec": round(t_end_ex, 3),
+                                "wait_in_queue_sec": wait_in_queue,
+                                "client_upload_plus_backend_sec": upload_plus_backend,
+                                "api_batch_process_time_sec": None, "api_batch_total_time_sec": None,
+                                "time_breakdown": (
+                                    "queue_to_db_sec = wait_in_queue_sec + client_upload_plus_backend_sec (失敗批次). "
+                                    + f"wait_in_queue_sec={wait_in_queue}, client_upload_plus_backend_sec={upload_plus_backend}"
+                                ),
                             })
                 for _, p, _, _ in batch:
 
@@ -357,7 +423,7 @@ def _run_batch_mode(
                 batch = []
 
     print(f"--- {num_streams} 路 RTSP，每路 {segments_per_stream} 段（每段 {segment_sec}s），每 {batch_size} 段送一次 batch API ---")
-    print("擷取中（10 條並行）… 後端在別台機器時，GPU 會在該台載入，請在該台看 nvidia-smi。", flush=True)
+    print("擷取中（4 條並行）… 後端在別台機器時，GPU 會在該台載入，請在該台看 nvidia-smi。", flush=True)
 
     # 開始擷取。
     t0 = time.time()
@@ -390,10 +456,13 @@ def _run_batch_mode(
     # 計算總耗時。
     elapsed = time.time() - t0
 
-    # 計算平均入隊→存 DB 時間。
+    # 計算平均入隊→存 DB 時間、平均排隊、平均上傳+後端。
     avg_queue_to_db = round(sum(r.get("queue_to_db_sec", 0) for r in timing_records) / len(timing_records), 3) if timing_records else 0
+    avg_process = round(sum(r.get("time_sec", 0) for r in timing_records) / len(timing_records), 3) if timing_records else 0
+    avg_wait_in_queue = round(sum(r.get("wait_in_queue_sec", 0) for r in timing_records) / len(timing_records), 3) if timing_records else 0
+    avg_upload_plus_backend = round(sum(r.get("client_upload_plus_backend_sec", 0) for r in timing_records) / len(timing_records), 3) if timing_records else 0
 
-    # 建立輸出字典，包含執行設定、各段分析結果、以及摘要統計。
+    # 建立輸出字典，包含執行設定、各段分析結果、以及摘要統計（與 test_segment_pipeline_rtsp.py 的 summary 結構一致）。
     out = {
         "run_config": {
             "num_streams": num_streams,
@@ -406,13 +475,32 @@ def _run_batch_mode(
         "summary": {
             "total_segments": len(timing_records),
             "success_count": sum(1 for r in timing_records if r.get("success")),
+            "fail_count": sum(1 for r in timing_records if not r.get("success")),
+            "avg_process_duration_sec": avg_process,
+            "avg_wait_in_queue_time": avg_wait_in_queue,
             "avg_queue_to_db_sec": avg_queue_to_db,
+            "avg_client_upload_plus_backend_sec": avg_upload_plus_backend,
+            "time_breakdown_legend": {
+                "queue_to_db_sec": "從「該段放入佇列 put_time_sec」到「該批 API 回傳 batch_upload_end_sec」的秒數。",
+                "formula_queue_to_db": "queue_to_db_sec = wait_in_queue_sec + client_upload_plus_backend_sec",
+                "wait_in_queue_sec": "從 put_time_sec 到 batch_upload_start_sec：該段在佇列中等候直到 worker 開始送這批請求。",
+                "client_upload_plus_backend_sec": "從 batch_upload_start_sec 到 batch_upload_end_sec：客戶端開始 POST 到收到回應（含上傳、後端處理、下載）。同一批的每段此值相同。",
+                "time_sec": "後端回傳的 total_api_time。batch 模式下同一批內多段共用「整批」的處理時間，故同一批的 time_sec 會相同。",
+                "vlm_time_sec": "後端該段 VLM 耗時（batch 路徑目前多為 null）。",
+                "yolo_reid_time_sec": "後端該段 YOLO+ReID 耗時（batch 路徑目前多為 null）。",
+                "api_batch_process_time_sec": "該批 API 回傳的 process_time_sec（後端跑 run_full_pipeline 的 t2-t1）。",
+                "api_batch_total_time_sec": "該批 API 回傳的 total_time_sec（後端整次請求 t2-t0）。",
+            },
         },
     }
     out_path = Path(__file__).resolve().parent.parent / f"segment_timing_batch_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
     out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"完成，總耗時 {elapsed:.1f}s")
-    print(f"  平均入隊→存 DB: {avg_queue_to_db:.2f}s（realtime: 若 < {segment_sec}s 可即時消化）")
+    print(f"  成功: {out['summary']['success_count']}, 失敗: {out['summary']['fail_count']}")
+    print(f"  平均後端處理時間 (time_sec): {avg_process:.2f}s")
+    print(f"  平均排隊 (wait_in_queue_sec): {avg_wait_in_queue:.2f}s")
+    print(f"  平均上傳+後端 (client_upload_plus_backend_sec): {avg_upload_plus_backend:.2f}s")
+    print(f"  平均入隊→存 DB: {avg_queue_to_db:.2f}s（= 排隊 + 上傳+後端；若 < {segment_sec}s 可即時消化）")
     print(f"結果: {out_path}")
 
 # 單次測試：擷取 N 段（N=BATCH_SIZE）後一次送 batch API。

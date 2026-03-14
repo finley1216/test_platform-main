@@ -30,13 +30,16 @@ export const useAnalysis = (apiKey) => {
       console.table({
         "CPU (%)": status.cpu.percent,
         "RAM (%)": status.memory.percent,
+        "Backend CUDA": status.backend_cuda
+          ? (status.backend_cuda.available ? `✅ ${status.backend_cuda.device_name || "GPU"}` : "❌ 後端看不到 GPU（YOLO/ReID 用 CPU，較慢）")
+          : "N/A",
         "GPU Status": status.gpu?.devices?.map(d => {
-          // 處理 null/undefined 值（後端返回 None 時會變成 null）
           const hasUtil = d.gpu_util_percent != null && typeof d.gpu_util_percent === 'number';
           const hasMem = d.mem_util_percent != null && typeof d.mem_util_percent === 'number';
-          
           let statusStr = d.name;
-          if (hasUtil) {
+          if (hasUtil && hasMem) {
+            statusStr += `: Util ${d.gpu_util_percent}% | Mem ${d.mem_util_percent}%`;
+          } else if (hasUtil) {
             statusStr += `: ${d.gpu_util_percent}%`;
           } else if (hasMem) {
             statusStr += `: Mem ${d.mem_util_percent}%`;

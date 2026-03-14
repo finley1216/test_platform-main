@@ -5,22 +5,32 @@ const ImageSearchResults = ({ data, apiKey }) => {
   const { query_type, query_info, total_results, results, threshold, label_filter, debug } = data || {};
   const [showVectorInfo, setShowVectorInfo] = useState(false);
 
-  const getImageUrl = (cropPath) => {
+  const getImageUrl = (cropPath, videoName) => {
     if (!cropPath) return null;
     // 如果路徑是絕對路徑或 URL，直接返回
     if (cropPath.startsWith("http")) {
       return cropPath;
     }
-    // 如果路徑已經以 /segment 開頭，直接使用
-    if (cropPath.startsWith("/segment")) {
-      const baseUrl = apiService.baseUrl.replace(/\/$/, "");
-      return `${baseUrl}${cropPath}`;
-    }
-    // 如果路徑是相對路徑（例如 "segment/xxx/yolo_output/object_crops/xxx.jpg"）
-    // 確保以 / 開頭
-    const normalizedPath = cropPath.startsWith("/") ? cropPath : `/${cropPath}`;
+    // 靜態檔案在後端的 /segment 下，目錄結構為 /segment/{video}/yolo_output/object_crops/xxx.jpg
+    // video 為影片名稱（如 車輛追蹤_K8-008），不是 segment 檔名（segment_003.mp4）
     const baseUrl = apiService.baseUrl.replace(/\/$/, "");
-    return `${baseUrl}${normalizedPath}`;
+    const segmentBaseUrl = baseUrl.replace(/\/api\/?$/, "") || baseUrl;
+    // 如果路徑已經以 segment/ 開頭（完整相對路徑），直接接在 origin 後
+    if (cropPath.startsWith("segment/")) {
+      return `${segmentBaseUrl}/${cropPath}`;
+    }
+    // 路徑是相對影片目錄的（例如 "yolo_output/object_crops/xxx.jpg"），需加上 video 名稱作為父目錄
+    if (videoName && (cropPath.includes("yolo_output") || cropPath.includes("object_crops"))) {
+      const path = cropPath.startsWith("/") ? cropPath.slice(1) : cropPath;
+      return `${segmentBaseUrl}/segment/${encodeURIComponent(videoName)}/${path}`;
+    }
+    // 若已有 /segment 開頭（絕對路徑形式）
+    if (cropPath.startsWith("/segment")) {
+      return `${segmentBaseUrl}${cropPath}`;
+    }
+    // 其餘：當作相對 origin 的路徑
+    const normalizedPath = cropPath.startsWith("/") ? cropPath : `/${cropPath}`;
+    return `${segmentBaseUrl}${normalizedPath}`;
   };
 
   const formatTimestamp = (timestamp) => {
@@ -304,7 +314,7 @@ const ImageSearchResults = ({ data, apiKey }) => {
           }}
         >
           {results.map((result, index) => {
-            const imageUrl = getImageUrl(result.crop_path);
+            const imageUrl = getImageUrl(result.crop_path, result.video);
             return (
               <div
                 key={result.crop_id || index}

@@ -21,6 +21,7 @@ RUN apt-get update && apt-get install -y \
 COPY ./requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir -U transformers accelerate && \
+    pip install --no-cache-dir torchao && \
     pip install --no-cache-dir git+https://github.com/ultralytics/CLIP.git || echo "Warning: Failed to install CLIP module"
 
 # 可選：精準 ReID 需 torchreid（未安裝時會 fallback 到 torchvision ResNet50）

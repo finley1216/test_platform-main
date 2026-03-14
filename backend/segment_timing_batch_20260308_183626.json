@@ -1,0 +1,208 @@
+{
+  "run_config": {
+    "num_streams": 4,
+    "duration_minutes": 1.0,
+    "segment_sec": 10.0,
+    "batch_size": 4,
+    "total_elapsed_sec": 84.329
+  },
+  "segments": [
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_0.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 46.87,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_0.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 46.87,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_2.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 19.661,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_2.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 19.661,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_1.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 43.134,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_2.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 29.502,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_4.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 2.167,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_4.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 2.167,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_0.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 57.057,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_1.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 43.367,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_3.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 16.132,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_4.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 2.41,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_5.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 0.926,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_1.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 56.89,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_3.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 29.597,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_5.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 2.263,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_2.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 43.697,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_01",
+      "filename": "RTSP_01_3.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 30.076,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_4.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 16.356,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_5.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 2.689,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_03",
+      "filename": "RTSP_03_0.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 71.318,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_1.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 57.629,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_04",
+      "filename": "RTSP_04_3.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 30.392,
+      "success": false,
+      "time_sec": 0.0
+    },
+    {
+      "video_id": "RTSP_02",
+      "filename": "RTSP_02_5.mp4",
+      "segment_sec": 10.0,
+      "queue_to_db_sec": 3.001,
+      "success": false,
+      "time_sec": 0.0
+    }
+  ],
+  "summary": {
+    "total_segments": 24,
+    "success_count": 0,
+    "avg_queue_to_db_sec": 28.076
+  }
+}

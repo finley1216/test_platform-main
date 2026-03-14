@@ -3,6 +3,11 @@
 """
 Start script for backend API using uvicorn
 """
+import os
+# TorchAO 量化與 torch.compile 衝突會導致 meta/cuda 裝置錯誤，在載入任何模型前就停用 dynamo
+if os.environ.get("QWEN_USE_QUANTIZATION", "").strip() in ("1", "true", "True"):
+    os.environ["TORCHDYNAMO_DISABLE"] = "1"
+
 import multiprocessing
 import uvicorn
 from src.config import config

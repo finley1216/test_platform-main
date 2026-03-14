@@ -3,14 +3,16 @@
 影片分析相關 API
 """
 import os
+import subprocess
 import time
 import json
 import tempfile
 from pathlib import Path
 from typing import Optional, List
-from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException
+from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException, Body
 from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
+from pydantic import BaseModel
 import psutil
 import logging
 import torch
@@ -46,6 +48,91 @@ def analyze_segment_result_api(req: dict, api_key: str = Depends(lambda: _get_db
     request_obj = SegmentAnalysisRequest(**req)
     return AnalysisService.analyze_segment(request_obj)
 
+
+class AnalyzeSingleSegmentBody(BaseModel):
+    """單段即時分析請求 body（video_id + 時間區間，不傳整部影片）"""
+    video_id: str
+    start_time: float  # 秒
+    duration: float = 10.0  # 秒
+
+
+@router.post("/v1/analyze_single_segment")
+def analyze_single_segment(
+    body: AnalyzeSingleSegmentBody = Body(...),
+    api_key: str = Depends(lambda: _get_db_and_models()[1]),
+):
+    """
+    依 video_id 與時間區間切出單一段落，做 YOLO + Qwen 推論後直接回傳 JSON。
+    不寫入資料庫，供前端播放同步即時顯示用。
+    """
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, DEF_EVENT_PROMPT, DEF_SUMMARY_PROMPT = _get_db_and_models()
+    video_id = (body.video_id or "").strip()
+    start_time = float(body.start_time)
+    duration = float(body.duration)
+    if duration <= 0 or duration > 60:
+        raise HTTPException(status_code=400, detail="duration 需介於 0～60 秒")
+    # 1. 解析 video_id 取得原始影片路徑（與 VideoService.prepare_segments 一致）
+    source_path = None
+    if "/" in video_id:
+        category, video_name = video_id.split("/", 1)
+        potential = config.VIDEO_LIB_DIR / category / f"{video_name}.mp4"
+        if not potential.exists():
+            for ext in [".avi", ".mov", ".mkv", ".flv"]:
+                p = config.VIDEO_LIB_DIR / category / f"{Path(video_name).stem}{ext}"
+                if p.exists():
+                    potential = p
+                    break
+        if potential.exists():
+            source_path = str(potential)
+    if not source_path or not Path(source_path).exists():
+        raise HTTPException(status_code=404, detail=f"找不到影片: {video_id}")
+    # 2. 使用 FFmpeg -ss 快速切出該區間暫存檔
+    fd, tmp_path = tempfile.mkstemp(prefix="single_seg_", suffix=".mp4")
+    os.close(fd)
+    try:
+        cmd = [
+            "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
+            "-ss", f"{start_time:.3f}", "-t", f"{duration:.3f}", "-i", source_path,
+            "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
+            "-c:a", "aac", "-strict", "experimental",
+            tmp_path,
+        ]
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        if proc.returncode != 0:
+            try:
+                os.remove(tmp_path)
+            except OSError:
+                pass
+            raise HTTPException(status_code=500, detail=f"FFmpeg 切片失敗: {(proc.stderr or proc.stdout or '')[-500:]}")
+        end_time = start_time + duration
+        time_range_str = f"{_fmt_hms(start_time)} - {_fmt_hms(end_time)}"
+        # 3. 組單段分析請求（與 run_full_pipeline 內格式一致）
+        req_data = SegmentAnalysisRequest(
+            segment_path=tmp_path,
+            segment_index=0,
+            start_time=start_time,
+            end_time=end_time,
+            model_type="qwen",
+            qwen_model="qwen2.5vl:latest",
+            frames_per_segment=8,
+            target_short=720,
+            event_detection_prompt=DEF_EVENT_PROMPT,
+            summary_prompt=DEF_SUMMARY_PROMPT,
+            yolo_labels="person,car",
+            yolo_every_sec=2.0,
+            yolo_score_thr=0.25,
+        )
+        # 4. 即時推論，不存 DB
+        result = AnalysisService.analyze_segment(req_data)
+        return result
+    finally:
+        try:
+            if Path(tmp_path).exists():
+                os.remove(tmp_path)
+        except OSError:
+            pass
+
+
 # POST 端點，接收上傳檔案 (file)、URL (video_url)、或已存在影片 (video_id)
 @router.post("/v1/segment_pipeline_multipart")
 def segment_pipeline_multipart(
@@ -56,8 +143,8 @@ def segment_pipeline_multipart(
     video_id: str = Form(None),
     segment_duration: float = Form(10.0),
     overlap: float = Form(0.0),
-    qwen_model: str = Form("qwen3-vl:8b"),
-    frames_per_segment: int = Form(8),
+    qwen_model: str = Form("qwen2.5vl:latest"),
+    frames_per_segment: int = Form(5),
     target_short: int = Form(720),
     sampling_fps: Optional[float] = Form(None),
     strict_segmentation: bool = Form(False),
@@ -187,7 +274,6 @@ def segment_pipeline_multipart(
         if cleanup and local_path and os.path.exists(local_path):
             os.remove(local_path)
 
-
 # 批次端點：配合 test_segment_pipeline_rtsp_batch.py 使用
 @router.post("/v1/segment_pipeline_batch")
 def segment_pipeline_batch(
@@ -216,8 +302,8 @@ def segment_pipeline_batch(
     # 記錄處理前的系統記憶體使用量（MB），用於後續診斷。
     mem_before = psutil.Process().memory_info().rss / (1024 * 1024)
 
-    # 限制單次 API 請求最多只能處理 10 個影片片段，防止過載。
-    MAX_BATCH = 10
+    # 限制單次 API 請求最多只能處理的影片片段數，防止過載。
+    MAX_BATCH = 16
     if len(files) > MAX_BATCH:
         raise HTTPException(status_code=422, detail=f"最多上傳 {MAX_BATCH} 個檔案")
 
@@ -249,7 +335,7 @@ def segment_pipeline_batch(
 
         num_segments = len(seg_files)
        
-        # 計算 VLM 一次需要處理的段數（qwen_inference_batch_size 或 MAX_BATCH，取最大值）。
+        # 計算 VLM 一次需要處理的段數（未傳 qwen_inference_batch_size 則使用 MAX_BATCH）。
         qwen_batch = qwen_inference_batch_size if qwen_inference_batch_size is not None else MAX_BATCH
 
         # 計算每段影片需要處理的幀數（每 segment_duration 秒處理一幀）。
@@ -345,7 +431,6 @@ def segment_pipeline_batch(
             except OSError:
                 pass
 
-
 # POST 端點：來源為 RTSP，其餘流程與 /v1/segment_pipeline_multipart 完全相同
 @router.post("/v1/segment_pipeline_rtsp")
 def segment_pipeline_rtsp(
@@ -356,7 +441,7 @@ def segment_pipeline_rtsp(
     model_type: str = Form(...),
     segment_duration: float = Form(10.0),
     overlap: float = Form(0.0),
-    qwen_model: str = Form("qwen3-vl:8b"),
+    qwen_model: str = Form("qwen2.5vl:latest"),
     frames_per_segment: int = Form(8),
     target_short: int = Form(720),
     sampling_fps: Optional[float] = Form(None),
@@ -426,6 +511,8 @@ def segment_pipeline_rtsp(
         mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
         logger.info(f"--- [Pipeline RTSP Success] Time: {round(t2-t0, 2)}s, Mem Delta: {round(mem_after - mem_before, 2)}MB ---")
 
+        time_ollama_sec = sum(r.get("time_ollama_sec", 0) for r in results)
+        time_yolo_reid_sec = sum(r.get("time_yolo_reid_sec", 0) for r in results)
         resp = {
             "model_type": model_type,
             "total_segments": len(results),
@@ -434,6 +521,8 @@ def segment_pipeline_rtsp(
             "process_time_sec": round(t2 - t1, 2),
             "total_time_sec": round(t2 - t0, 2),
             "stem": stem,
+            "time_ollama_sec": round(time_ollama_sec, 2),
+            "time_yolo_reid_sec": round(time_yolo_reid_sec, 2),
             "diagnostics": {
                 "mem_delta_mb": round(mem_after - mem_before, 2),
                 "strict_mode": strict_segmentation,
@@ -470,7 +559,6 @@ def segment_pipeline_rtsp(
                 os.remove(local_path)
             except OSError:
                 pass
-
 
 @router.post("/v1/search/image", dependencies=[Depends(lambda: _get_db_and_models()[1])])
 def search_by_image(

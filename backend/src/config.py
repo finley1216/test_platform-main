@@ -32,6 +32,10 @@ class Config:
         self.OLLAMA_EMBED_MODEL: str = os.getenv("OLLAMA_EMBED_MODEL", "bge-m3")
         self.OLLAMA_LLM_MODEL: str = os.getenv("OLLAMA_LLM_MODEL", "qwen2.5vl:latest")
         self.OLLAMA_REQUEST_TIMEOUT: int = int(os.getenv("OLLAMA_REQUEST_TIMEOUT", "600"))  # VLM 運算較久時避免連線中斷（秒）
+        # Qwen HF 本機載入參數（對應 LlamaCpp 的 n_ctx / n_batch / n_gpu_layers）
+        self.QWEN_MAX_NEW_TOKENS: int = int(os.getenv("QWEN_MAX_NEW_TOKENS", "512"))   # 等同 n_ctx 的生成長度上限
+        self.QWEN_HF_MAX_INFERENCE_BATCH_SIZE: int = int(os.getenv("QWEN_HF_MAX_INFERENCE_BATCH_SIZE", "4"))  # 等同 n_batch：VLM 單次 forward 段數上限
+        self.QWEN_N_GPU_LAYERS: str = os.getenv("QWEN_N_GPU_LAYERS", "-1")  # -1=全 GPU (auto)，0=僅 CPU
         # RAG 回答優化配置
         self.RAG_ANSWER_TOP_K: int = int(os.getenv("RAG_ANSWER_TOP_K", "5"))  # 生成回答時使用的片段數量（預設5個以確保完整性）
         self.RAG_ANSWER_SUMMARY_MAX_LEN: int = int(os.getenv("RAG_ANSWER_SUMMARY_MAX_LEN", "500"))  # 每個摘要的最大長度（增加到500以保留更多資訊）

@@ -9,11 +9,13 @@ import time
 from pathlib import Path
 from typing import Dict, List, Any
 from fastapi import APIRouter, Request, Depends, HTTPException
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 
 # 從 main.py 導入必要的函數和變數
 from src.main import (
-    get_api_key, ADMIN_TOKEN, HAS_DB, get_db, VIDEO_LIB_DIR
+    get_api_key, ADMIN_TOKEN, HAS_DB, get_db, VIDEO_LIB_DIR,
+    SERVER_API_KEY,
 )
 from src.database import SessionLocal
 from src.config import config
@@ -44,6 +46,47 @@ def _save_video_events(events: Dict[str, Dict[str, Any]]):
     with open(VIDEO_EVENTS_FILE, "w", encoding="utf-8") as f:
         json.dump(events, f, ensure_ascii=False, indent=2)
 
+
+def _fetch_summary_results_for_videos(video_ids: List[str]) -> List[Dict[str, Any]]:
+    """從 DB 依 video 欄位查詢 Summary，回傳與 get_video_info 一致的 results 格式。"""
+    if not HAS_DB or not video_ids:
+        return []
+    db = SessionLocal()
+    try:
+        from sqlalchemy import or_
+        summaries = db.query(Summary).filter(
+            or_(*(Summary.video == v for v in video_ids))
+        ).order_by(Summary.start_timestamp.asc()).limit(100).all()
+        return [
+            {
+                "video": s.video,
+                "segment": s.segment,
+                "time_range": s.time_range,
+                "success": True,
+                "parsed": {
+                    "summary_independent": s.message,
+                    "frame_analysis": {
+                        "events": {
+                            "fire": s.fire,
+                            "water_flood": s.water_flood,
+                            "person_fallen": s.person_fallen_unmoving,
+                            "double_parking": s.double_parking_lane_block,
+                            "smoking": s.smoking_outside_zone,
+                            "crowd": s.crowd_loitering,
+                            "security_door": s.security_door_tamper,
+                            "abnormal_attire": s.abnormal_attire_face_cover_at_entry,
+                        }
+                    }
+                }
+            }
+            for s in summaries
+        ]
+    except Exception as e:
+        print(f"--- [DEBUG] Failed to fetch summary results for {video_ids}: {e} ---")
+        return []
+    finally:
+        db.close()
+
 def _get_video_lib_categories() -> Dict[str, List[str]]:
     """獲取 video 資料夾中的分類 and 影片列表"""
     categories = {}
@@ -58,6 +101,47 @@ def _get_video_lib_categories() -> Dict[str, List[str]]:
                 if video_files:
                     categories[category_name] = sorted(video_files)
     return categories
+
+# 允許的影片副檔名與對應 Content-Type
+_VIDEO_EXT_MEDIA = {
+    ".mp4": "video/mp4",
+    ".avi": "video/x-msvideo",
+    ".mov": "video/quicktime",
+    ".mkv": "video/x-matroska",
+    ".webm": "video/webm",
+}
+
+
+def _get_api_key_header_or_query(request: Request):
+    """允許從 Header 或 query 參數 api_key 取得 API Key（供 <video src> 無法帶 Header 時使用）"""
+    key = request.headers.get("X-API-Key") or request.query_params.get("api_key")
+    if not key:
+        raise HTTPException(status_code=403, detail="請提供 API Key (Header: X-API-Key 或 query: api_key)")
+    if key != SERVER_API_KEY and key != ADMIN_TOKEN:
+        raise HTTPException(status_code=401, detail="無效的 API Key")
+    return key
+
+
+@router.get("/v1/stream_video", dependencies=[Depends(_get_api_key_header_or_query)])
+def stream_video(path: str):
+    """
+    串流影片檔（供前端 <video> 播放）。
+    path 為相對 VIDEO_LIB_DIR 的路徑，例如：火災生成/Video_火災3.mp4
+    建議使用 MP4 以獲得最佳瀏覽器相容性。可用 query 參數 api_key 傳入 API Key。
+    """
+    if not path or ".." in path or path.startswith("/"):
+        raise HTTPException(status_code=400, detail="Invalid path")
+    full = (VIDEO_LIB_DIR / path).resolve()
+    if not full.is_file():
+        raise HTTPException(status_code=404, detail=f"Video not found: {path}")
+    try:
+        full.relative_to(VIDEO_LIB_DIR.resolve())
+    except ValueError:
+        raise HTTPException(status_code=403, detail="Path outside video library")
+    ext = full.suffix.lower()
+    media_type = _VIDEO_EXT_MEDIA.get(ext, "application/octet-stream")
+    return FileResponse(str(full), media_type=media_type)
+
 
 # 注意：具體路由必須放在路徑參數路由之前，否則會被攔截
 @router.get("/v1/videos/list", dependencies=[Depends(get_api_key)])
@@ -353,8 +437,11 @@ def get_video_info(video_id: str):
         # 先檢查 segment 中是否有對應的處理結果（格式：{category}_{video_name}）
         stem = f"{category}_{video_name}"
         seg_dir = segment_base / stem
-        
-        # 如果 segment 中有結果，優先使用 segment 的結果
+        # 本地影片／批次分析可能只寫 DB（video_id 或 stem），先查 DB 讓前端輪詢能拿到結果
+        db_results_cat = _fetch_summary_results_for_videos([video_id, stem])
+        video_data_from_db = {"results": db_results_cat} if db_results_cat else None
+
+        # 如果 segment 中有結果，優先使用 segment 的 JSON（完整 pipeline 回傳）
         if seg_dir.exists():
             json_files = list(seg_dir.glob("*.json"))
             if json_files:
@@ -365,7 +452,6 @@ def get_video_info(video_id: str):
                 try:
                     with open(latest_json, "r", encoding="utf-8") as f:
                         video_data = json.load(f)
-                    
                     # 檢查 video_lib 中是否有原始影片
                     video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
                     if not video_path.exists():
@@ -389,6 +475,30 @@ def get_video_info(video_id: str):
                     }
                 except Exception as e:
                     raise HTTPException(status_code=500, detail=f"Failed to load video data: {e}")
+            # 沒有 JSON 但有 DB 結果（例如批次剛寫入 DB、或 RTSP 逐段寫入）→ 讓前端日誌能顯示
+            if not json_files and video_data_from_db:
+                events = _load_video_events()
+                event_info = events.get(video_id, {})
+                video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
+                if not video_path.exists():
+                    for ext in ['.avi', '.mov', '.mkv', '.flv']:
+                        vp = VIDEO_LIB_DIR / category / f"{video_name}{ext}"
+                        if vp.exists():
+                            video_path = vp
+                            break
+                return {
+                    "video_id": video_id,
+                    "display_name": video_path.name if video_path.exists() else f"{video_name}.mp4",
+                    "source": "database",
+                    "json_path": None,
+                    "analysis_data": video_data_from_db,
+                    "event_label": event_info.get("event_label"),
+                    "event_description": event_info.get("event_description", ""),
+                    "event_set_by": event_info.get("set_by", ""),
+                    "event_set_at": event_info.get("set_at", ""),
+                    "category": category,
+                    "video_path": str(video_path.relative_to(VIDEO_LIB_DIR.parent)) if video_path.exists() else None,
+                }
         
         # 如果 segment 中沒有，檢查 video_lib
         video_path = VIDEO_LIB_DIR / category / f"{video_name}.mp4"
@@ -431,8 +541,8 @@ def get_video_info(video_id: str):
                 "display_name": video_path.name,
                 "source": "video_lib",
                 "json_path": None,
-                "analysis_data": None,
-                    "event_label": event_info.get("event_label"),  # 只使用實際設置的 event_label
+                "analysis_data": video_data_from_db if video_data_from_db else None,
+                "event_label": event_info.get("event_label"),  # 只使用實際設置的 event_label
                 "event_description": event_info.get("event_description", ""),
                 "event_set_by": event_info.get("set_by", ""),
                 "event_set_at": event_info.get("set_at", ""),

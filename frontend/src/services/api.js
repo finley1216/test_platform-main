@@ -11,9 +11,9 @@ class ApiService {
     console.log("API Service base URL updated to:", this.baseUrl);
   }
 
-  // 通用的 Fetch 包裝器，帶有診斷功能
+  // 通用的 Fetch 包裝器，帶有診斷功能；可選 timeout（毫秒），逾時則中止請求
   async request(endpoint, options = {}) {
-    const { headers = {}, body, method = "GET", apiKey, responseType = 'json' } = options;
+    const { headers = {}, body, method = "GET", apiKey, responseType = 'json', timeout } = options;
     const url = endpoint.startsWith("http") ? endpoint : `${this.baseUrl}${endpoint}`;
 
     const fetchOptions = {
@@ -23,6 +23,13 @@ class ApiService {
         ...headers,
       },
     };
+
+    let timeoutId;
+    if (timeout != null && timeout > 0) {
+      const controller = new AbortController();
+      fetchOptions.signal = controller.signal;
+      timeoutId = setTimeout(() => controller.abort(), timeout);
+    }
 
     if (apiKey) fetchOptions.headers["X-API-Key"] = apiKey;
 
@@ -36,6 +43,7 @@ class ApiService {
     try {
       console.log(`🚀 [Request] ${method} ${url}`);
       const response = await fetch(url, fetchOptions);
+      if (timeoutId != null) clearTimeout(timeoutId);
 
       if (!response.ok) {
         console.group('🔍 Server Diagnostics');
@@ -64,6 +72,13 @@ class ApiService {
       return await response.json();
 
     } catch (error) {
+      if (timeoutId != null) clearTimeout(timeoutId);
+      if (error.name === 'AbortError') {
+        console.group('🔍 Server Diagnostics');
+        console.error(`❌ Request aborted after ${timeout}ms (timeout).`);
+        console.groupEnd();
+        throw new Error(`請求逾時（${Math.round(timeout / 1000)} 秒），請稍後再試或檢查後端負載。`);
+      }
       if (error.name === 'TypeError' && error.message === 'Failed to fetch') {
         console.group('🔍 Server Diagnostics');
         console.error("❌ Network Failure. Check Proxy/Firewall settings.");
@@ -120,6 +135,7 @@ class ApiService {
   }
 
   // 使用 XMLHttpRequest 以支援上傳進度追蹤 (Point 6)
+  // 本地影片分析可能需數分鐘，設定長逾時避免 proxy/XHR 提前中斷
   async runAnalysis(formData, apiKey, onUploadProgress) {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
@@ -127,10 +143,15 @@ class ApiService {
       
       xhr.open("POST", url);
       xhr.setRequestHeader("X-API-Key", apiKey);
+      xhr.timeout = 600000; // 10 分鐘，配合後端長時間分析
 
       if (onUploadProgress) {
         xhr.upload.onprogress = onUploadProgress;
       }
+
+      xhr.ontimeout = () => {
+        reject(new Error("請求逾時（分析時間過長），請檢查後端是否完成；結果可於稍後由日誌輪詢顯示。"));
+      };
 
       xhr.onload = () => {
         if (xhr.status >= 200 && xhr.status < 300) {
@@ -171,6 +192,26 @@ class ApiService {
 
       xhr.send(formData);
     });
+  }
+
+  /** 單段即時分析：傳 video_id + start_time + duration；後端 VLM+YOLO 可能需 1～3 分鐘，設定長逾時；連線失敗時自動重試一次 */
+  async runInstantSegmentAnalysis(videoId, startTime, duration, apiKey) {
+    const doRequest = () => this.request("/v1/analyze_single_segment", {
+      method: "POST",
+      body: { video_id: videoId, start_time: startTime, duration: duration ?? 10 },
+      apiKey,
+      timeout: 300000, // 5 分鐘，配合後端單段分析耗時
+    });
+    try {
+      return await doRequest();
+    } catch (err) {
+      const isNetworkOrTimeout = err?.message?.includes("Network Failure") || err?.message?.includes("請求逾時") || err?.message?.includes("timeout");
+      if (isNetworkOrTimeout) {
+        await new Promise((r) => setTimeout(r, 2000)); // 等 2 秒後重試一次
+        return await doRequest();
+      }
+      throw err;
+    }
   }
 
   async searchRAG(query, topK, threshold, apiKey) {

@@ -23,9 +23,11 @@ from src.config import config
 try:
     from src.utils import qwen_hf_utils
     HAS_QWEN_HF = True
-except Exception:
+except Exception as _e:
     qwen_hf_utils = None
     HAS_QWEN_HF = False
+    print("--- [AnalysisService] Qwen HF 模組載入失敗，qwen_hf batch 不可用，改走單段 analyze_segment ---")
+    print("--- [AnalysisService] 錯誤:", type(_e).__name__, str(_e), "---")
 
 try:
     import google.generativeai as genai
@@ -83,6 +85,21 @@ class AnalysisService:
     def release_gpu_memory():
         """釋放 GPU 暫存（不卸載模型），供 API 請求結束後呼叫。"""
         _release_gpu_memory()
+
+    @staticmethod
+    def _safe_crop_path_for_storage(crop_path: Path, seg_dir: Path) -> str:
+        """
+        取得供儲存/DB 使用的 crop 路徑字串。
+        若 crop 在專案目錄下則回傳相對專案根的路徑；
+        否則（例如片段在 /tmp）回傳相對 seg_dir 或絕對路徑，避免 relative_to 拋錯。
+        """
+        try:
+            return str(crop_path.relative_to(Path(".").resolve()))
+        except ValueError:
+            try:
+                return str(crop_path.relative_to(seg_dir))
+            except ValueError:
+                return str(crop_path)
 
     @staticmethod
     def infer_segment_qwen(
@@ -729,7 +746,7 @@ class AnalysisService:
                         crop_filename = f"crop_{fi}_{b_idx}_{label}.jpg"
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)
-                        rel_crop_path = str(crop_path.relative_to(Path(".")))
+                        rel_crop_path = AnalysisService._safe_crop_path_for_storage(crop_path, crops_dir.parent.parent)
                         crops_imgs.append(crop)
                         temp_detections.append({
                             "timestamp": timestamp, "label": label, "score": conf,
@@ -780,19 +797,26 @@ class AnalysisService:
         return out
 
     @staticmethod
-    def _merge_vlm_and_yolo_result(req, frame_obj: Dict, summary_txt: str, yolo_res: Dict) -> Dict:
-        """合併已算好的 VLM 結果與 YOLO 結果為單一 result 字典（不再呼叫 YOLO）。"""
+    def _merge_vlm_and_yolo_result(req, frame_obj: Dict, summary_txt: str, yolo_res: Dict, batch_elapsed_sec: Optional[float] = None) -> Dict:
+        """合併已算好的 VLM 結果與 YOLO 結果為單一 result 字典（不再呼叫 YOLO）。
+        batch_elapsed_sec: 若為 batch 路徑呼叫，可傳入該 batch 的總耗時（秒），會寫入 time_sec / total_api_time。"""
         p = req.segment_path
         tr = f"{_fmt_hms(req.start_time)} - {_fmt_hms(req.end_time)}"
+        vlm_ok = "error" not in frame_obj
+        yolo_ok = yolo_res and isinstance(yolo_res, dict) and "error" not in yolo_res
+        has_yolo_data = yolo_ok and (yolo_res.get("detections") or yolo_res.get("total_detections", 0) > 0)
+        # 只要 VLM 成功，或 YOLO 有結果且無錯誤，就視為可寫入 DB
+        success = vlm_ok or has_yolo_data
+        elapsed = batch_elapsed_sec if batch_elapsed_sec is not None else 0.0
         result = {
             "segment": Path(p).name,
             "time_range": tr,
             "duration_sec": round(req.end_time - req.start_time, 2),
-            "success": "error" not in frame_obj and "error" not in (yolo_res or {}),
-            "time_sec": 0.0,
+            "success": success,
+            "time_sec": round(elapsed, 2),
             "vlm_time": 0.0,
             "yolo_reid_time": 0.0,
-            "total_api_time": 0.0,
+            "total_api_time": round(elapsed, 2),
             "parsed": {
                 "frame_analysis": AnalysisService._normalize_vlm_output(frame_obj),
                 "summary_independent": summary_txt or "",
@@ -800,7 +824,6 @@ class AnalysisService:
             "raw_detection": {"yolo": yolo_res},
             "error": frame_obj.get("error") or (yolo_res.get("error") if isinstance(yolo_res, dict) else None),
         }
-        result["time_sec"] = result["total_api_time"]
         return result
 
     @staticmethod
@@ -826,6 +849,11 @@ class AnalysisService:
         
         results = []
         QWEN_HF_BATCH_SIZE = 10
+        # VLM 單次 forward 的段數上限（等同 n_batch），可由環境變數 QWEN_HF_MAX_INFERENCE_BATCH_SIZE 覆寫
+        try:
+            QWEN_HF_MAX_INFERENCE_BATCH_SIZE = int(os.environ.get("QWEN_HF_MAX_INFERENCE_BATCH_SIZE", "4"))
+        except (TypeError, ValueError):
+            QWEN_HF_MAX_INFERENCE_BATCH_SIZE = 4
 
         class Req:
             def __init__(self, **kwargs):
@@ -873,7 +901,7 @@ class AnalysisService:
                         target_short=target_short,
                         frames_per_segment=frames_per_segment,
                         sampling_fps=sampling_fps,
-                        max_inference_batch_size=vlm_batch_size,
+                        max_inference_batch_size=min(batch_size, QWEN_HF_MAX_INFERENCE_BATCH_SIZE),
                     )
 
                 def run_yolo_batch():
@@ -886,11 +914,13 @@ class AnalysisService:
                     )
 
                 # 這行程式碼讓 VLM 與 YOLO 同時在 GPU 上排隊或併發執行，而不是等一個做完才換另一個，能顯著減少 GPU 的閒置時間。
+                t_batch_start = time.time()
                 with ThreadPoolExecutor(max_workers=2) as ex:
                     future_vlm = ex.submit(run_vlm_batch)
                     future_yolo = ex.submit(run_yolo_batch)
                     vlm_list = future_vlm.result()
                     yolo_list = future_yolo.result()
+                batch_elapsed_sec = round(time.time() - t_batch_start, 2)
 
                 # 合併 VLM 與 YOLO 的結果，並生成最終的結果列表。
                 for i, seg_path in enumerate(batch_paths):
@@ -916,12 +946,14 @@ class AnalysisService:
                     # 從各自的批次結果清單中，根據索引取出對應這段影片的 AI 分析結果。
                     frame_obj, summary_txt = vlm_list[i] if i < len(vlm_list) else ({"error": "batch 長度不符"}, "")
                     yolo_res = yolo_list[i] if i < len(yolo_list) else {}
-                    results.append(AnalysisService._merge_vlm_and_yolo_result(req, frame_obj, summary_txt, yolo_res))
+                    results.append(AnalysisService._merge_vlm_and_yolo_result(req, frame_obj, summary_txt, yolo_res, batch_elapsed_sec=batch_elapsed_sec))
 
             # 最後將所有結果按片段順序排序，確保結果的順序與原始影片片段的順序一致。
             results.sort(key=lambda x: x["segment"])
             return results
 
+        if model_type == "qwen_hf" and not HAS_QWEN_HF:
+            print("--- [AnalysisService] qwen_hf 請求但 Qwen HF 模組未載入，改為單段 ThreadPool 處理（每段會回傳 error）---")
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {executor.submit(process_one, p, i): i for i, p in enumerate(seg_files)}
             for future in as_completed(futures):
@@ -1111,7 +1143,7 @@ class AnalysisService:
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)  # 將裁剪圖存成 jpg
 
-                        rel_crop_path = str(crop_path.relative_to(Path(".")))  # 相對路徑，供 DB 儲存
+                        rel_crop_path = AnalysisService._safe_crop_path_for_storage(crop_path, seg_dir)
 
                         crops_imgs.append(crop)
                         temp_detections.append({

@@ -52,6 +52,14 @@ export const getApiBaseUrl = () => {
   return getApiBase();
 };
 
+// 靜態資源（segment 影片/切片目錄等）由後端掛在 /segment，不在 /api 下
+// 回傳用於載入這些資源的 base URL（與 API 同 host/port，但路徑不含 /api）
+export const getSegmentBaseUrl = () => {
+  const base = getApiBase();
+  const normalized = base.replace(/\/$/, "");
+  return normalized.replace(/\/api\/?$/, "") || normalized;
+};
+
 // 提供一個函數讓用戶可以手動設定 API 地址（例如在開發者控制台）
 export const setApiBase = (url) => {
   try {

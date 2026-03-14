@@ -86,8 +86,8 @@ const ModelConfig = ({
                 </>
               ) : (
                 <>
-                  <option value="qwen3-vl:8b">qwen3-vl:8b</option>
                   <option value="qwen2.5vl:latest">qwen2.5vl:latest</option>
+                  <option value="qwen3-vl:8b">qwen3-vl:8b</option>
                 </>
               )}
             </select>

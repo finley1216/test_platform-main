@@ -90,6 +90,10 @@ def get_system_status():
     # GPU 用量 (Point 1)
     gpu_status = get_gpu_status()
     
+    # 後端 process 是否看得見 CUDA（YOLO/ReID 會用此決定用 GPU 還是 CPU）
+    cuda_available = torch.cuda.is_available()
+    cuda_device_name = torch.cuda.get_device_name(0) if cuda_available else None
+    
     return {
         "timestamp": os.getpid(), # 借用 PID 標識進程
         "cpu": {
@@ -103,6 +107,10 @@ def get_system_status():
             "percent": mem.percent
         },
         "gpu": gpu_status,
+        "backend_cuda": {
+            "available": cuda_available,
+            "device_name": cuda_device_name,
+        },
         "models": model_status,
         "active_requests": active_requests,
         "disk": {

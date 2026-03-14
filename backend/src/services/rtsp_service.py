@@ -7,7 +7,12 @@ import shutil
 from pathlib import Path
 from datetime import datetime
 from src.services.analysis_service import AnalysisService
-from src.main import _save_results_to_postgres, SegmentAnalysisRequest
+from src.main import (
+    _save_results_to_postgres,
+    SegmentAnalysisRequest,
+    EVENT_DETECTION_PROMPT,
+    analyze_segment_and_optionally_save,
+)
 from src.database import SessionLocal
 
 class RTSPStreamManager:
@@ -49,9 +54,18 @@ class RTSPStreamManager:
         except Exception as e:
             print(f"--- [RTSP] ⚠️ RTSP URL validation error (will still attempt): {str(e)[:150]} ---")
 
-        # 1. 準備輸出目錄
+        # 1. 準備輸出目錄（確保可寫入，避免 FFmpeg 後續出現 I/O error）
         output_dir = Path("segment") / video_id
         output_dir.mkdir(parents=True, exist_ok=True)
+        try:
+            test_file = output_dir / ".write_test"
+            test_file.write_text("")
+            test_file.unlink()
+        except OSError as e:
+            raise RuntimeError(
+                f"無法寫入 segment 目錄 {output_dir}（磁碟滿或權限不足）: {e}. "
+                "請檢查磁碟空間與目錄權限。"
+            )
 
         # 2. 啟動兩個 FFmpeg 進程：
         #    - 進程1：推流到 MediaMTX (供前端 HLS 觀看)
@@ -213,7 +227,13 @@ class RTSPStreamManager:
             "status": "running",  # running, stopped, error, ended
             "rtsp_url": rtsp_url,
             "error_message": None,
-            "encoding": encoder_name  # 存儲編碼器信息
+            "encoding": encoder_name,  # 存儲編碼器信息
+            # 進度與錯誤（方便前端/日誌知道讀到哪一段、進度、是否報錯）
+            "segments_processed": 0,
+            "last_segment_name": None,
+            "last_processed_at": None,
+            "current_segment": None,  # 目前正在分析的檔名，完成後清空
+            "analysis_errors": [],  # 最近的分析錯誤，最多保留 10 筆
         }
         
         # 啟動執行緒來讀取並打印 FFmpeg 的輸出，並檢測錯誤
@@ -229,9 +249,9 @@ class RTSPStreamManager:
                     # 檢測串流結束或找不到串流的錯誤
                     if any(keyword in line_lower for keyword in [
                         "stream not found", "connection refused", "connection timed out",
-                        "end of file", "server returned 404", "server returned 400", 
+                        "end of file", "server returned 404", "server returned 400",
                         "unable to open", "error opening input", "option not found",
-                        "error splitting", "unrecognized option"
+                        "error splitting", "unrecognized option", "input/output error", "i/o error"
                     ]):
                         print(f"--- [FFmpeg {vid} - {proc_type}] ⚠️ 串流錯誤檢測: {line.strip()} ---")
                         stream_info = RTSPStreamManager._streams.get(vid)
@@ -244,6 +264,11 @@ class RTSPStreamManager:
                                 stream_info["error_message"] = f"RTSP 源連接失敗 (400): {rtsp_url}。請檢查 RTSP URL 是否正確。"
                             elif "option not found" in line_lower or "unrecognized option" in line_lower:
                                 stream_info["error_message"] = f"FFmpeg 參數錯誤: {line.strip()}"
+                            elif "input/output error" in line_lower or "i/o error" in line_lower:
+                                stream_info["error_message"] = (
+                                    "串流 I/O 錯誤：可能為 (1) RTSP 源中斷或網路不穩 (2) 寫入目錄磁碟滿或權限不足。"
+                                    " 請檢查 RTSP 源、網路，以及 segment 目錄所在磁碟空間。"
+                                )
                             else:
                                 stream_info["error_message"] = line.strip()
             except Exception as e:
@@ -353,7 +378,13 @@ class RTSPStreamManager:
                 "uptime": round(time.time() - info["start_time"], 2),
                 "status": info.get("status", process_status),
                 "rtsp_url": info.get("rtsp_url", "unknown"),
-                "encoding": info.get("encoding", "unknown")  # 添加編碼器信息
+                "encoding": info.get("encoding", "unknown"),
+                # 進度：已處理幾段、最後一段檔名、目前正在處理的檔名
+                "segments_processed": info.get("segments_processed", 0),
+                "last_segment_name": info.get("last_segment_name"),
+                "last_processed_at": info.get("last_processed_at"),
+                "current_segment": info.get("current_segment"),
+                "recent_errors": info.get("analysis_errors", [])[-5:],  # 最近 5 筆分析錯誤
             }
             
             # 如果有錯誤訊息，加入結果
@@ -426,29 +457,32 @@ class RTSPStreamManager:
                 
                 break
 
-            # 獲取所有 mp4，按修改時間排序
+            # 獲取所有 mp4，按修改時間排序（舊的在前）
             files = sorted(list(output_dir.glob("*.mp4")), key=lambda f: f.stat().st_mtime)
-            
-            # 策略：只處理「不是最新」的檔案 (假設最新的正在寫入)
-            # 或者檢查檔案大小在幾秒內沒有變化
-            
+            # 只處理「不是最新」的檔案（假設最新的正在寫入）
             if len(files) > 1:
-                # 取出所有非最新的檔案 (candidates)
                 candidates = files[:-1]
-                
-                for file_path in candidates:
-                    if file_path.name not in processed_files:
-                        print(f"--- [RTSP] New segment detected: {file_path.name} ---")
-                        
-                        # 等待一小段時間確保寫入完全 flush
-                        time.sleep(1)
-                        
-                        # 觸發分析
-                        try:
-                            RTSPStreamManager._analyze_file(video_id, file_path, segment_duration)
-                            processed_files.add(file_path.name)
-                        except Exception as e:
-                            print(f"--- [RTSP ERROR] Analysis failed for {file_path.name}: {e} ---")
+                unprocessed = [f for f in candidates if f.name not in processed_files]
+                # 每輪只處理「一個」片段，避免一次噴出一大堆辨識結果與日誌
+                if unprocessed:
+                    file_path = unprocessed[0]
+                    processed_files.add(file_path.name)
+                    # 等待一小段時間確保寫入完全 flush
+                    time.sleep(1)
+                    try:
+                        RTSPStreamManager._analyze_file(video_id, file_path, segment_duration)
+                    except Exception as e:
+                        # 記錄到串流狀態，讓 status API 與日誌都能看到
+                        stream_info = RTSPStreamManager._streams.get(video_id)
+                        if stream_info is not None:
+                            err_list = stream_info.get("analysis_errors") or []
+                            err_list.append({
+                                "segment": file_path.name,
+                                "error": str(e),
+                                "at": time.time(),
+                            })
+                            stream_info["analysis_errors"] = err_list[-10:]
+                        print(f"--- [RTSP {video_id}] 片段失敗: {file_path.name} | {e} ---")
             
             time.sleep(2)
 
@@ -456,6 +490,12 @@ class RTSPStreamManager:
     def _analyze_file(video_id, file_path, duration):
         """使用與 POST /v1/analyze_segment_result 相同的單一入口，不重複實作分析與寫 DB。"""
         stem = file_path.stem
+        stream_info = RTSPStreamManager._streams.get(video_id)
+        n = (stream_info.get("segments_processed", 0) + 1) if stream_info else 1
+        if stream_info is not None:
+            stream_info["current_segment"] = file_path.name
+        print(f"--- [RTSP {video_id}] 第 {n} 段 開始: {file_path.name} ---")
+        t0 = time.time()
         req = {
             "segment_path": str(file_path),
             "segment_index": 0,
@@ -471,11 +511,16 @@ class RTSPStreamManager:
             "yolo_every_sec": 2.0,
             "yolo_score_thr": 0.25,
         }
-        print(f"--- [RTSP] ⚡ 極速模式分析中: {file_path.name}... ---")
         analyze_segment_and_optionally_save(
             req,
             save_to_db=True,
             video_id=video_id,
             time_range=stem,
         )
-        print(f"--- [RTSP] ✓ 分析完成並存檔: {file_path.name} ---")
+        elapsed = round(time.time() - t0, 1)
+        if stream_info is not None:
+            stream_info["segments_processed"] = stream_info.get("segments_processed", 0) + 1
+            stream_info["last_segment_name"] = file_path.name
+            stream_info["last_processed_at"] = time.time()
+            stream_info["current_segment"] = None
+        print(f"--- [RTSP {video_id}] 第 {n} 段 完成: {file_path.name} (耗時 {elapsed}s) ---")
