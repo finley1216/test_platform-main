@@ -47,15 +47,14 @@ services:
     #   - "11434:11434"  # 移除端口映射，避免衝突。backend 可通過服務名 ollama:11434 訪問
     environment:
       - OLLAMA_MAX_LOADED_MODELS=1
-      # -1=永久預載；0=不預載（關閉後即卸載）；正數=閒置 N 分鐘後卸載。要省 GPU 可設 0
       - OLLAMA_KEEP_ALIVE=${OLLAMA_KEEP_ALIVE:--1}
     volumes:
       - ollama_data:/root/.ollama
     networks:
       - app-network
     extra_hosts:
-      - "registry.ollama.ai:104.16.55.3"  # 加這行，直接用 IP
-      - "registry.ollama.ai:104.16.54.3"  # Cloudflare 的備用 IP
+      - "registry.ollama.ai:104.16.55.3"
+      - "registry.ollama.ai:104.16.54.3"
     deploy:
       resources:
         reservations:
@@ -63,6 +62,48 @@ services:
             - driver: nvidia
               count: all
               capabilities: [gpu]
+
+  # vLLM Service - OpenAI 相容 API，可選用 Qwen2.5-VL AWQ 等模型
+  vllm:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    environment:
+      - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct-AWQ}
+      - VLLM_HOST=0.0.0.0
+      - VLLM_PORT=8440
+      - VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
+      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-56000}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
+      - HF_HOME=/root/.cache/huggingface
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      # 強制離線，只讀掛載的 HF cache（不連 huggingface.co）
+      - TRANSFORMERS_OFFLINE=1
+      - HF_HUB_OFFLINE=1
+    volumes:
+      - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    networks:
+      - app-network
+    # 主機 port 可於 .env 設 VLLM_PORT（預設 8440）；若 8440 被本機 vLLM 佔用可改 8441
+    ports:
+      - "${VLLM_PORT:-8440}:8440"
+    command: >
+      --model ${VLLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct-AWQ}
+      --host 0.0.0.0
+      --port 8440
+      --trust-remote-code
+      --dtype half
+      --quantization awq
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-56000}
+      --api-key ${VLLM_API_KEY:-}
 
   # PostgreSQL Database with pgvector extension
   postgres:
@@ -124,9 +165,8 @@ services:
       - HOST=${HOST}
       - PORT=8080
       - RELOAD=${RELOAD:-false}
-      # 每個 worker 為獨立 process，各載一份 Qwen+YOLO+ReID（約 17GB/process）。要改多 worker 請改下面為 WORKERS=2 或改用 ${WORKERS:-1} 並在 .env 設 WORKERS
-      # - WORKERS=4
-      - WORKERS=1
+      # 每個 worker 為獨立 process，各載一份 Qwen+YOLO+ReID（約 17GB/process）。在 .env 設 WORKERS=4 即會生效；預設 1 避免單機 VRAM 不足。
+      - WORKERS=${WORKERS:-1}
       - PRELOAD_CLIP=${PRELOAD_CLIP:-false}
       - PRELOAD_YOLO_REID=${PRELOAD_YOLO_REID:-true}
       - PRELOAD_SENTENCE_TRANSFORMER=${PRELOAD_SENTENCE_TRANSFORMER:-true}
@@ -140,6 +180,8 @@ services:
       - OLLAMA_LLM_MODEL=qwen2.5vl:latest
       - OLLAMA_BASE=http://ollama:11434
       - OLLAMA_REQUEST_TIMEOUT=600
+      - VLLM_BASE=${VLLM_BASE:-http://vllm:8440}
+      - VLLM_API_KEY=${VLLM_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
       - POSTGRES_USER=postgres
