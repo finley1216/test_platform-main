@@ -10,6 +10,8 @@
     "smoking_outside_zone": false,
     "crowd_loitering": false,
     "security_door_tamper": false,
+    "dangerous_items": false,
+    "violence": false,
 
     "reason": ""
   }
@@ -24,6 +26,8 @@
 6) smoking_outside_zone（非管制區吸菸）：手持燃燒香菸與煙霧，且明顯不在吸菸區標示內 → **true**。
 7) crowd_loitering（聚眾逗留）：同位置 ≥3 人在連續影格位置基本不變或樓梯旁多人閒坐（單張影像不足則 false） → **true**。
 8) security_door_tamper（突破安全門）：反覆拉門把/推門縫/對鎖孔操作或操作「安全門/禁止進入」之門 → **true**。
+9) dangerous_items（持有危險武器）：人員手持危險武器，手持槍械，可能涉及危險物品。 → **true**。
+10) violence（暴力行為）：企圖攻擊他人或造成物理性衝突 → **true**。
 
 ### 決斷與一致性
 - 觀察到明確徵象就設 **true**；否則 **false**。

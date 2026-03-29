@@ -63,7 +63,8 @@ services:
               count: all
               capabilities: [gpu]
 
-  # vLLM Service - OpenAI 相容 API，可選用 Qwen2.5-VL AWQ 等模型
+  # vLLM（服務名 vllm，容器內 8440）— 下方 VLLM_MAX_MODEL_LEN（預設 56000）「只影響這個服務」。
+  # Qwen3 走 vllm-qwen3 / 主機 8441 時，請看該服務的 QWEN3_MAX_MODEL_LEN；後端 QWEN3_VLLM_BASE 預設指 host:8441。
   vllm:
     image: vllm/vllm-openai:latest
     restart: unless-stopped
@@ -72,7 +73,7 @@ services:
       - VLLM_HOST=0.0.0.0
       - VLLM_PORT=8440
       - VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
-      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-56000}
+      - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-16384}
       - VLLM_API_KEY=${VLLM_API_KEY:-}
       - HF_HOME=/root/.cache/huggingface
       - TRANSFORMERS_CACHE=/root/.cache/huggingface
@@ -102,8 +103,46 @@ services:
       --dtype half
       --quantization awq
       --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
-      --max-model-len ${VLLM_MAX_MODEL_LEN:-56000}
+      --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --api-key ${VLLM_API_KEY:-}
+
+  # Qwen3-VL（host network，預設主機 8441）— max context 由 QWEN3_MAX_MODEL_LEN 決定，與上方 vllm 的 56000 無關。
+  # 多圖＋長 prompt 時若設太小會出現 vLLM 400：max_tokens 為負數；VRAM 不足再於 .env 調低。
+  vllm-qwen3:
+    image: vllm/vllm-openai:latest
+    restart: unless-stopped
+    environment:
+      - QWEN3_MODEL=${QWEN3_MODEL:-Qwen/Qwen3-VL-8B-Instruct-FP8}
+      - QWEN3_HOST=0.0.0.0
+      - QWEN3_PORT=8441
+      - QWEN3_GPU_MEMORY_UTILIZATION=${QWEN3_GPU_MEMORY_UTILIZATION:-0.7}
+      - QWEN3_MAX_MODEL_LEN=${QWEN3_MAX_MODEL_LEN:-16384}
+      - QWEN3_API_KEY=${QWEN3_API_KEY:-}
+      - HF_HOME=/root/.cache/huggingface
+      - TRANSFORMERS_CACHE=/root/.cache/huggingface
+      # 首次啟動通常需下載權重；若確定快取完整可在 .env 設 QWEN3_OFFLINE=1
+      - TRANSFORMERS_OFFLINE=${QWEN3_OFFLINE:-0}
+      - HF_HUB_OFFLINE=${QWEN3_OFFLINE:-0}
+    volumes:
+      - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    shm_size: "2gb"
+    deploy:
+      resources:
+        reservations:
+          devices:
+            - driver: nvidia
+              count: all
+              capabilities: [gpu]
+    # 在學校網路環境下，bridge DNS 解析可能受限；改用 host network 取用主機 DNS
+    network_mode: host
+    command: >
+      --model ${QWEN3_MODEL:-Qwen/Qwen3-VL-8B-Instruct-FP8}
+      --host 0.0.0.0
+      --port ${QWEN3_PORT:-8441}
+      --trust-remote-code
+      --dtype auto
+      --gpu-memory-utilization ${QWEN3_GPU_MEMORY_UTILIZATION:-0.7}
+      --max-model-len ${QWEN3_MAX_MODEL_LEN:-16384}
 
   # PostgreSQL Database with pgvector extension
   postgres:
@@ -165,6 +204,9 @@ services:
       - HOST=${HOST}
       - PORT=8080
       - RELOAD=${RELOAD:-false}
+      # gunicorn：-w WORKERS，UvicornWorker；worker 死後 master 會再起。
+      # uvicorn：WORKERS=1 為單一 process；WORKERS>1 則 uvicorn --workers N（多 process，仍非 Gunicorn）。
+      - BACKEND_PROCESS_MANAGER=${BACKEND_PROCESS_MANAGER:-gunicorn}
       # 每個 worker 為獨立 process，各載一份 Qwen+YOLO+ReID（約 17GB/process）。在 .env 設 WORKERS=4 即會生效；預設 1 避免單機 VRAM 不足。
       - WORKERS=${WORKERS:-1}
       - PRELOAD_CLIP=${PRELOAD_CLIP:-false}
@@ -181,6 +223,10 @@ services:
       - OLLAMA_BASE=http://ollama:11434
       - OLLAMA_REQUEST_TIMEOUT=600
       - VLLM_BASE=${VLLM_BASE:-http://vllm:8440}
+      # 模型名含 qwen3 時會打這個 URL（預設主機 8441＝vllm-qwen3）；要改打容器內 vllm:8440 請覆寫此變數
+      - QWEN3_VLLM_BASE=${QWEN3_VLLM_BASE:-http://host.docker.internal:8441}
+      # 遠端 vLLM 批次同時 HTTP 連線數（預設 8）；設 1 則逐筆送，易拖慢 pipeline
+      - VLLM_BATCH_MAX_WORKERS=${VLLM_BATCH_MAX_WORKERS:-8}
       - VLLM_API_KEY=${VLLM_API_KEY:-}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
@@ -214,6 +260,8 @@ services:
       - ../video:/app/video:ro
       # 本機 HF cache：用與 download 腳本相同使用者的 $HOME，或於 .env 設 HF_CACHE_HOST=/mnt/10THDD/M133040024/.cache/huggingface
       - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     dns:
       - 8.8.8.8
       - 8.8.4.4
@@ -235,6 +283,51 @@ services:
       timeout: 10s
       retries: 3
       start_period: 90s
+
+    # --- 以下為舊參數對照（純 Gunicorn）；實際啟動改由下方 command 依 BACKEND_PROCESS_MANAGER 決定 ---
+    # 舊版曾用：--timeout 600 --graceful-timeout 10
+    # 現行 gunicorn 分支：--timeout 0（停用 worker 靜默逾時殺進程）、--graceful-timeout 3600；無 --max-requests
+    # command: >
+    #   gunicorn
+    #   -k uvicorn.workers.UvicornWorker
+    #   -w ${WORKERS:-1}
+    #   -b ${HOST:-0.0.0.0}:${PORT:-8080}
+    #   --timeout 0
+    #   --graceful-timeout 3600
+    #   --log-level ${LOG_LEVEL:-info}
+    #   src.main:app
+    # --- 對照結束 ---
+
+    command:
+      - sh
+      - -lc
+      - |
+        set -e
+        if [ "${BACKEND_PROCESS_MANAGER:-gunicorn}" = "uvicorn" ]; then
+          if [ "${WORKERS:-1}" -le 1 ]; then
+            exec uvicorn src.main:app \
+              --host "${HOST:-0.0.0.0}" \
+              --port "${PORT:-8080}" \
+              --timeout-keep-alive 600 \
+              --log-level "${LOG_LEVEL:-info}"
+          else
+            exec uvicorn src.main:app \
+              --host "${HOST:-0.0.0.0}" \
+              --port "${PORT:-8080}" \
+              --workers "${WORKERS:-1}" \
+              --timeout-keep-alive 600 \
+              --log-level "${LOG_LEVEL:-info}"
+          fi
+        else
+          exec gunicorn \
+            -k uvicorn.workers.UvicornWorker \
+            -w "${WORKERS:-1}" \
+            -b "${HOST:-0.0.0.0}:${PORT:-8080}" \
+            --timeout 0 \
+            --graceful-timeout 3600 \
+            --log-level "${LOG_LEVEL:-info}" \
+            src.main:app
+        fi
 
   frontend:
     build:

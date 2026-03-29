@@ -3,10 +3,14 @@
 影片分析相關 API
 """
 import os
+import gc
 import subprocess
 import time
 import json
 import tempfile
+import uuid
+import traceback
+import threading
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException, Body
@@ -38,6 +42,32 @@ def _get_db_and_models():
     return get_db, get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
 
 router = APIRouter(tags=["影片分析"])
+
+
+def _print_ram_diagnosis(stage: str) -> None:
+    """即時列印系統 / 進程 RAM 與 Swap，供診斷 vm_pct 飆高（segment_pipeline 與 YOLO batch 內延遲匯入呼叫）。"""
+    try:
+        vm = psutil.virtual_memory()
+        vm_pct = float(vm.percent)
+        available_mib = vm.available / (1024 * 1024)
+        rss = psutil.Process(os.getpid()).memory_info().rss
+        rss_mb = rss / (1024 * 1024)
+        sw = psutil.swap_memory()
+        swap_used = int(sw.used)
+        swap_used_mib = swap_used / (1024 * 1024)
+        print(
+            f"--- [RAM-DIAG] {stage} vm_pct={vm_pct:.1f}% available={available_mib:.1f}MiB "
+            f"process_rss={rss_mb:.1f}MiB swap_used={swap_used_mib:.1f}MiB ({swap_used} bytes) ---",
+            flush=True,
+        )
+        if vm_pct > 90.0:
+            print(
+                "--- [RAM-CRITICAL] 記憶體即將耗盡，系統可能觸發 Swap 導致 I/O 鎖死！ ---",
+                flush=True,
+            )
+    except Exception as ex:
+        print(f"--- [RAM-DIAG] {stage} 無法讀取 psutil: {type(ex).__name__}: {ex} ---", flush=True)
+
 
 # 對每個片段做 VLM + YOLO，含偵測與切割
 @router.post("/v1/analyze_segment_result")
@@ -158,9 +188,25 @@ def segment_pipeline_multipart(
 ):
     global active_requests_counter
     active_requests_counter += 1
+    req_id = uuid.uuid4().hex[:12]
     t0 = time.time()
+    t1 = None  # pipeline 開始時刻（供 api_process_time 與慢請求診斷）
     mem_before = psutil.Process().memory_info().rss / (1024 * 1024)
-    
+    client_host = request.client.host if request.client else "?"
+    try:
+        vm_pct = psutil.virtual_memory().percent
+    except Exception:
+        vm_pct = -1.0
+
+    print(
+        f"--- [API] 收到 POST /v1/segment_pipeline_multipart | req_id={req_id} | active_same_worker={active_requests_counter} "
+        f"| client={client_host} | python_threads≈{threading.active_count()} | rss_mb={mem_before:.1f} | vm_pct={vm_pct} ---",
+        flush=True,
+    )
+    print(
+        "--- [診斷] 若客戶端僅見 503 且本行未出現，請查 Nginx backlog / worker 數；若見 500 請對照下方 traceback 與 [GPU_LOCK] 等待時間 ---",
+        flush=True,
+    )
     logger.info(f"--- [Pipeline Start] Model: {model_type}, Qwen: {qwen_model}, Strict: {strict_segmentation} ---")
     if strict_segmentation:
         logger.warning("--- [Diagnostics] Performing Re-encoding (CPU Intensive) ---")
@@ -173,6 +219,8 @@ def segment_pipeline_multipart(
     if not summary_prompt or not summary_prompt.strip():
         summary_prompt = DEF_SUMMARY_PROMPT
 
+    _print_ram_diagnosis(f"[START] req_id={req_id} segment_pipeline_multipart（讀取影片前）")
+
     # 1. 處理上傳與下載
     target_filename = "unknown_video"
     local_path = None
@@ -180,6 +228,7 @@ def segment_pipeline_multipart(
     
     try:
         if video_id and video_id.strip():
+            print(f"--- [API] 使用已存在 video_id: {video_id} ---")
             local_path = None
         elif file is not None:
             # 檢查檔案大小 (Point 5, 9)
@@ -190,13 +239,15 @@ def segment_pipeline_multipart(
             if file_size == 0:
                 logger.error(f"--- [Upload Error] File is empty (0 bytes). Upload blocked by firewall? ---")
                 raise HTTPException(status_code=400, detail="File is empty (0 bytes). Upload blocked by firewall?")
-                
+            print(f"--- [API] 已收到上傳檔案: {file.filename or 'video.mp4'}, 大小: {file_size} bytes ---")
             target_filename = file.filename or "video.mp4"
             fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(target_filename).suffix)
-            with os.fdopen(fd, "wb") as f: 
+            with os.fdopen(fd, "wb") as f:
                 f.write(file_content)
             local_path, cleanup = tmp, True
+            del file_content
         elif video_url:
+            print(f"--- [API] 使用 video_url 下載: {video_url[:80]}... ---")
             target_filename = Path(video_url).name or "video_url.mp4"
             local_path, cleanup = VideoService.download_to_temp(video_url), True
         else:
@@ -211,8 +262,10 @@ def segment_pipeline_multipart(
             logger.error(f"--- [FFmpeg Error] {ve} ---")
             raise HTTPException(status_code=500, detail=f"FFmpeg Processing Failed: {ve}")
 
+        print(f"--- [API] req_id={req_id} 片段準備完成: 共 {len(seg_files)} 個片段, stem={stem} ---", flush=True)
+        # 3. 執行 Pipeline（t1：僅 pipeline，不含上傳/FFmpeg 切片）
+        print(f"--- [API] req_id={req_id} 開始執行分析 pipeline (model_type={model_type}), 共 {len(seg_files)} 段 ---", flush=True)
         t1 = time.time()
-        # 3. 執行 Pipeline
         try:
             results = AnalysisService.run_full_pipeline(
                 seg_files, total_duration, segment_duration, overlap,
@@ -220,10 +273,14 @@ def segment_pipeline_multipart(
                 event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr
             )
         except torch.cuda.OutOfMemoryError as e:
-            logger.error(f"--- [CUDA OOM] {e} ---")
+            print(f"--- [API] req_id={req_id} CUDA OOM ---", flush=True)
+            traceback.print_exc()
+            logger.error(f"--- [CUDA OOM] req_id={req_id} {e} ---", exc_info=True)
             raise HTTPException(status_code=500, detail="CUDA Out of Memory: GPU is overloaded. Please try a smaller model or fewer frames.")
         except MemoryError as e:
-            logger.error(f"--- [OOM] {e} ---")
+            print(f"--- [API] req_id={req_id} MemoryError ---", flush=True)
+            traceback.print_exc()
+            logger.error(f"--- [OOM] req_id={req_id} {e} ---", exc_info=True)
             raise HTTPException(status_code=500, detail="System Out of Memory: CPU/RAM is overloaded.")
         finally:
             # 整次請求結束後釋放 GPU 暫存，模型保留在 worker 內
@@ -231,6 +288,21 @@ def segment_pipeline_multipart(
         
         t2 = time.time()
         mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
+        ok_count = sum(1 for r in results if r.get("success"))
+        wall_total = t2 - t0
+        if wall_total > 10.0 and t1 is not None:
+            proc_only = t2 - t1
+            print(
+                f"--- [API][SlowRequest] req_id={req_id} api_process_time={round(proc_only, 2)}s (pipeline 起訖) "
+                f"api_total_time={round(wall_total, 2)}s (含上傳/切片) | "
+                f"差額≈{round(wall_total - proc_only, 2)}s → 大差額多為 I/O/切片；pipeline 內慢多為 AI/GPU ---",
+                flush=True,
+            )
+        print(
+            f"--- [API] Pipeline 完成: req_id={req_id} 耗時 {round(t2-t0, 2)}s, success_segments={ok_count}/{len(results)} "
+            f"active_same_worker={active_requests_counter} ---",
+            flush=True,
+        )
         logger.info(f"--- [Pipeline Success] Time: {round(t2-t0, 2)}s, Mem Delta: {round(mem_after - mem_before, 2)}MB ---")
 
         # 4. 存檔與資料庫
@@ -262,17 +334,62 @@ def segment_pipeline_multipart(
             finally:
                 db.close()
 
-        return JSONResponse(resp)
+        if config.CLEANUP_YOLO_CROPS:
+            try:
+                AnalysisService.cleanup_yolo_object_crop_files(results, Path(seg_dir))
+            except Exception as crop_clean_err:
+                logger.warning(
+                    "--- [Pipeline] object_crops 清理失敗: %s ---",
+                    crop_clean_err,
+                    exc_info=True,
+                )
+
+        response_obj = JSONResponse(resp)
+        try:
+            del results
+            del resp
+        except NameError:
+            pass
+        gc.collect()
+        if torch.cuda.is_available():
+            try:
+                torch.cuda.empty_cache()
+            except Exception:
+                pass
+
+        return response_obj
 
     except HTTPException:
         raise
     except Exception as e:
-        logger.error(f"--- [Unexpected Error] {type(e).__name__}: {e} ---", exc_info=True)
+        print(f"--- [API] req_id={req_id} segment_pipeline_multipart 未預期錯誤 ---", flush=True)
+        traceback.print_exc()
+        logger.error(f"--- [Unexpected Error] req_id={req_id} {type(e).__name__}: {e} ---", exc_info=True)
+        try:
+            te = time.time()
+            if t1 is not None and (te - t0) > 10.0:
+                print(
+                    f"--- [API][SlowRequest][錯誤路徑] req_id={req_id} "
+                    f"自 pipeline 起算≈{round(te - t1, 2)}s 總耗時≈{round(te - t0, 2)}s ---",
+                    flush=True,
+                )
+        except Exception:
+            pass
         raise HTTPException(status_code=500, detail=f"Unexpected Error: {type(e).__name__} - {str(e)}")
     finally:
         active_requests_counter -= 1
-        if cleanup and local_path and os.path.exists(local_path):
-            os.remove(local_path)
+        if cleanup and local_path:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+        try:
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 # 批次端點：配合 test_segment_pipeline_rtsp_batch.py 使用
 @router.post("/v1/segment_pipeline_batch")

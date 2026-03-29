@@ -80,6 +80,8 @@ export const EVENT_MAP = {
   smoking_outside_zone: "違規吸菸",
   crowd_loitering: "聚眾逗留",
   security_door_tamper: "破壞門禁",
+  violence: "暴力衝突",
+  dangerous_items: "危險物品/武器",
 };
 
 export const STORAGE_KEYS = {

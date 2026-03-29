@@ -24,6 +24,9 @@ RUN pip install --no-cache-dir -r requirements.txt && \
     pip install --no-cache-dir torchao && \
     pip install --no-cache-dir git+https://github.com/ultralytics/CLIP.git || echo "Warning: Failed to install CLIP module"
 
+# gunicorn 用來成為 process manager，讓 kill 掉單一 worker 後可以自動補回
+RUN pip install --no-cache-dir gunicorn
+
 # 可選：精準 ReID 需 torchreid（未安裝時會 fallback 到 torchvision ResNet50）
 RUN pip install --no-cache-dir torchreid || echo "Warning: torchreid not installed, ReID will use torchvision ResNet50"
 

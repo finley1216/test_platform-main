@@ -4,6 +4,8 @@
 # 注意：僅 Hugging Face 系模型（如 Qwen）使用 device_map；YOLO/ReID 為一般 PyTorch/Ultralytics，不使用 device_map，載入後 .to(device) 為正確用法。
 import os
 import threading
+import time
+from contextlib import contextmanager
 import torch
 import numpy as np
 from ultralytics import YOLOWorld
@@ -15,6 +17,28 @@ _reid_load_lock = threading.Lock()
 # 推理鎖：YOLO/ReID 模型非 thread-safe，多 thread 並行 predict 會導致設備不一致、模型狀態損壞、CUDA illegal memory access。
 # run_full_pipeline 的 ThreadPoolExecutor 會有多 thread 同時呼叫 infer_segment_yolo，必須串行化 GPU 推理。
 _gpu_inference_lock = threading.Lock()
+
+
+@contextmanager
+def gpu_inference_lock_traced():
+    """
+    取得 YOLO/ReID 共用的 _gpu_inference_lock，並印出等待時間。
+    多請求同時進入時等待會變長，可用來對照 500/逾時是否為 GPU 鎖排隊或 CPU 解碼過載。
+    """
+    t0 = time.time()
+    th = threading.current_thread().name
+    ident = threading.get_ident()
+    _gpu_inference_lock.acquire()
+    try:
+        wait_sec = time.time() - t0
+        print(
+            f"--- [GPU_LOCK] YOLO/ReID 已取得鎖 | 等待 {wait_sec:.3f}s | thread={th} ident={ident} ---",
+            flush=True,
+        )
+        yield
+    finally:
+        _gpu_inference_lock.release()
+
 
 # YOLO-World 模型（單例）
 _yolo_world_model = None

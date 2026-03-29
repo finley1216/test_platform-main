@@ -10,14 +10,24 @@ from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from src.core.model_loader import get_yolo_model, get_reid_model, get_clip_model, _gpu_inference_lock
+import threading
+
+from src.core.model_loader import get_yolo_model, get_reid_model, get_clip_model, gpu_inference_lock_traced
 from src.utils.video_utils import _sample_frames_evenly_to_pil, _fmt_hms
 from src.utils.image_utils import _resize_short_side, _pil_to_b64
 from src.utils.ollama_utils import (
-    _ollama_chat, _safe_parse_json, _extract_first_json, 
+    _ollama_chat, _safe_parse_json, _extract_first_json,
     _clean_summary_text, _extract_first_json_and_tail
 )
 from src.config import config
+
+try:
+    from src.utils.vllm_utils import _vllm_chat
+    from src.utils.vllm_utils import _vllm_chat_batch
+    HAS_VLLM = True
+except Exception as _e:
+    _vllm_chat = None
+    HAS_VLLM = False
 
 # 本機 HF Qwen2.5-VL（batch 推論用）；未安裝 transformers 時為 None
 try:
@@ -41,7 +51,14 @@ def _release_gpu_memory():
     """釋放 GPU 上推理產生的暫存張量與快取，不卸載模型。供每個片段/請求結束後呼叫。"""
     try:
         if torch.cuda.is_available():
+            # 先同步，避免仍在排隊的 CUDA kernel 尚未結束導致 empty_cache 釋放不完全
+            torch.cuda.synchronize()
             torch.cuda.empty_cache()
+            # 釋放跨進程共享記憶體（CUDA IPC）殘留
+            try:
+                torch.cuda.ipc_collect()
+            except Exception:
+                pass
             gc.collect()
     except Exception:
         pass
@@ -102,6 +119,45 @@ class AnalysisService:
                 return str(crop_path)
 
     @staticmethod
+    def cleanup_yolo_object_crop_files(
+        results: Optional[List[Dict]],
+        segments_parent: Optional[Path] = None,
+    ) -> None:
+        """
+        ReID embedding 已寫入結果、且 DB/JSON 持久化完成後，刪除 yolo_output/object_crops 暫存圖檔，
+        降低磁碟佔用與大量小檔 I/O 造成的壓力。
+        segments_parent: 片段檔所在目錄（與 prepare_segments 的 seg_dir 一致），供相對 path 還原實際檔案。
+        """
+        if not results:
+            return
+        seg_base = Path(segments_parent).resolve() if segments_parent else None
+        for r in results:
+            if not isinstance(r, dict):
+                continue
+            yolo = (r.get("raw_detection") or {}).get("yolo") or {}
+            dets = yolo.get("detections") or yolo.get("crop_paths") or []
+            if not isinstance(dets, list):
+                continue
+            for d in dets:
+                if not isinstance(d, dict):
+                    continue
+                p = d.get("path")
+                if not p or not isinstance(p, str):
+                    continue
+                if "object_crops" not in p.replace("\\", "/"):
+                    continue
+                try:
+                    ap = Path(p)
+                    if not ap.is_absolute() and seg_base is not None:
+                        ap = (seg_base / p).resolve()
+                    elif not ap.is_absolute():
+                        ap = Path(p).resolve()
+                    if ap.is_file():
+                        ap.unlink()
+                except OSError:
+                    pass
+
+    @staticmethod
     def infer_segment_qwen(
         model_name: str,
         video_path: str,
@@ -143,10 +199,6 @@ class AnalysisService:
                 print(f"--- [Qwen] 呼叫 Ollama 進行事件偵測+摘要 (單一請求, 模型: {model_name})... ---")
                 raw = _ollama_chat(model_name, combined_msgs, images_b64=images_b64)
                 print(f"--- [Qwen] 事件+摘要完成，回應長度: {len(raw)} ---")
-                # 除錯：輸出完整 raw 供比對 qwen2.5 / qwen3 差異（docker compose logs -f backend 可見）
-                print("========== [Qwen RAW 回應] 模型: {} ==========".format(model_name))
-                print(raw if raw else "(空)")
-                print("========== [Qwen RAW 結束] ==========")
             except Exception as e:
                 combined_error = f"Ollama 失敗: {e}"
                 print(f"--- [Qwen] ✗ 單一請求失敗: {e} ---")
@@ -177,10 +229,6 @@ class AnalysisService:
             print(f"--- [Qwen] 呼叫 Ollama 進行事件偵測 (模型: {model_name})... ---")
             event_txt = _ollama_chat(model_name, event_msgs, images_b64=images_b64)
             print(f"--- [Qwen] 事件偵測完成，長度: {len(event_txt)} ---")
-            # 除錯：輸出完整 event_txt（僅事件、無摘要時）（docker compose logs -f backend 可見）
-            print("========== [Qwen RAW 回應-僅事件] 模型: {} ==========".format(model_name))
-            print(event_txt if event_txt else "(空)")
-            print("========== [Qwen RAW 結束] ==========")
         except Exception as e:
             event_txt = ""
             print(f"--- [Qwen] ✗ 事件偵測失敗: {e} ---")
@@ -188,6 +236,268 @@ class AnalysisService:
         if not isinstance(frame_obj.get("events"), dict):
             frame_obj["events"] = {"reason": ""}
         return frame_obj, ""
+
+    @staticmethod
+    def infer_segment_vllm(
+        model_name: str,
+        video_path: str,
+        event_prompt: str,
+        summary_prompt: str,
+        target_short: int = 720,              # 先保留，雖然 video 直傳時通常不再用到
+        frames_per_segment: int = 8,          # 先保留，給 fallback 模式用
+        sampling_fps: Optional[float] = None
+    ) -> Tuple[Dict, str]:
+        """使用 vLLM 分析影片片段。優先走原生 video 輸入；若失敗可 fallback 成 frame 模式。"""
+        print(f"--- [infer_segment_vllm] 進入, model={model_name}, video_path={video_path!r}, HAS_VLLM={HAS_VLLM}, _vllm_chat={_vllm_chat is not None} ---", flush=True)
+        if not HAS_VLLM or _vllm_chat is None:
+            print("--- [infer_segment_vllm] 離開: vLLM 不可用 ---")
+            return {"error": "vLLM 不可用（未實作或載入失敗）"}, ""
+
+        if not os.path.exists(video_path):
+            return {"error": f"找不到影片檔案: {video_path}"}, ""
+
+        want_summary = bool(summary_prompt.strip())
+        qwen3_disable_thinking = ("qwen3" in (model_name or "").lower())
+
+        # 有摘要時
+        if want_summary:
+            combined_instruction = (
+                f"{event_prompt}\n\n"
+                f"{summary_prompt}\n\n"
+                "請輸出「一個」JSON 物件，且必須包含以下欄位：\n"
+                "- events: 事件描述物件（可含 reason 等）\n"
+                "- persons: 人員相關陣列\n"
+                "- summary: 50–100 字繁體中文畫面摘要（字串）\n"
+                "只輸出該 JSON，不要其他文字。"
+            )
+
+            combined_msgs = [
+                {
+                    "role": "system",
+                    "content": "你是災害與人員異常偵測器，並產出影片摘要。只輸出一個 JSON 物件，含 events、persons、summary。"
+                },
+                {
+                    "role": "user",
+                    "content": combined_instruction
+                }
+            ]
+
+            raw = ""
+            combined_error = None
+
+            try:
+                print(f"--- [vLLM] 呼叫 vLLM 進行事件偵測+摘要（影片直傳, 模型: {model_name}）... ---")
+                raw = _vllm_chat(
+                    model_name=model_name,
+                    messages=combined_msgs,
+                    video_path=video_path,
+                    sampling_fps=sampling_fps,
+                    frames_per_segment=frames_per_segment,
+                    enable_thinking=False if qwen3_disable_thinking else None,
+                )
+                print(f"--- [vLLM] 事件+摘要完成，回應長度: {len(raw)} ---")
+                print("========== [vLLM RAW 回應] 模型: {} ==========".format(model_name))
+                print(raw if raw else "(空)")
+                print("========== [vLLM RAW 結束] ==========")
+
+            except Exception as e:
+                combined_error = f"vLLM 失敗: {e}"
+                print(f"--- [vLLM] ✗ 單一請求失敗: {e} ---")
+
+            combined = _safe_parse_json(raw) or _extract_first_json(raw) or {}
+            print(f"--- [vLLM 解析] 解析後 combined 鍵: {list(combined.keys()) if isinstance(combined, dict) else type(combined)}, summary 長度: {len(str(combined.get('summary') or ''))} ---")
+            events_in = combined.get("events") if isinstance(combined.get("events"), dict) else {}
+            reason = combined.get("event_reason") or combined.get("reason") or (events_in.get("reason", "") if isinstance(events_in, dict) else "")
+
+            if reason and isinstance(events_in, dict) and "reason" not in events_in:
+                events_in = {**events_in, "reason": reason}
+
+            frame_obj = {
+                "events": events_in or {"reason": ""},
+                "persons": combined.get("persons", []),
+            }
+
+            if not isinstance(frame_obj.get("events"), dict):
+                frame_obj["events"] = {"reason": ""}
+
+            if combined_error:
+                frame_obj["error"] = combined_error
+
+            summary_txt = _clean_summary_text(combined.get("summary") or raw or "")
+            if not summary_txt and raw:
+                summary_txt = _clean_summary_text(raw)
+
+            return frame_obj, summary_txt
+
+        # 僅事件偵測（無摘要）
+        event_msgs = [
+            {
+                "role": "system",
+                "content": "你是『嚴格的災害與人員異常偵測器』。只輸出純 JSON 物件。"
+            },
+            {
+                "role": "user",
+                "content": f"{event_prompt}\n\n強制規則：只輸出一個 JSON 物件。"
+            }
+        ]
+
+        try:
+            print(f"--- [vLLM] 呼叫 vLLM 進行事件偵測（影片直傳, 模型: {model_name}）... ---")
+            event_txt = _vllm_chat(
+                model_name=model_name,
+                messages=event_msgs,
+                video_path=video_path,
+                sampling_fps=sampling_fps,
+                frames_per_segment=frames_per_segment,
+                enable_thinking=False if qwen3_disable_thinking else None,
+            )
+            print(f"--- [vLLM] 事件偵測完成，長度: {len(event_txt)} ---")
+            print("========== [vLLM RAW 回應-僅事件] 模型: {} ==========".format(model_name))
+            print(event_txt if event_txt else "(空)")
+            print("========== [vLLM RAW 結束] ==========")
+
+        except Exception as e:
+            event_txt = ""
+            print(f"--- [vLLM] ✗ 事件偵測失敗: {e} ---")
+
+        frame_obj = _safe_parse_json(event_txt) or _extract_first_json(event_txt) or {
+            "events": {"reason": ""},
+            "persons": []
+        }
+        print(f"--- [vLLM 解析] 僅事件模式 解析後 frame_obj 鍵: {list(frame_obj.keys()) if isinstance(frame_obj, dict) else type(frame_obj)} ---")
+
+        if not isinstance(frame_obj.get("events"), dict):
+            frame_obj["events"] = {"reason": ""}
+
+        return frame_obj, ""
+
+    @staticmethod
+    def infer_segment_vllm_batch(
+        model_name: str,
+        path_strs: List[str],
+        event_prompt: str,
+        summary_prompt: str,
+        target_short: int = 432,
+        frames_per_segment: int = 5,
+        sampling_fps: Optional[float] = None
+    ) -> List[Tuple[Dict, str]]:
+        """
+        使用 vLLM 批次分析多個影片片段。
+        優勢：利用 Continuous Batching 與 Prefix Caching 提升 3-5 倍吞吐量。
+        """
+        print(f"--- [vLLM Batch] 開始處理 {len(path_strs)} 個片段, 模型={model_name} ---", flush=True)
+        qwen3_disable_thinking = ("qwen3" in (model_name or "").lower())
+        
+        if not HAS_VLLM or _vllm_chat is None:
+            print("--- [vLLM Batch] 錯誤: vLLM 環境未就緒 ---")
+            return [({"error": "vLLM 不可用"}, "")] * len(path_strs)
+
+        # 預設回傳容器
+        all_parsed: List[Tuple[Dict, str]] = [({"error": "未處理"}, "")] * len(path_strs)
+        valid_indices: List[int] = []
+        batch_requests = []
+
+        # 1. 準備批次資料 (Data Preparation)
+        # 由於 Prompt 都一樣，vLLM 會自動進行 Prefix Caching 優化
+        instruction = (
+            f"{event_prompt}\n\n"
+            f"{summary_prompt}\n\n"
+            "請輸出「一個」JSON 物件，且必須包含以下欄位：\n"
+            "- events: 事件描述物件（可含 reason 等）\n"
+            "- persons: 人員相關陣列\n"
+            "- summary: 50–100 字繁體中文畫面摘要（字串）\n"
+            "只輸出該 JSON，不要其他文字。"
+        )
+
+        combined_msgs = [
+            {
+                "role": "system",
+                "content": "你是災害與人員異常偵測器，並產出影片摘要。只輸出一個 JSON 物件，含 events、persons、summary。"
+            },
+            {
+                "role": "user",
+                "content": instruction
+            }
+        ]
+
+        for i, path in enumerate(path_strs):
+            if not os.path.exists(path):
+                print(f"--- [vLLM Batch] 找不到檔案: {path} ---")
+                all_parsed[i] = ({"error": f"找不到影片檔案: {path}"}, "")
+                continue
+            
+            # 封裝成 vLLM 批次請求格式
+            batch_requests.append({
+                "model_name": model_name,
+                "messages": combined_msgs,
+                "video_path": path,
+                "sampling_fps": sampling_fps,
+                "frames_per_segment": frames_per_segment,
+                "enable_thinking": False if qwen3_disable_thinking else True,
+            })
+            valid_indices.append(i)
+
+        if not batch_requests:
+            return all_parsed
+
+        # 2. 執行 vLLM 批次推論 (Inference)
+        # 這裡呼叫支援 List 輸入的 _vllm_chat 封裝，啟動 Continuous Batching
+        raw_outputs = []
+        try:
+            _mw = max(1, min(int(getattr(config, "VLLM_BATCH_MAX_WORKERS", 16)), 32, len(batch_requests)))
+            print(
+                f"--- [vLLM Batch] 正在呼叫 vLLM 引擎進行 {len(batch_requests)} 段並行分析 (HTTP threads={_mw}) ---",
+                flush=True,
+            )
+            raw_outputs = _vllm_chat_batch(
+                model_name=model_name,
+                batch_requests=batch_requests,
+                max_workers=_mw,
+                enable_thinking=False if qwen3_disable_thinking else None,
+            )
+            print(f"--- [vLLM Batch] 推論完成，取得 {len(raw_outputs)} 筆回應 ---")
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            print(f"--- [vLLM Batch] ✗ 批次請求崩潰: {e} | active_threads={threading.active_count()} ---", flush=True)
+            for idx in valid_indices:
+                all_parsed[idx] = ({"error": f"vLLM Batch 失敗: {e}"}, "")
+            return all_parsed
+
+        # 3. 解析與結果歸位 (Parsing & Post-processing)
+        for j, raw in enumerate(raw_outputs):
+            orig_idx = valid_indices[j]
+            try:
+                # 沿用您原本精密的解析與清理邏輯
+                combined = _safe_parse_json(raw) or _extract_first_json(raw) or {}
+                
+                events_in = combined.get("events") if isinstance(combined.get("events"), dict) else {}
+                reason = (combined.get("event_reason") or 
+                        combined.get("reason") or 
+                        (events_in.get("reason", "") if isinstance(events_in, dict) else ""))
+
+                if reason and isinstance(events_in, dict) and "reason" not in events_in:
+                    events_in = {**events_in, "reason": reason}
+
+                frame_obj = {
+                    "events": events_in or {"reason": ""},
+                    "persons": combined.get("persons", []),
+                }
+
+                if not isinstance(frame_obj.get("events"), dict):
+                    frame_obj["events"] = {"reason": ""}
+
+                summary_txt = _clean_summary_text(combined.get("summary") or raw or "")
+                if not summary_txt and raw:
+                    summary_txt = _clean_summary_text(raw)
+
+                all_parsed[orig_idx] = (frame_obj, summary_txt)
+
+            except Exception as parse_err:
+                print(f"--- [vLLM Batch] 解析失敗 (Index {orig_idx}): {parse_err} ---")
+                all_parsed[orig_idx] = ({"error": f"解析失敗: {parse_err}", "raw": raw[:100]}, "")
+
+        return all_parsed
 
     @staticmethod
     def infer_segment_qwen_hf(
@@ -452,13 +762,19 @@ class AnalysisService:
                     "summary_independent": summary_txt  # VLM 產生的文字摘要
                 }
 
-            elif req.model_type == "qwen_hf":
-                # 使用本機 Hugging Face Qwen2.5-VL（非 Ollama）
-                frame_obj, summary_txt = AnalysisService.infer_segment_qwen_hf(
-                    req.qwen_model, p, req.event_detection_prompt, req.summary_prompt,
-                    target_short=req.target_short, frames_per_segment=req.frames_per_segment,
-                    sampling_fps=req.sampling_fps
-                )
+            elif req.model_type == "vllm_qwen":
+                # 使用 vLLM（Qwen-VL 等）進行事件偵測與摘要
+                print(f"--- [AnalysisService] 即將呼叫 infer_segment_vllm (segment_path={p}) ---", flush=True)
+                try:
+                    frame_obj, summary_txt = AnalysisService.infer_segment_vllm(
+                        req.qwen_model, p, req.event_detection_prompt, req.summary_prompt,
+                        target_short=req.target_short, frames_per_segment=req.frames_per_segment,
+                        sampling_fps=req.sampling_fps
+                    )
+                    print(f"--- [AnalysisService] infer_segment_vllm 返回, has_error={('error' in frame_obj)}, summary_len={len(summary_txt or '')} ---", flush=True)
+                except Exception as vllm_ex:
+                    print(f"--- [AnalysisService] infer_segment_vllm 拋出異常: {vllm_ex} ---", flush=True)
+                    frame_obj, summary_txt = {"error": str(vllm_ex)}, ""
                 frame_norm = AnalysisService._normalize_vlm_output(frame_obj)
                 result["success"] = "error" not in frame_obj
                 result["error"] = frame_obj.get("error")
@@ -592,9 +908,24 @@ class AnalysisService:
         score_thr: float = 0.25,
         yolo_batch_size: int = 20,
     ) -> List[Dict]:
-        
+        # print(
+        #     "[API][infer_segment_yolo_batch][INPUT] "
+        #     + json.dumps(
+        #         {
+        #             "seg_paths": seg_paths or [],
+        #             "labels": labels,
+        #             "every_sec": every_sec,
+        #             "score_thr": score_thr,
+        #             "yolo_batch_size": yolo_batch_size,
+        #         },
+        #         ensure_ascii=False,
+        #         default=str,
+        #     ),
+        #     flush=True,
+        # )
+
         # 同一時間只允許一個執行緒做推論，避免多執行緒同時用 GPU 造成設備不一致或 CUDA 錯誤。
-        with _gpu_inference_lock:
+        with gpu_inference_lock_traced():
             return AnalysisService._infer_segment_yolo_batch_impl(
                 seg_paths, labels, every_sec, score_thr, yolo_batch_size)
 
@@ -611,190 +942,213 @@ class AnalysisService:
         if not seg_paths:
             return []
 
-        # 獲取全域單例（Singleton）的 YOLO 與 ReID 模型，避免重複載入佔用 VRAM。
+        # 1. 獲取模型與基礎參數
         model = get_yolo_model()
-        if not model:
-            model = get_yolo_model()
-            if not model:
-                return [{"error": "YOLO model failed to load", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
-
-        # 獲取 ReID 模型與設備（用於後續物件 re-identification 特徵提取）
         reid_model, reid_device = get_reid_model()
-
-        # 解析 labels 字串（逗號分隔）為列表，若為空則預設 person, car
-        labels_list = [l.strip() for l in labels.split(",") if l.strip()] or ["person", "car"]
+        labels_list = [l.strip() for l in (labels or "person,car").split(",") if l.strip()]
         device = "cuda" if torch.cuda.is_available() else "cpu"
+
+        # 2. 設備初始化與類別設定 (僅處理設備邏輯，不在此處 print 尚未宣告的變數)
         try:
             model.to(device)
             model.set_classes(labels_list)
             model.to(device)
+        except RuntimeError as e:
+            if "same device" in str(e):
+                print(f"--- [YOLO Batch] 偵測到張量設備不一致，嘗試 CPU 修復再回傳 {device} ---", flush=True)
+                try:
+                    model.cpu()
+                    model.set_classes(labels_list)
+                    model.to(device)
+                    print("--- [YOLO Batch] 設備同步修復完成 ---", flush=True)
+                except Exception as e2:
+                    return [{"error": f"Device Fix Failed: {str(e2)}", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
+            else:
+                return [{"error": f"RuntimeError: {str(e)}", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
         except Exception as e:
-            return [{"error": str(e), "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
+            return [{"error": f"Init Error: {str(e)}", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
 
-        # 為每段建立 crops 目錄，並收集 (seg_idx, frame_idx, frame, fps, crops_dir)
+        # 3. 收集所有影格 (Flat Frames)
         flat_frames: List[tuple] = []
         frames_per_seg: List[int] = [0] * len(seg_paths)
 
-        # 遍歷每段影片，收集所有需要處理的影格資訊。
         for seg_idx, p in enumerate(seg_paths):
-
-            # 取得該段影片的目錄，並建立 crops 目錄。
             seg_dir = Path(p).parent
-
-            # 建立 crops 目錄。
             crops_dir = seg_dir / "yolo_output" / "object_crops"
             crops_dir.mkdir(parents=True, exist_ok=True)
 
-            # 開啟影片檔案。
             cap = cv2.VideoCapture(p)
-
-            # 如果無法開啟影片檔案，則跳過。
             if not cap.isOpened():
                 continue
 
-            # 取得影片的 FPS。
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-
-            # 計算取樣間隔。
             interval = max(1, int(round(fps * every_sec)))
-
-            # 收集所有需要處理的影格索引。
             frame_indices = list(range(0, total_frames, interval))
 
-            # 遍歷所有需要處理的影格索引，讀取影格資料並收集到 flat_frames。
             for fi in frame_indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
                 ok, frame = cap.read()
                 if ok:
+                    # (段索引, 影格索引, 影像陣列, FPS, 儲存目錄)
                     flat_frames.append((seg_idx, fi, frame.copy(), fps, crops_dir))
 
-            # 記錄該段影片的總影格數。
             frames_per_seg[seg_idx] = len(frame_indices)
-
-            # 釋放影片檔案。
             cap.release()
 
-        # 如果沒有需要處理的影格，則回傳空列表。
-        if not flat_frames:
-            return [
-                {"total_detections": 0, "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": frames_per_seg[i]}
-                for i in range(len(seg_paths))]
+        try:
+            from src.api.video_analysis import _print_ram_diagnosis
 
-        # 跨段 YOLO batch 推論；每幀推論完依 YOLO 結果 crop、寫檔，並收集 (seg_idx, det_dict, crop_img) 供 ReID
+            _print_ram_diagnosis(
+                f"[AFTER_CV2_EXTRACT] flat_frames={len(flat_frames)} segs={len(seg_paths)}"
+            )
+        except Exception:
+            pass
+
+        # 4. 執行 YOLO Batch 推論
         flat_for_reid: List[tuple] = []
         seg_detections: List[List[Dict]] = [[] for _ in range(len(seg_paths))]
 
-        # 遍歷所有需要處理的影格，進行 YOLO 推論。
         for start in range(0, len(flat_frames), batch_size):
-
-            # 取得當前批次需要處理的影格。
             chunk = flat_frames[start : start + batch_size]
-
-            # 取得當前批次需要處理的影格的影像。
             batch_frames = [x[2] for x in chunk]
 
-            # 進行 YOLO 推論。
+            batch_predict_res: List[Any] = []
             try:
-
-                # 一次對 20 張圖進行偵測。這比單張偵測快上數倍，因為減少了 CPU 與 GPU 之間的溝通次數。
-                batch_predict_res = model.predict(batch_frames, conf=score_thr, verbose=False)
+                batch_predict_res = list(model.predict(batch_frames, conf=score_thr, verbose=False))
             except Exception as e:
-                print(f"--- [YOLO Batch] Predict 失敗: {e} ---")
-                continue
+                print(
+                    f"--- [YOLO Batch] 批次 Predict 失敗，改單幀重試: {type(e).__name__}: {e} ---",
+                    flush=True,
+                )
+                for j, single_frame in enumerate(batch_frames):
+                    try:
+                        one = model.predict([single_frame], conf=score_thr, verbose=False)
+                        if one is not None and len(one) > 0:
+                            batch_predict_res.append(one[0])
+                        else:
+                            batch_predict_res.append(None)
+                    except Exception as e2:
+                        fi_hint = chunk[j][1] if j < len(chunk) else None
+                        print(
+                            f"--- [YOLO Batch] 單幀略過 start={start} j={j} fi={fi_hint}: "
+                            f"{type(e2).__name__}: {e2} ---",
+                            flush=True,
+                        )
+                        batch_predict_res.append(None)
 
-            # 遍歷所有需要處理的影格，進行 YOLO 推論。
+            while len(batch_predict_res) < len(chunk):
+                batch_predict_res.append(None)
+
             for idx, res in enumerate(batch_predict_res):
-
-                # 如果當前索引超過當前批次需要處理的影格，則跳過。
                 if idx >= len(chunk):
                     break
+                if res is None:
+                    continue
+                try:
+                    _ = res.boxes
+                except Exception as e_parse:
+                    print(f"--- [YOLO Batch] 結果物件無效 idx={idx}: {type(e_parse).__name__}: {e_parse} ---", flush=True)
+                    continue
 
-                # 取得當前需要處理的影格的資訊。
                 seg_idx, fi, frame, fps, crops_dir = chunk[idx]
-
-                # 計算當前影格的時間戳。
                 timestamp = round(fi / fps, 2)
-
-                # 初始化當前影格的 crop 影像列表。
+                temp_detections = []
                 crops_imgs = []
 
-                # 初始化當前影格的偵測記錄列表。
-                temp_detections = []
-
-                # 遍歷所有需要處理的影格，進行 YOLO 推論。
                 for b_idx, box in enumerate(res.boxes):
-
-                    # 取得當前物件的類別 ID。
                     cls_id = int(box.cls)
-
-                    # 取得當前物件的類別名稱。
                     label = labels_list[cls_id]
-
-                    # 取得當前物件的信心分數。
                     conf = round(float(box.conf), 3)
-                    xyxy = [int(round(float(c))) for _, c in enumerate(box.xyxy[0].tolist())]
+                    xyxy = [int(round(float(c))) for c in box.xyxy[0].tolist()]
 
-                    # 取得當前物件的邊界框。
-                    x1, y1, x2, y2 = xyxy
-
-                    # 裁剪當前物件的影像。
-                    crop = frame[y1:y2, x1:x2]
+                    # 裁切物件影像
+                    crop = frame[xyxy[1]:xyxy[3], xyxy[0]:xyxy[2]]
                     if crop.size > 0:
-
-                        # 儲存當前物件的影像。
                         crop_filename = f"crop_{fi}_{b_idx}_{label}.jpg"
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)
+                        
                         rel_crop_path = AnalysisService._safe_crop_path_for_storage(crop_path, crops_dir.parent.parent)
-                        crops_imgs.append(crop)
-                        temp_detections.append({
+                        
+                        det_info = {
                             "timestamp": timestamp, "label": label, "score": conf,
                             "box": xyxy, "frame": fi, "path": rel_crop_path,
-                        })
+                        }
+                        temp_detections.append(det_info)
+                        crops_imgs.append(crop)
+
+                # 將結果歸類到對應的段落
                 for d in temp_detections:
                     seg_detections[seg_idx].append(d)
-                # flat_for_reid 每個元素為 (seg_idx, 偵測資訊 dict, crop 像素陣列)
-                # 單一元素範例：
-                #   seg_idx = 0
-                #   d = {
-                #     "timestamp": 1.5, "label": "person", "score": 0.92,
-                #     "box": [120, 80, 200, 320], "frame": 45, "path": "seg_0/yolo_output/object_crops/crop_45_0_person.jpg"
-                #   }
-                #   img = numpy.ndarray shape (240, 80, 3), dtype uint8，BGR 像素矩陣（即那張 crop 的影像資料）
+
+                # 準備傳遞給 ReID 的資料包 (段索引, 偵測字典, 像素陣列)
                 for d, img in zip(temp_detections, crops_imgs):
                     flat_for_reid.append((seg_idx, d, img))
-            del batch_frames, batch_predict_res
+
+            del batch_frames
+            del chunk
+            del batch_predict_res
             _release_gpu_memory()
 
-       
+        # 5. DEBUG 輸出：列印完整的 flat_for_reid 物件內容
+        # 此處已經確保 flat_for_reid 變數存在且已填充資料
+        # print(
+        #     "[API][_infer_segment_yolo_batch_impl][DEBUG][flat_for_reid_content] "
+        #     + str(flat_for_reid),
+        #     flush=True,
+        # )
 
-
-        # 所有 YOLO 偵測到的 crop 一次送入 ReID 做 embedding
+        # 6. 執行 ReID Embedding Batch
         if flat_for_reid and reid_model:
             all_crops = [x[2] for x in flat_for_reid]
+            # 一次將所有裁切圖送入 ReID 提取特徵向量
             embeddings = AnalysisService.generate_reid_embeddings_batch(all_crops, reid_model, reid_device)
+            
             for i, emb in enumerate(embeddings):
-                if i < len(flat_for_reid) and emb:
+                if i < len(flat_for_reid) and emb is not None:
+                    # 將 Embedding 回填至對應的偵測字典中 (透過引用修改)
                     flat_for_reid[i][1]["reid_embedding"] = emb
+            del all_crops
+            del embeddings
+
         _release_gpu_memory()
 
-        # 依 seg_idx 組回每段的回傳格式
-        out = []
+        # 7. 組合最終回傳格式
+        final_output = []
         for seg_idx in range(len(seg_paths)):
             dets = seg_detections[seg_idx]
-            object_count = {}
+            
+            # 計算該段物件分布
+            obj_summary = {}
             for d in dets:
-                object_count[d["label"]] = object_count.get(d["label"], 0) + 1
-            out.append({
+                lbl = d["label"]
+                obj_summary[lbl] = obj_summary.get(lbl, 0) + 1
+            
+            final_output.append({
                 "total_detections": len(dets),
                 "detections": dets,
-                "crop_paths": dets,
-                "object_count": object_count,
+                "crop_paths": dets, # 與舊版欄位兼容
+                "object_count": obj_summary,
                 "total_frames_processed": frames_per_seg[seg_idx],
             })
-        print(f"--- [YOLO Batch] 完成 {len(seg_paths)} 段，共 {len(flat_frames)} 幀、{len(flat_for_reid)} 個 crop ---")
-        return out
+
+        print(
+            f"--- [YOLO Batch] 完成 {len(seg_paths)} 段分析，處理 {len(flat_frames)} 幀，產生 {len(flat_for_reid)} 個 ReID 特徵 ---",
+            flush=True,
+        )
+        del flat_frames
+        del flat_for_reid
+        del seg_detections
+        del frames_per_seg
+        gc.collect()
+        try:
+            from src.api.video_analysis import _print_ram_diagnosis
+
+            _print_ram_diagnosis("[AFTER_GC_CLEAN] YOLO batch 結束，已 del 大 list 並 gc.collect()")
+        except Exception:
+            pass
+        return final_output
 
     @staticmethod
     def _merge_vlm_and_yolo_result(req, frame_obj: Dict, summary_txt: str, yolo_res: Dict, batch_elapsed_sec: Optional[float] = None) -> Dict:
@@ -861,6 +1215,8 @@ class AnalysisService:
 
         # 單執行緒備案：定義如何處理單一影片片段。它計算該片段在原始影片中的開始/結束時間，並呼叫 analyze_segment。
         def process_one(seg_path, idx):
+            from pathlib import Path
+            print(f"--- [Pipeline] 開始處理片段 {idx + 1}/{len(seg_files)}: {Path(seg_path).name} ---")
             start = idx * (segment_duration - overlap)
             end = min(start + segment_duration, total_duration)
             req = Req(
@@ -878,50 +1234,61 @@ class AnalysisService:
                 yolo_every_sec=yolo_every_sec,
                 yolo_score_thr=yolo_score_thr
             )
-            return AnalysisService.analyze_segment(req)
+            res = AnalysisService.analyze_segment(req)
+            print(f"--- [Pipeline] 片段 {idx + 1}/{len(seg_files)} 完成 (success={res.get('success')}) ---")
+            return res
 
-        if model_type == "qwen_hf" and HAS_QWEN_HF:
-            yolo_labels = yolo_labels or "person,car"
-            vlm_batch_size = qwen_inference_batch_size if qwen_inference_batch_size is not None else QWEN_HF_BATCH_SIZE
-            yolo_frame_batch = yolo_batch_size if yolo_batch_size is not None else 16
+        # 在 run_full_pipeline 內部新增 vllm 判斷
+        if model_type == "vllm_qwen":
+            # vLLM 支援更高的並行，batch_size 可以設大 (例如 64)
+            # 為了讓每個 worker 的 GPU RAM 使用量在請求結束後更接近「未執行前」的基線，
+            # 這裡預設不要用太大的 batch，避免觸發一次性較大的 CUDA/allocator 保留記憶體。
+            vlm_batch_size = qwen_inference_batch_size or 10
+            yolo_frame_batch = yolo_batch_size or 10
 
-            # 將所有影片切成多個 Batch（例如一次處理 10 段），避免一次塞入過多資料導致 GPU OOM。
+            print(
+                f"--- [Pipeline vllm_qwen] 共 {len(seg_files)} 段 | VLM batch={vlm_batch_size} YOLO 幀batch={yolo_frame_batch} "
+                f"| active_threads={threading.active_count()}（單請求內 YOLO 與 VLM 各一條 worker 並行，跨請求會爭奪 GPU_LOCK）---",
+                flush=True,
+            )
+
             for batch_start in range(0, len(seg_files), vlm_batch_size):
                 batch_paths = seg_files[batch_start : batch_start + vlm_batch_size]
                 path_strs = [str(p) for p in batch_paths]
-                batch_size = len(path_strs)
-                print(f"--- [QwenHF] Batch {batch_start//vlm_batch_size + 1}: VLM({batch_size}段) + YOLO(幀batch={yolo_frame_batch}) 並行 ---")
 
-                def run_vlm_batch():
-                    return AnalysisService.infer_segment_qwen_hf_batch(
+                # 定義 VLM 批次任務
+                def run_vlm_vllm_batch():
+                    return AnalysisService.infer_segment_vllm_batch(
                         qwen_model,
                         path_strs,
                         event_detection_prompt,
                         summary_prompt,
-                        target_short=target_short,
                         frames_per_segment=frames_per_segment,
                         sampling_fps=sampling_fps,
-                        max_inference_batch_size=min(batch_size, QWEN_HF_MAX_INFERENCE_BATCH_SIZE),
                     )
 
+                # 定義 YOLO 批次任務
                 def run_yolo_batch():
                     return AnalysisService.infer_segment_yolo_batch(
                         path_strs,
                         labels=yolo_labels,
                         every_sec=yolo_every_sec,
-                        score_thr=yolo_score_thr,
                         yolo_batch_size=yolo_frame_batch,
                     )
 
-                # 這行程式碼讓 VLM 與 YOLO 同時在 GPU 上排隊或併發執行，而不是等一個做完才換另一個，能顯著減少 GPU 的閒置時間。
-                t_batch_start = time.time()
+                # 兩者並行，最大化 GPU 吞吐量
+                # [修正] 在 ThreadPoolExecutor 啟動前記錄時間
+                t_batch_start = time.time() 
                 with ThreadPoolExecutor(max_workers=2) as ex:
-                    future_vlm = ex.submit(run_vlm_batch)
+                    future_vlm = ex.submit(run_vlm_vllm_batch)
                     future_yolo = ex.submit(run_yolo_batch)
                     vlm_list = future_vlm.result()
                     yolo_list = future_yolo.result()
-                batch_elapsed_sec = round(time.time() - t_batch_start, 2)
+                # [修正] 計算該批次總耗時
+                batch_elapsed_sec = round(time.time() - t_batch_start, 2) 
 
+                # 後續合併結果時，batch_elapsed_sec 就不會噴 NameError 了
+                
                 # 合併 VLM 與 YOLO 的結果，並生成最終的結果列表。
                 for i, seg_path in enumerate(batch_paths):
                     idx = batch_start + i
@@ -952,8 +1319,7 @@ class AnalysisService:
             results.sort(key=lambda x: x["segment"])
             return results
 
-        if model_type == "qwen_hf" and not HAS_QWEN_HF:
-            print("--- [AnalysisService] qwen_hf 請求但 Qwen HF 模組未載入，改為單段 ThreadPool 處理（每段會回傳 error）---")
+       
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             futures = {executor.submit(process_one, p, i): i for i, p in enumerate(seg_files)}
             for future in as_completed(futures):
@@ -983,8 +1349,11 @@ class AnalysisService:
         
         norm_events = default_events.copy()
         for k, v in ev.items():
-            if k in norm_events and k != "reason":
-                norm_events[k] = bool(v)
+            if k == "reason":
+                continue
+            # 保留既有白名單鍵，也保留新加入的事件鍵（如 violence、dangerous_items）
+            # 避免前端統計異常時被「正規化」掉。
+            norm_events[k] = bool(v)
         
         norm_events["reason"] = str(ev.get("reason", ""))
         return {"events": norm_events, "persons": frame_obj.get("persons", [])}
@@ -996,7 +1365,7 @@ class AnalysisService:
         流程：讀取影片片段 → 依 every_sec 取樣幀 → YOLO 批次推論 → 裁剪 bbox → 存檔 → ReID 特徵
         YOLO/ReID 非 thread-safe，必須在 _gpu_inference_lock 內執行，避免多 thread 並行導致設備不一致與 CUDA 錯誤。
         """
-        with _gpu_inference_lock:
+        with gpu_inference_lock_traced():
             return AnalysisService._infer_segment_yolo_impl(seg_path, labels, every_sec, score_thr, batch_size)
 
     @staticmethod

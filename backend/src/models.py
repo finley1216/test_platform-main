@@ -44,6 +44,8 @@ class Summary(Base):
     smoking_outside_zone = Column(Boolean, default=False, nullable=True)  # 非管制區吸菸
     crowd_loitering = Column(Boolean, default=False, nullable=True)  # 聚眾逗留
     security_door_tamper = Column(Boolean, default=False, nullable=True)  # 突破安全門
+    violence = Column(Boolean, default=False, nullable=True)  # 暴力行為
+    dangerous_items = Column(Boolean, default=False, nullable=True)  # 危險物品
     event_reason = Column(Text, nullable=True)  # Event detection reason
     # Vector embedding for semantic search (384 dimensions for paraphrase-multilingual-MiniLM-L12-v2)
     embedding = Column(Vector(384), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)

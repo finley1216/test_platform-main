@@ -141,6 +141,8 @@ function App() {
       setQwenModel("gemini-2.5-flash");
     } else if (modelType === "qwen") {
       setQwenModel("qwen2.5vl:latest");
+    } else if (modelType === "vllm_qwen") {
+      setQwenModel("Qwen/Qwen2.5-VL-7B-Instruct-AWQ");
     }
   }, [modelType]);
 
@@ -165,7 +167,7 @@ function App() {
     formData.append("segment_duration", segDur);
     formData.append("overlap", overlap);
 
-    if (modelType === "qwen" || modelType === "gemini" || modelType === "moondream") {
+    if (modelType === "qwen" || modelType === "gemini" || modelType === "moondream" || modelType === "vllm_qwen") {
       formData.append("qwen_model", qwenModel);
       const calculatedFrames = Math.max(1, Math.ceil(samplingFps * segDur));
       formData.append("frames_per_segment", calculatedFrames);
@@ -323,7 +325,7 @@ function App() {
             onOverlapChange={setOverlap}
           />
 
-          {(modelType === "qwen" || modelType === "gemini") && (
+          {(modelType === "qwen" || modelType === "gemini" || modelType === "vllm_qwen") && (
             <DetectionSettings
               samplingFps={samplingFps}
               targetShort={targetShort}

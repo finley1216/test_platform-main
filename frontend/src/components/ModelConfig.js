@@ -62,16 +62,19 @@ const ModelConfig = ({
             }}
           >
             <option value="qwen">Qwen (Multimodal via Ollama)</option>
+            <option value="vllm_qwen">Qwen (vLLM)</option>
             <option value="moondream">Moondream (Local)</option>
             {/* <option value="gemini">Google Gemini (Cloud API)</option> */}
           </select>
         </div>
 
-        {(modelType === "qwen" || modelType === "gemini") && (
+        {(modelType === "qwen" || modelType === "gemini" || modelType === "vllm_qwen") && (
           <div className="form-group">
             <label className="form-label">
               {modelType === "gemini"
                 ? "Gemini Model Version"
+                : modelType === "vllm_qwen"
+                ? "vLLM Model"
                 : "Qwen Model Version"}
             </label>
             <select
@@ -83,6 +86,11 @@ const ModelConfig = ({
                 <>
                   <option value="gemini-2.5-flash">gemini-2.5-flash</option>
                   <option value="gemini-2.5-pro">gemini-2.5-pro</option>
+                </>
+              ) : modelType === "vllm_qwen" ? (
+                <>
+                  <option value="Qwen/Qwen2.5-VL-7B-Instruct-AWQ">Qwen2.5-VL-7B-Instruct-AWQ</option>
+                  <option value="Qwen/Qwen3-VL-8B-Instruct-FP8">Qwen3-VL-8B-Instruct-FP8</option>
                 </>
               ) : (
                 <>

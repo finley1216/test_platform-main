@@ -2122,6 +2122,14 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
                     event_conditions.append(Summary.crowd_loitering == True)
                 elif event_type == "security_door_tamper":
                     event_conditions.append(Summary.security_door_tamper == True)
+                elif event_type == "violence":
+                    event_conditions.append(Summary.violence == True)
+                elif event_type == "dangerous_items":
+                    event_conditions.append(Summary.dangerous_items == True)
+                elif event_type == "violence":
+                    event_conditions.append(Summary.violence == True)
+                elif event_type == "dangerous_items":
+                    event_conditions.append(Summary.dangerous_items == True)
             
             if event_conditions:
                 stmt = stmt.filter(or_(*event_conditions))
@@ -2201,6 +2209,14 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
                 events_true.append("crowd_loitering")
             if result.security_door_tamper:
                 events_true.append("security_door_tamper")
+            if result.violence:
+                events_true.append("violence")
+            if result.dangerous_items:
+                events_true.append("dangerous_items")
+            if result.violence:
+                events_true.append("violence")
+            if result.dangerous_items:
+                events_true.append("dangerous_items")
 
             norm_hits.append({
                 "score": round(score, 4),
@@ -2261,6 +2277,8 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
                     "double_parking_lane_block": ["併排", "停車", "阻塞", "parking", "block"],
                     "smoking_outside_zone": ["吸菸", "抽菸", "smoking"],
                     "security_door_tamper": ["闖入", "突破", "安全門", "tamper", "door"],
+                    "violence": ["暴力", "打架", "攻擊", "衝突", "violence", "fight", "assault"],
+                    "dangerous_items": ["危險物品", "武器", "刀", "槍", "dangerous", "weapon", "knife", "gun"],
                 }
                 # 收集所有需要匹配的關鍵字
                 required_keywords = set()
@@ -2383,6 +2401,8 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
                 "double_parking_lane_block": ["併排", "停車", "阻塞", "parking", "block"],
                 "smoking_outside_zone": ["吸菸", "抽菸", "smoking"],
                 "security_door_tamper": ["闖入", "突破", "安全門", "tamper", "door"],
+                "violence": ["暴力", "打架", "攻擊", "衝突", "violence", "fight", "assault"],
+                "dangerous_items": ["危險物品", "武器", "刀", "槍", "dangerous", "weapon", "knife", "gun"],
             }
             
             # 收集所有需要匹配的關鍵字
@@ -2455,6 +2475,8 @@ async def _rag_search_legacy(request: Request, db: Session = Depends(get_db) if 
                             "person_fallen_unmoving": ["躺", "臥", "不動", "靜止", "趴", "倒", "fall", "lie", "still"],
                             "fire": ["燃燒", "燒", "煙", "火光", "burn", "flame"],
                             "water_flood": ["濕", "水", "積", "淹", "wet", "water"],
+                            "violence": ["打", "毆", "攻擊", "衝突", "fight", "assault", "violence"],
+                            "dangerous_items": ["刀", "槍", "棍", "武器", "knife", "gun", "weapon"],
                         }
                         
                         has_related_keyword = False
@@ -3088,6 +3110,8 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.smoking_outside_zone = bool(events.get("smoking_outside_zone", False))
             existing.crowd_loitering = bool(events.get("crowd_loitering", False))
             existing.security_door_tamper = bool(events.get("security_door_tamper", False))
+            existing.violence = bool(events.get("violence", False))
+            existing.dangerous_items = bool(events.get("dangerous_items", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
             
             # [已移除] events_en, events_zh, events_json 欄位（改用個別布林欄位）
@@ -3195,6 +3219,8 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 smoking_outside_zone=bool(events.get("smoking_outside_zone", False)),
                 crowd_loitering=bool(events.get("crowd_loitering", False)),
                 security_door_tamper=bool(events.get("security_door_tamper", False)),
+                violence=bool(events.get("violence", False)),
+                dangerous_items=bool(events.get("dangerous_items", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
                 embedding=embedding,  # [NEW] 自動生成的 embedding
                 # [NEW] YOLO 結果（整合到 summaries 表）
@@ -3538,6 +3564,10 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         "闖入": "security_door_tamper",
         "突破": "security_door_tamper",
         "安全門": "security_door_tamper",
+        "暴力": "violence",
+        "打架": "violence",
+        "危險物品": "dangerous_items",
+        "武器": "dangerous_items",
         "遮臉": "abnormal_attire_face_cover_at_entry",
         "異常著裝": "abnormal_attire_face_cover_at_entry",
         "倒地": "person_fallen_unmoving",
@@ -3748,6 +3778,10 @@ def _filter_summaries_by_query(
                 event_conditions.append(Summary.crowd_loitering == True)
             elif event_type == "security_door_tamper":
                 event_conditions.append(Summary.security_door_tamper == True)
+            elif event_type == "violence":
+                event_conditions.append(Summary.violence == True)
+            elif event_type == "dangerous_items":
+                event_conditions.append(Summary.dangerous_items == True)
         
         if event_conditions:
             query = query.filter(or_(*event_conditions))

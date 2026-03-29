@@ -43,6 +43,15 @@ class Config:
         # ================== Gemini API Configuration ==================
         self.GEMINI_API_KEY: Optional[str] = os.getenv("GEMINI_API_KEY")
 
+        # ================== vLLM Configuration ==================
+        self.VLLM_BASE: str = os.getenv("VLLM_BASE", "http://127.0.0.1:8440")
+        # Qwen3 專用 vLLM endpoint（若未設定則回退 VLLM_BASE）
+        self.QWEN3_VLLM_BASE: str = os.getenv("QWEN3_VLLM_BASE", "http://host.docker.internal:8441")
+        self.VLLM_API_KEY: Optional[str] = os.getenv("VLLM_API_KEY") or None
+        self.VLLM_REQUEST_TIMEOUT: int = int(os.getenv("VLLM_REQUEST_TIMEOUT", "600"))
+        # vLLM 批次：同時發出的 HTTP 請求數（遠端 vLLM 由 Continuous Batching 消化；設 1 則變成逐筆）
+        self.VLLM_BATCH_MAX_WORKERS: int = int(os.getenv("VLLM_BATCH_MAX_WORKERS", "8"))
+
         # ================== Database Configuration ==================
         # PostgreSQL connection URL
         db_user = os.getenv("POSTGRES_USER", "postgres")
@@ -72,6 +81,8 @@ class Config:
         self.PRELOAD_YOLO_REID: bool = os.getenv("PRELOAD_YOLO_REID", "true").lower() in ("true", "1", "yes")
         # 是否在啟動時預載入 SentenceTransformer（RAG 用）。關閉可省 GPU
         self.PRELOAD_SENTENCE_TRANSFORMER: bool = os.getenv("PRELOAD_SENTENCE_TRANSFORMER", "true").lower() in ("true", "1", "yes")
+        # segment_pipeline 完成後是否刪除 yolo_output/object_crops（預設 false：保留圖檔供以圖搜圖/預覽）
+        self.CLEANUP_YOLO_CROPS: bool = os.getenv("CLEANUP_YOLO_CROPS", "false").lower() in ("true", "1", "yes")
 
         # ================== File Paths ==================
         self.SEGMENT_DIR: Path = Path(os.getenv("SEGMENT_DIR", "./segment"))

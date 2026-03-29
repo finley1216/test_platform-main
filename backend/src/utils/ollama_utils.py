@@ -1,12 +1,111 @@
 # -*- coding: utf-8 -*-
+import copy
 import json
+import os
 import re
 import requests
 from typing import List, Dict, Any, Optional, Tuple
 from src.config import config
 
+
+def _ollama_debug_io_enabled() -> bool:
+    """設 OLLAMA_DEBUG_IO=0 可關閉輸入/輸出除錯（預設開啟）。"""
+    v = os.environ.get("OLLAMA_DEBUG_IO", "1").strip().lower()
+    return v not in ("0", "false", "no", "off")
+
+
+def _summarize_image_b64(b64: Any, index: int) -> Dict[str, Any]:
+    """將 base64 圖片改為可放進 JSON 的預覽（不塞完整編碼）。"""
+    if not isinstance(b64, str):
+        return {"_type": "image_base64", "index": index, "error": f"not a string: {type(b64).__name__}"}
+    blen = len(b64)
+    head = b64[:32] if blen > 32 else b64
+    return {
+        "_type": "image_base64",
+        "index": index,
+        "length": blen,
+        "head_prefix": head + ("…" if blen > 32 else ""),
+    }
+
+
+def _sanitize_messages_for_log(messages: List[Dict]) -> List[Dict[str, Any]]:
+    """複製 messages，將 images 陣列改為預覽物件，其餘保留（含完整 content）。"""
+    out: List[Dict[str, Any]] = []
+    for m in messages:
+        mm = copy.deepcopy(m)
+        if "images" in mm and isinstance(mm.get("images"), list):
+            mm["images"] = [_summarize_image_b64(img, i) for i, img in enumerate(mm["images"])]
+        out.append(mm)
+    return out
+
+
+def _ollama_debug_log_request_json(url: str, payload: Dict[str, Any]) -> None:
+    """印出與實際 POST 相同結構的 JSON（圖片已替換為預覽），格式接近 OpenAI chat 的 body。"""
+    view = {
+        "_note": "Ollama POST /api/chat；結構對齊 OpenAI「model + messages」習慣，images 僅預覽不含完整 base64",
+        "method": "POST",
+        "url": url,
+        "body": {
+            "model": payload.get("model"),
+            "messages": _sanitize_messages_for_log(payload.get("messages") or []),
+            "stream": payload.get("stream"),
+            "options": payload.get("options"),
+        },
+    }
+    print("========== [Ollama] REQUEST (JSON) ==========", flush=True)
+    print(json.dumps(view, ensure_ascii=False, indent=2, default=str), flush=True)
+    print("========== [Ollama] REQUEST 結束 ==========", flush=True)
+
+
+def _openai_style_response_from_ollama(
+    data: Dict[str, Any], returned_text: Optional[str] = None
+) -> Dict[str, Any]:
+    """將 Ollama /api/chat 回應轉成類似 OpenAI chat.completion 的欄位，便於對照文件。"""
+    msg = data.get("message") or {}
+    content = returned_text if returned_text is not None else (msg.get("content") or "")
+    thinking = msg.get("thinking") or ""
+    assistant_msg: Dict[str, Any] = {
+        "role": msg.get("role") or "assistant",
+        "content": content,
+    }
+    if thinking:
+        assistant_msg["thinking"] = thinking
+    return {
+        "id": data.get("id") or "",
+        "object": "chat.completion",
+        "created": data.get("created_at") or data.get("created") or 0,
+        "model": data.get("model") or "",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": data.get("done_reason") or "stop",
+                "message": assistant_msg,
+                "logprobs": None,
+            }
+        ],
+        "usage": {
+            "prompt_tokens": data.get("prompt_eval_count"),
+            "completion_tokens": data.get("eval_count"),
+            "total_tokens": None,
+        },
+    }
+
+
+def _ollama_debug_log_response_json(data: Dict[str, Any], returned_text: Optional[str] = None) -> None:
+    """印出完整 Ollama 原生 JSON，另附 OpenAI 風格對照（欄位可為 null）。
+    returned_text：實際回傳給上層的字串（例如由 thinking 補上），對照區與行為一致。
+    """
+    wrapped = {
+        "_note": "openai_style 為欄位對照；ollama_native 為 Ollama 實際回應（完整）",
+        "openai_style": _openai_style_response_from_ollama(data, returned_text=returned_text),
+        "ollama_native": data,
+    }
+    print("========== [Ollama] RESPONSE (JSON) ==========", flush=True)
+    print(json.dumps(wrapped, ensure_ascii=False, indent=2, default=str), flush=True)
+    print("========== [Ollama] RESPONSE 結束 ==========", flush=True)
+
+
 def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[List[str]] = None, stream: bool = False) -> str:
-    
     # 構建發送給 Ollama API 的 JSON 資料主體。
     payload = {
         "model": model_name,
@@ -34,6 +133,9 @@ def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[Lis
         # 設定 HTTP 請求超時時間，預設為 600 秒（10 分鐘）。
         timeout = getattr(config, "OLLAMA_REQUEST_TIMEOUT", 600)
 
+        if _ollama_debug_io_enabled():
+            _ollama_debug_log_request_json(url, payload)
+
         # 發送 HTTP POST 請求到 Ollama API。
         r = requests.post(url, json=payload, timeout=timeout)
 
@@ -45,11 +147,36 @@ def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[Lis
 
             # 初始化一個空字串，用於累積串流回應的文字。
             full_txt = ""
+            last_j: Dict[str, Any] = {}
             for line in r.iter_lines():
                 if line:
                     j = json.loads(line)
+                    last_j = j
                     full_txt += j.get("message", {}).get("content", "")
-                    if j.get("done"): break
+                    if j.get("done"):
+                        break
+            if _ollama_debug_io_enabled():
+                stream_view = {
+                    "_note": "Ollama stream=true，以下為串流累積後之對照；逐包 NDJSON 未完整列出",
+                    "openai_style": {
+                        "object": "chat.completion",
+                        "model": last_j.get("model") or model_name,
+                        "choices": [
+                            {
+                                "index": 0,
+                                "finish_reason": "stop" if last_j.get("done") else None,
+                                "message": {
+                                    "role": "assistant",
+                                    "content": full_txt,
+                                },
+                            }
+                        ],
+                        "usage": None,
+                    },
+                }
+                print("========== [Ollama] RESPONSE (JSON, stream) ==========", flush=True)
+                print(json.dumps(stream_view, ensure_ascii=False, indent=2, default=str), flush=True)
+                print("========== [Ollama] RESPONSE 結束 ==========", flush=True)
             return full_txt
 
         # 非串流，直接等待模型全部跑完，一次性拿回 JSON 結果並取出文字內容。
@@ -60,19 +187,21 @@ def _ollama_chat(model_name: str, messages: List[Dict], images_b64: Optional[Lis
             thinking = msg.get("thinking", "") or ""
             # qwen3 等模型會把整段輸出放在 thinking，content 為空；改為用 thinking 當作可解析文字
             if not content and thinking:
-                print("--- [Ollama] content 為空，改使用 thinking 作為回應內容以供解析 ---")
+                print("--- [Ollama] content 為空，改使用 thinking 作為回應內容以供解析 ---", flush=True)
                 content = thinking
             # 若內容仍為空，印出完整 API 回應以便除錯
             elif not content and data:
-                print("--- [Ollama] 回應內容為空，完整 API 回應如下 ---")
+                print("--- [Ollama] 回應內容為空，完整 API 回應如下 ---", flush=True)
                 try:
-                    print(json.dumps(data, ensure_ascii=False, indent=2))
+                    print(json.dumps(data, ensure_ascii=False, indent=2), flush=True)
                 except Exception:
-                    print(data)
-                print("--- [Ollama] 以上為空回應時的完整 body ---")
+                    print(data, flush=True)
+                print("--- [Ollama] 以上為空回應時的完整 body ---", flush=True)
+            if _ollama_debug_io_enabled():
+                _ollama_debug_log_response_json(data, returned_text=content)
             return content
     except Exception as e:
-        print(f"--- [Ollama] ✗ 請求失敗: {e} ---")
+        print(f"--- [Ollama] ✗ 請求失敗: {e} ---", flush=True)
         raise
 
 def _safe_parse_json(text: str) -> Optional[Dict]:
