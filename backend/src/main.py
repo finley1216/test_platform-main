@@ -56,11 +56,13 @@ except ImportError:
 # ================== 環境變數 ==================
 
 try:
-    from prompts import EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
+    from prompts import get_event_detection_prompt, get_summary_prompt
 except Exception:
-    # 預設值已更新為符合您的新需求
-    EVENT_DETECTION_PROMPT = "請根據提供的影格輸出事件 JSON。"
-    SUMMARY_PROMPT = "請觀察畫面中的人車流動與任何異常狀況，並將其彙整為一句約 50-100 字的繁體中文描述。"
+    def get_event_detection_prompt():
+        return "請根據提供的影格輸出事件 JSON。"
+
+    def get_summary_prompt():
+        return "請觀察畫面中的人車流動與任何異常狀況，並將其彙整為一句約 50-100 字的繁體中文描述。"
 
 # Use configuration from config.py
 ADMIN_TOKEN = config.ADMIN_TOKEN
@@ -1134,11 +1136,16 @@ def _segment_pipeline_multipart_legacy(
     owl_labels: str = Form("person,pedestrian,motorcycle,car,bus,scooter,truck"),
     owl_every_sec: float = Form(2.0),
     owl_score_thr: float = Form(0.15),
-    event_detection_prompt: str = Form(EVENT_DETECTION_PROMPT),
-    summary_prompt: str = Form(SUMMARY_PROMPT),
+    event_detection_prompt: str = Form(""),
+    summary_prompt: str = Form(""),
     save_json: bool = Form(True),
     save_basename: str = Form(None),
 ):
+
+        if not event_detection_prompt or not str(event_detection_prompt).strip():
+            event_detection_prompt = get_event_detection_prompt()
+        if not summary_prompt or not str(summary_prompt).strip():
+            summary_prompt = get_summary_prompt()
 
         target_filename = "unknown_video"
 
@@ -1349,31 +1356,10 @@ def _segment_pipeline_multipart_legacy(
 # Prompt API 已移至 src.api.prompts
 # 保留函數定義以向後兼容（如果需要）
 def _get_default_prompts_legacy():
-    """回傳後端設定的預設 Prompts（動態讀取文件，無需重啟服務）"""
-    # 動態讀取 prompt 文件，而不是使用啟動時緩存的變數
-    prompts_dir = Path(__file__).parent.parent / "prompts"
-    
-    def _read_prompt_file(filename: str) -> str:
-        """讀取 prompt 文件"""
-        file_path = prompts_dir / filename
-        try:
-            if file_path.exists():
-                content = file_path.read_text(encoding="utf-8")
-                # 清理：去掉 BOM 與首尾空白
-                if content and content[0] == "\ufeff":
-                    content = content[1:]
-                return content.strip()
-            else:
-                # 如果文件不存在，回退到緩存的變數
-                return EVENT_DETECTION_PROMPT if filename == "frame_prompt.md" else SUMMARY_PROMPT
-        except Exception as e:
-            # 讀取失敗時回退到緩存的變數
-            print(f"[警告] 無法讀取 {filename}：{e}，使用緩存值")
-            return EVENT_DETECTION_PROMPT if filename == "frame_prompt.md" else SUMMARY_PROMPT
-    
+    """回傳後端設定的預設 Prompts（與 prompts 套件相同：每次讀檔）"""
     return {
-        "event_prompt": _read_prompt_file("frame_prompt.md"),
-        "summary_prompt": _read_prompt_file("summary_prompt.md")
+        "event_prompt": get_event_detection_prompt(),
+        "summary_prompt": get_summary_prompt(),
     }
 
 # ================== RAG 路由 ==================

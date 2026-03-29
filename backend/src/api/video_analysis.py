@@ -38,8 +38,18 @@ def get_active_requests():
 # 延遲導入以解決循環引用
 def _get_db_and_models():
     from src.database import get_db
-    from src.main import get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
-    return get_db, get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, EVENT_DETECTION_PROMPT, SUMMARY_PROMPT
+    from src.main import get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest
+    from prompts import get_event_detection_prompt, get_summary_prompt
+
+    return (
+        get_db,
+        get_api_key,
+        _save_results_to_postgres,
+        HAS_DB,
+        SegmentAnalysisRequest,
+        get_event_detection_prompt,
+        get_summary_prompt,
+    )
 
 router = APIRouter(tags=["影片分析"])
 
@@ -95,7 +105,7 @@ def analyze_single_segment(
     依 video_id 與時間區間切出單一段落，做 YOLO + Qwen 推論後直接回傳 JSON。
     不寫入資料庫，供前端播放同步即時顯示用。
     """
-    get_db, get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, DEF_EVENT_PROMPT, DEF_SUMMARY_PROMPT = _get_db_and_models()
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, SegmentAnalysisRequest, get_event_prompt, get_summary_prompt = _get_db_and_models()
     video_id = (body.video_id or "").strip()
     start_time = float(body.start_time)
     duration = float(body.duration)
@@ -146,8 +156,8 @@ def analyze_single_segment(
             qwen_model="qwen2.5vl:latest",
             frames_per_segment=8,
             target_short=720,
-            event_detection_prompt=DEF_EVENT_PROMPT,
-            summary_prompt=DEF_SUMMARY_PROMPT,
+            event_detection_prompt=get_event_prompt(),
+            summary_prompt=get_summary_prompt(),
             yolo_labels="person,car",
             yolo_every_sec=2.0,
             yolo_score_thr=0.25,
@@ -211,13 +221,13 @@ def segment_pipeline_multipart(
     if strict_segmentation:
         logger.warning("--- [Diagnostics] Performing Re-encoding (CPU Intensive) ---")
 
-    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, DEF_EVENT_PROMPT, DEF_SUMMARY_PROMPT = _get_db_and_models()
-    
-    # 如果 prompt 為空，則使用預設值
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
+
+    # 若前端未送或送空字串，則每次請求從 prompts/*.md 重新讀取（無需重啟 worker）
     if not event_detection_prompt or not event_detection_prompt.strip():
-        event_detection_prompt = DEF_EVENT_PROMPT
+        event_detection_prompt = get_event_prompt()
     if not summary_prompt or not summary_prompt.strip():
-        summary_prompt = DEF_SUMMARY_PROMPT
+        summary_prompt = get_summary_prompt()
 
     _print_ram_diagnosis(f"[START] req_id={req_id} segment_pipeline_multipart（讀取影片前）")
 
@@ -425,11 +435,11 @@ def segment_pipeline_batch(
         raise HTTPException(status_code=422, detail=f"最多上傳 {MAX_BATCH} 個檔案")
 
     # 取得資料庫連線與 API 金鑰，以及預設的 event_detection_prompt 和 summary_prompt。
-    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, DEF_EVENT_PROMPT, DEF_SUMMARY_PROMPT = _get_db_and_models()
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
     if not event_detection_prompt or not event_detection_prompt.strip():
-        event_detection_prompt = DEF_EVENT_PROMPT
+        event_detection_prompt = get_event_prompt()
     if not summary_prompt or not summary_prompt.strip():
-        summary_prompt = DEF_SUMMARY_PROMPT
+        summary_prompt = get_summary_prompt()
 
     temp_dir = None
     seg_files: List[Path] = []
@@ -578,11 +588,11 @@ def segment_pipeline_rtsp(
 
     logger.info(f"--- [Pipeline RTSP] Model: {model_type}, Qwen: {qwen_model}, Strict: {strict_segmentation} ---")
 
-    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, DEF_EVENT_PROMPT, DEF_SUMMARY_PROMPT = _get_db_and_models()
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
     if not event_detection_prompt or not event_detection_prompt.strip():
-        event_detection_prompt = DEF_EVENT_PROMPT
+        event_detection_prompt = get_event_prompt()
     if not summary_prompt or not summary_prompt.strip():
-        summary_prompt = DEF_SUMMARY_PROMPT
+        summary_prompt = get_summary_prompt()
 
     local_path = None
     cleanup = False

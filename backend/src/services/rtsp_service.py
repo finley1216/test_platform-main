@@ -10,9 +10,9 @@ from src.services.analysis_service import AnalysisService
 from src.main import (
     _save_results_to_postgres,
     SegmentAnalysisRequest,
-    EVENT_DETECTION_PROMPT,
     analyze_segment_and_optionally_save,
 )
+from prompts import get_event_detection_prompt
 from src.database import SessionLocal
 
 class RTSPStreamManager:
@@ -505,7 +505,7 @@ class RTSPStreamManager:
             "qwen_model": "qwen2.5vl:latest",
             "frames_per_segment": 8,
             "target_short": 720,
-            "event_detection_prompt": EVENT_DETECTION_PROMPT,
+            "event_detection_prompt": get_event_detection_prompt(),
             "summary_prompt": "",
             "yolo_labels": "person,car",
             "yolo_every_sec": 2.0,
