@@ -216,6 +216,54 @@ body {
   margin-bottom: 6px;
 }
 
+.model-config-card-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px 16px;
+}
+
+.model-config-card-header .card-title {
+  margin-bottom: 0;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+
+.vlm-header-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  flex-shrink: 0;
+  font-size: 13px;
+  font-weight: 600;
+  user-select: none;
+}
+
+.vlm-header-status-label--ok {
+  color: #15803d;
+}
+
+.vlm-header-status-label--warn {
+  color: #b45309;
+}
+
+.vlm-header-status-label--error {
+  color: #b91c1c;
+}
+
+.vlm-header-status-led {
+  width: 10px;
+  height: 10px;
+  border-radius: 50%;
+  flex-shrink: 0;
+  box-shadow: 0 0 0 2px rgba(0, 0, 0, 0.06);
+}
+
+.vlm-header-status-led--pulse {
+  animation: pulse 2s ease-in-out infinite;
+}
+
 .card-title-icon {
   font-size: 18px;
 }

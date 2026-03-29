@@ -134,6 +134,22 @@ class ApiService {
     }
   }
 
+  async getVlmStatus(apiKey) {
+    try {
+      return await this.request("/v1/system/vlm", { method: "GET", apiKey });
+    } catch (e) {
+      return null;
+    }
+  }
+
+  async selectVlmProfile(apiKey, profileId) {
+    return await this.request("/v1/system/vlm/select", {
+      method: "POST",
+      body: { profile_id: profileId },
+      apiKey,
+    });
+  }
+
   // 使用 XMLHttpRequest 以支援上傳進度追蹤 (Point 6)
   // 本地影片分析可能需數分鐘，設定長逾時避免 proxy/XHR 提前中斷
   async runAnalysis(formData, apiKey, onUploadProgress) {

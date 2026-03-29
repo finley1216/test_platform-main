@@ -39,6 +39,22 @@ services:
       -rtsp_transport tcp
       rtsp://rtsp-server:8554/simulator
 
+  # ---------------------------------------------------------------------------
+  # 推論服務埠一覽（給 backend 連線用；與「主機對外映射埠」不一定相同）
+  #
+  # | 服務        | 容器內 / 監聽        | backend 內建 URL（見下方 environment） |
+  # |-------------|----------------------|----------------------------------------|
+  # | ollama      | 11434（bridge）      | OLLAMA_BASE=http://ollama:11434        |
+  # | vllm        | 8440（bridge）       | VLLM_BASE=http://vllm:8440             |
+  # | vllm-qwen3  | host 網路，預設 8441 | QWEN3_VLLM_BASE=http://host.docker.internal:8441 |
+  #
+  # vllm-qwen3 使用 network_mode: host，不在 app-network，故後端無法用服務名 vllm-qwen3
+  # 連線，必須經主機埠（預設 8441）＋ extra_hosts: host.docker.internal。
+  #
+  # 前端僅透過 API 寫入偏好並探測就緒；不會自動 docker compose up/down，除非
+  # VLM_ORCHESTRATION_ENABLED=true 且掛載 docker.sock（見 backend 註解）。
+  # ---------------------------------------------------------------------------
+
   # Ollama Service
   ollama:
     image: ollama/ollama:latest
@@ -63,7 +79,7 @@ services:
               count: all
               capabilities: [gpu]
 
-  # vLLM（服務名 vllm，容器內 8440）— 下方 VLLM_MAX_MODEL_LEN（預設 56000）「只影響這個服務」。
+  # vLLM（服務名 vllm，容器內 8440）— VLLM_MAX_MODEL_LEN 預設 16384（.env 可覆寫，如 56000）。
   # Qwen3 走 vllm-qwen3 / 主機 8441 時，請看該服務的 QWEN3_MAX_MODEL_LEN；後端 QWEN3_VLLM_BASE 預設指 host:8441。
   vllm:
     image: vllm/vllm-openai:latest
@@ -72,7 +88,7 @@ services:
       - VLLM_MODEL=${VLLM_MODEL:-Qwen/Qwen2.5-VL-7B-Instruct-AWQ}
       - VLLM_HOST=0.0.0.0
       - VLLM_PORT=8440
-      - VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
+      - VLLM_GPU_MEMORY_UTILIZATION=${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
       - VLLM_MAX_MODEL_LEN=${VLLM_MAX_MODEL_LEN:-16384}
       - VLLM_API_KEY=${VLLM_API_KEY:-}
       - HF_HOME=/root/.cache/huggingface
@@ -102,7 +118,7 @@ services:
       --trust-remote-code
       --dtype half
       --quantization awq
-      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.8}
+      --gpu-memory-utilization ${VLLM_GPU_MEMORY_UTILIZATION:-0.7}
       --max-model-len ${VLLM_MAX_MODEL_LEN:-16384}
       --api-key ${VLLM_API_KEY:-}
 
@@ -189,6 +205,11 @@ services:
       dockerfile: Dockerfile
       network: host
     restart: unless-stopped
+    # VLM 編排：rootless 須掛 DOCKER_SOCK_HOST=/run/user/<uid>/docker.sock。
+    # 勿設 user:/group_add: 主機 uid/gid（易 setgroups invalid argument）；改 privileged + 正確 socket，行程維持預設 root。
+    privileged: true
+    security_opt:
+      - label:disable
     shm_size: "2gb"  # 電腦視覺/多 worker 需較大 shared memory
     deploy:
       resources:
@@ -200,6 +221,8 @@ services:
               count: all
               capabilities: [gpu]
     environment:
+      # 明確指定 daemon socket（掛載目標固定為容器內 /var/run/docker.sock）
+      - DOCKER_HOST=unix:///var/run/docker.sock
       - PROJECT_ROOT=${PROJECT_ROOT}
       - HOST=${HOST}
       - PORT=8080
@@ -222,12 +245,28 @@ services:
       - OLLAMA_LLM_MODEL=qwen2.5vl:latest
       - OLLAMA_BASE=http://ollama:11434
       - OLLAMA_REQUEST_TIMEOUT=600
+      # 與服務 vllm 容器埠一致（bridge 內 8440）；勿與 Qwen3 的 8441 混淆
       - VLLM_BASE=${VLLM_BASE:-http://vllm:8440}
-      # 模型名含 qwen3 時會打這個 URL（預設主機 8441＝vllm-qwen3）；要改打容器內 vllm:8440 請覆寫此變數
+      # Qwen3 服務為 host network，請對主機埠（預設 8441），勿填 http://vllm-qwen3:8441
       - QWEN3_VLLM_BASE=${QWEN3_VLLM_BASE:-http://host.docker.internal:8441}
       # 遠端 vLLM 批次同時 HTTP 連線數（預設 8）；設 1 則逐筆送，易拖慢 pipeline
       - VLLM_BATCH_MAX_WORKERS=${VLLM_BATCH_MAX_WORKERS:-8}
       - VLLM_API_KEY=${VLLM_API_KEY:-}
+      # --- VLM 自動編排（釋放 VRAM：例如切到 Qwen2.5 時 stop vllm-qwen3 再 up vllm）---
+      # .env 須設 VLM_COMPOSE_PROJECT_NAME=與主機 compose 專案名相同（例 test_platform-main），否則 stop 會找不到容器。
+      # 預設 false。要啟用請在 .env 設 VLM_ORCHESTRATION_ENABLED=true，並取消註解下方 docker.sock + vlm-compose-host，
+      # 再設 VLM_COMPOSE_FILE=/vlm-compose-host/docker-compose.yml 與 VLM_COMPOSE_PROJECT_DIR=/vlm-compose-host，重建 backend。
+      # 風險：backend 可對主機執行 docker compose（等同高權限），僅限信任環境。
+      # VLM 自動編排：backend 容器內路徑須指向「可讀」的 compose 檔（勿用宿主機絕對路徑，除非有 bind mount）。
+      # 例：於下方 volumes 取消註解 .:/vlm-compose-host:ro 後，設
+      #   VLM_COMPOSE_FILE=/vlm-compose-host/docker-compose.yml
+      #   VLM_COMPOSE_PROJECT_DIR=/vlm-compose-host
+      - VLM_ORCHESTRATION_ENABLED=${VLM_ORCHESTRATION_ENABLED:-false}
+      - VLM_COMPOSE_FILE=${VLM_COMPOSE_FILE:-}
+      - VLM_COMPOSE_PROJECT_DIR=${VLM_COMPOSE_PROJECT_DIR:-}
+      - VLM_COMPOSE_PROJECT_NAME=${VLM_COMPOSE_PROJECT_NAME:-}
+      # vLLM profile 時是否一併 docker stop ollama（單卡釋放 VRAM；RAG「回答」若依賴 Ollama LLM 請設 false）
+      - VLM_ORCHESTRATION_STOP_OLLAMA_ON_VLLM=${VLM_ORCHESTRATION_STOP_OLLAMA_ON_VLLM:-false}
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
       - POSTGRES_USER=postgres
@@ -238,8 +277,7 @@ services:
       - MOONDREAM_MODELS_DIR=/app/models
       # 離線或無法下載時：先在本機執行 mkdir -p yolo_weights && wget -O yolo_weights/yolov8s-world.pt https://github.com/ultralytics/assets/releases/download/v8.4.0/yolov8s-world.pt
       - YOLO_WEIGHTS_PATH=/app/yolo_weights/yolov8s-world.pt
-      # Moondream 等 trust_remote_code 會寫入 cache；若主機 cache 唯讀，改寫到容器內可寫路徑
-      # 與下方 volume 對應，讓本機已下載的 Qwen 被容器使用
+      # Moondream 等 trust_remote_code 會寫入 cache；與下方 volume 對應
       - HF_HOME=/root/.cache/huggingface
       - TRANSFORMERS_CACHE=/root/.cache/huggingface
       # 容器無外網：huggingface_hub 與 transformers 皆不連線
@@ -258,13 +296,15 @@ services:
       - ./backend/rag_store:/app/rag_store
       - ./backend/prompts:/app/prompts
       - ../video:/app/video:ro
-      # 本機 HF cache：用與 download 腳本相同使用者的 $HOME，或於 .env 設 HF_CACHE_HOST=/mnt/10THDD/M133040024/.cache/huggingface
+      # VLM 自動編排：主機 socket 路徑可用 .env 的 DOCKER_SOCK_HOST（rootless 時常非 /var/run/docker.sock）
+      - ${DOCKER_SOCK_HOST:-/var/run/docker.sock}:/var/run/docker.sock
+      - .:/vlm-compose-host:ro
+      # 本機 HF cache：與 .env 的 HF_CACHE_HOST 對應（離線權重）
       - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
     extra_hosts:
       - "host.docker.internal:host-gateway"
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
+    # 勿在此設定 dns: 8.8.8.8 — 會覆寫 Docker 內建 DNS，導致無法解析同網路服務名（vllm、postgres）。
+    # 需要對外 DNS 時請改在 docker daemon 設定，或維持不寫 dns（使用預設，內建 127.0.0.11 可解析服務名）。
     # ports:
     #   - "8080:8080"  # 移除對外暴露，改由 nginx 反向代理
     networks:
@@ -338,14 +378,15 @@ services:
     environment:
       # 不設置 REACT_APP_API_BASE，讓前端根據 hostname 自動選擇
       # - REACT_APP_API_BASE=http://localhost:8080  # 已移除，改為自動檢測
+      # 必須綁 0.0.0.0，否則 webpack dev server 只聽 127.0.0.1，nginx 反代 frontend:3000 會 502
+      - HOST=0.0.0.0
+      # 經 nginx 以不同 Host 存取 dev server 時避免 Invalid Host header
+      - DANGEROUSLY_DISABLE_HOST_CHECK=true
       - WDS_SOCKET_HOST=localhost
       - WDS_SOCKET_PORT=3000
     volumes:
       - ./frontend:/app:delegated
       # - node_modules_data:/app/node_modules
-    dns:
-      - 8.8.8.8
-      - 8.8.4.4
     # ports:
     #   - "3000:3000"  # 移除對外暴露，改由 nginx 反向代理
     networks:

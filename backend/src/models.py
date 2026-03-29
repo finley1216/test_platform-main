@@ -47,6 +47,8 @@ class Summary(Base):
     violence = Column(Boolean, default=False, nullable=True)  # 暴力行為
     dangerous_items = Column(Boolean, default=False, nullable=True)  # 危險物品
     event_reason = Column(Text, nullable=True)  # Event detection reason
+    # 動態偵測項目（前端新增、無對應固定欄位者）之布林，JSON 字串如 {"stay": true}
+    events_extra = Column(Text, nullable=True)
     # Vector embedding for semantic search (384 dimensions for paraphrase-multilingual-MiniLM-L12-v2)
     embedding = Column(Vector(384), nullable=True) if HAS_PGVECTOR else Column(Text, nullable=True)
     

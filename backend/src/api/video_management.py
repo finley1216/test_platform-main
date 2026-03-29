@@ -47,6 +47,34 @@ def _save_video_events(events: Dict[str, Dict[str, Any]]):
         json.dump(events, f, ensure_ascii=False, indent=2)
 
 
+def _frame_events_from_summary(s: "Summary") -> Dict[str, Any]:
+    """從 DB 列組裝 frame_analysis.events（固定欄位 + events_extra 動態鍵如 stay）。"""
+    events = {
+        "water_flood": bool(s.water_flood),
+        "fire": bool(s.fire),
+        "abnormal_attire_face_cover_at_entry": bool(s.abnormal_attire_face_cover_at_entry),
+        "person_fallen_unmoving": bool(s.person_fallen_unmoving),
+        "double_parking_lane_block": bool(s.double_parking_lane_block),
+        "smoking_outside_zone": bool(s.smoking_outside_zone),
+        "crowd_loitering": bool(s.crowd_loitering),
+        "security_door_tamper": bool(s.security_door_tamper),
+        "violence": bool(getattr(s, "violence", False)),
+        "dangerous_items": bool(getattr(s, "dangerous_items", False)),
+        "reason": (s.event_reason or "") if getattr(s, "event_reason", None) else "",
+    }
+    raw = getattr(s, "events_extra", None)
+    if raw:
+        try:
+            extra = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(extra, dict):
+                for k, v in extra.items():
+                    if k != "reason":
+                        events[k] = bool(v)
+        except Exception:
+            pass
+    return events
+
+
 def _fetch_summary_results_for_videos(video_ids: List[str]) -> List[Dict[str, Any]]:
     """從 DB 依 video 欄位查詢 Summary，回傳與 get_video_info 一致的 results 格式。"""
     if not HAS_DB or not video_ids:
@@ -66,16 +94,7 @@ def _fetch_summary_results_for_videos(video_ids: List[str]) -> List[Dict[str, An
                 "parsed": {
                     "summary_independent": s.message,
                     "frame_analysis": {
-                        "events": {
-                            "fire": s.fire,
-                            "water_flood": s.water_flood,
-                            "person_fallen": s.person_fallen_unmoving,
-                            "double_parking": s.double_parking_lane_block,
-                            "smoking": s.smoking_outside_zone,
-                            "crowd": s.crowd_loitering,
-                            "security_door": s.security_door_tamper,
-                            "abnormal_attire": s.abnormal_attire_face_cover_at_entry,
-                        }
+                        "events": _frame_events_from_summary(s),
                     }
                 }
             }
@@ -572,16 +591,7 @@ def get_video_info(video_id: str):
                         "parsed": {
                             "summary_independent": s.message,
                             "frame_analysis": {
-                                "events": {
-                                    "fire": s.fire,
-                                    "water_flood": s.water_flood,
-                                    "person_fallen": s.person_fallen_unmoving,
-                                    "double_parking": s.double_parking_lane_block,
-                                    "smoking": s.smoking_outside_zone,
-                                    "crowd": s.crowd_loitering,
-                                    "security_door": s.security_door_tamper,
-                                    "abnormal_attire": s.abnormal_attire_face_cover_at_entry
-                                }
+                                "events": _frame_events_from_summary(s),
                             }
                         }
                     })

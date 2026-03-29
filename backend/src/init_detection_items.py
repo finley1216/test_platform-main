@@ -5,9 +5,16 @@
 根據原有的 frame_prompt.md 創建預設的偵測項目
 """
 
+import os
+import sys
+
+_backend_root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _backend_root not in sys.path:
+    sys.path.insert(0, _backend_root)
+
 from sqlalchemy.orm import Session
-from database import SessionLocal, engine
-from models import Base, DetectionItem
+from src.database import SessionLocal, engine
+from src.models import Base, DetectionItem
 from datetime import datetime
 
 # 預設的偵測項目（從原有的 frame_prompt.md 提取）
@@ -68,7 +75,38 @@ DEFAULT_DETECTION_ITEMS = [
         "description": "反覆拉門把/推門縫/對鎖孔操作或操作「安全門/禁止進入」之門",
         "is_enabled": True,
     },
+    {
+        "name": "violence",
+        "name_en": "violence",
+        "name_zh": "暴力行為",
+        "description": "企圖攻擊他人或造成物理性衝突、持械威脅等",
+        "is_enabled": True,
+    },
+    {
+        "name": "dangerous_items",
+        "name_en": "dangerous_items",
+        "name_zh": "危險物品",
+        "description": "可辨識之刀械、槍械、爆裂物等危險物品",
+        "is_enabled": True,
+    },
 ]
+
+
+def sync_missing_detection_items(db: Session) -> int:
+    """
+    補齊預設偵測項目中尚未存在於資料庫的列（不刪除、不覆寫既有資料）。
+    供 migrate_database 與部署腳本呼叫，避免 _create_alert_if_needed 出現「找不到偵測項目」。
+    回傳本次新增的筆數。
+    """
+    added = 0
+    for item_data in DEFAULT_DETECTION_ITEMS:
+        exists = db.query(DetectionItem).filter(DetectionItem.name == item_data["name"]).first()
+        if not exists:
+            db.add(DetectionItem(**item_data))
+            added += 1
+    if added:
+        db.commit()
+    return added
 
 
 def init_detection_items(db: Session):

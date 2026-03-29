@@ -2,9 +2,70 @@ import React, { useState, useEffect } from "react";
 import apiService from "../services/api";
 import VideoSelector from "./VideoSelector";
 
+/** 標題列右側：狀態燈 + 單行文字（高對比）；詳情與自動編排說明用 title 提示 */
+function VlmHeaderStatus({ vlmStatus, vlmUiLocked }) {
+  const sw = vlmStatus.switch;
+  const ready = vlmStatus.readiness?.ready;
+  const orch = vlmStatus.orchestration;
+
+  let led = "#64748b";
+  let label = "連線中";
+  let pulse = true;
+  let labelClass = "vlm-header-status-label vlm-header-status-label--warn";
+  if (sw?.phase === "error") {
+    led = "#dc2626";
+    label = "錯誤";
+    pulse = false;
+    labelClass = "vlm-header-status-label vlm-header-status-label--error";
+  } else if (vlmUiLocked || sw?.phase === "loading") {
+    led = "#d97706";
+    label = "載入中";
+    pulse = true;
+    labelClass = "vlm-header-status-label vlm-header-status-label--warn";
+  } else if (ready) {
+    led = "#16a34a";
+    label = "就緒";
+    pulse = false;
+    labelClass = "vlm-header-status-label vlm-header-status-label--ok";
+  }
+
+  const errDetail =
+    sw?.phase === "error" ? sw?.message || sw?.last_error || "後端錯誤" : "";
+  const orchHint =
+    orch?.enabled === true
+      ? "已啟用自動編排：切換模型時會對主機執行 docker compose（停舊 vLLM/Ollama、啟動所選後端）。"
+      : orch && orch.enabled === false
+      ? "未啟用自動編排：僅儲存偏好，請在主機手動 docker compose stop/up。"
+      : "";
+  const extra =
+    !ready && sw?.phase !== "error" && !(vlmUiLocked || sw?.phase === "loading")
+      ? vlmStatus.readiness?.detail || ""
+      : "";
+  const titleParts = [errDetail, extra, orchHint].filter(Boolean);
+  const title = titleParts.length ? titleParts.join("\n\n") : undefined;
+
+  return (
+    <div
+      className="vlm-header-status"
+      title={title}
+      role="status"
+      aria-live="polite"
+    >
+      <span
+        aria-hidden
+        className={`vlm-header-status-led${pulse ? " vlm-header-status-led--pulse" : ""}`}
+        style={{ background: led }}
+      />
+      <span className={labelClass}>{label}</span>
+    </div>
+  );
+}
+
 const ModelConfig = ({
   modelType,
   qwenModel,
+  vlmStatus,
+  vlmUiLocked = false,
   source,
   videoUrl,
   videoFile,
@@ -43,11 +104,14 @@ const ModelConfig = ({
   };
   return (
     <div className="card">
-      <div className="card-header">
+      <div className="card-header model-config-card-header">
         <div className="card-title">
           <span>⚙️</span>
           <span>Model & Source Configuration</span>
         </div>
+        {(modelType === "qwen" || modelType === "vllm_qwen") && vlmStatus && (
+          <VlmHeaderStatus vlmStatus={vlmStatus} vlmUiLocked={vlmUiLocked} />
+        )}
       </div>
       <div className="form-grid">
         <div className="form-group">
@@ -55,11 +119,8 @@ const ModelConfig = ({
           <select
             className="form-select"
             value={modelType}
-            onChange={(e) => {
-              const v = e.target.value;
-              onModelTypeChange(v);
-              if (v === "moondream") onQwenModelChange("moondream3-preview");
-            }}
+            disabled={vlmUiLocked}
+            onChange={(e) => onModelTypeChange(e.target.value)}
           >
             <option value="qwen">Qwen (Multimodal via Ollama)</option>
             <option value="vllm_qwen">Qwen (vLLM)</option>
@@ -80,6 +141,7 @@ const ModelConfig = ({
             <select
               className="form-select"
               value={qwenModel}
+              disabled={vlmUiLocked}
               onChange={(e) => onQwenModelChange(e.target.value)}
             >
               {modelType === "gemini" ? (
@@ -108,6 +170,7 @@ const ModelConfig = ({
             <select
               className="form-select"
               value={qwenModel}
+              disabled={vlmUiLocked}
               onChange={(e) => onQwenModelChange(e.target.value)}
             >
               <option value="moondream3-preview">moondream3-preview</option>

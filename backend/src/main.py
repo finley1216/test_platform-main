@@ -245,6 +245,24 @@ async def startup_event():
     """應用啟動時預載入模型，避免首次請求時延遲（在背景執行，不阻塞啟動）"""
     import asyncio
     import threading
+
+    # 補齊 detection_items（violence / dangerous_items 等），避免警報流程查不到項目
+    if HAS_DB:
+        try:
+            from src.database import SessionLocal
+            from src.init_detection_items import sync_missing_detection_items
+
+            _db = SessionLocal()
+            try:
+                _n = sync_missing_detection_items(_db)
+                if _n:
+                    print(
+                        f"--- [啟動] 已補齊 {_n} 筆 detection_items（含 violence / dangerous_items 等）---"
+                    )
+            finally:
+                _db.close()
+        except Exception as _e:
+            print(f"--- [啟動] detection_items 同步略過: {_e} ---")
     
     def preload_models_sync():
         """在背景線程中預載入模型（同步執行，避免阻塞）"""
@@ -2896,6 +2914,37 @@ async def _rag_answer_legacy(request: Request, db: Session = Depends(get_db) if 
 
 # ================== PostgreSQL 保存與過濾 ==================
 
+# 與 Summary 固定布林欄位對應的 event 鍵；其餘（如前端新增的 stay）寫入 events_extra JSON
+SUMMARY_FIXED_EVENT_KEYS = frozenset({
+    "water_flood",
+    "fire",
+    "abnormal_attire_face_cover_at_entry",
+    "person_fallen_unmoving",
+    "double_parking_lane_block",
+    "smoking_outside_zone",
+    "crowd_loitering",
+    "security_door_tamper",
+    "violence",
+    "dangerous_items",
+})
+
+
+def _events_extra_json_from_events(events: Dict[str, Any]) -> Optional[str]:
+    """自 VLM events 抽出非固定欄位，序列化為 JSON 存 summaries.events_extra。"""
+    if not isinstance(events, dict):
+        return None
+    extra = {}
+    for k, v in events.items():
+        if k == "reason":
+            continue
+        if k in SUMMARY_FIXED_EVENT_KEYS:
+            continue
+        extra[k] = bool(v)
+    if not extra:
+        return None
+    return json.dumps(extra, ensure_ascii=False)
+
+
 def _parse_time_range(time_range_str: str) -> Tuple[Optional[datetime], Optional[datetime]]:
     """
     解析時間範圍字串，例如 "00:00:00 - 00:00:08"
@@ -2961,17 +3010,23 @@ def _create_alert_if_needed(db: Session, summary_id: int, events: Dict[str, Any]
     for event_name in detected_events:
         item = item_dict.get(event_name)
         if not item:
-            print(f"  ⚠️  找不到偵測項目: {event_name}")
-            continue
-        
-        # 建立警報標題
-        title = f"偵測到{item.name_zh}"
+            print(
+                f"  ⚠️  找不到偵測項目: {event_name}（請執行 migrate_database 補齊 detection_items，"
+                "或於前端「偵測項目管理」新增同名項目）— 仍建立警報"
+            )
+            title = f"偵測到事件：{event_name}"
+        else:
+            # 建立警報標題
+            title = f"偵測到{item.name_zh}"
         if location:
             title += f"於{location}"
         
         # 建立警報訊息
         event_reason = events.get("reason", "")
-        message = f"偵測到{item.name_zh}"
+        if item:
+            message = f"偵測到{item.name_zh}"
+        else:
+            message = f"偵測到事件（{event_name}）"
         if event_reason:
             message += f"，{event_reason}"
         else:
@@ -2981,7 +3036,7 @@ def _create_alert_if_needed(db: Session, summary_id: int, events: Dict[str, Any]
         try:
             alert = Alert(
                 summary_id=summary_id,
-                detection_item_id=item.id,
+                detection_item_id=item.id if item else None,
                 alert_type=event_name,
                 title=title,
                 message=message,
@@ -2996,8 +3051,8 @@ def _create_alert_if_needed(db: Session, summary_id: int, events: Dict[str, Any]
             )
             db.add(alert)
             
-            # 更新 DetectionItem 的 alert_count
-            item.alert_count += 1
+            if item:
+                item.alert_count += 1
             
             print(f"  ✓ 建立警報：{title}")
         except Exception as e:
@@ -3099,6 +3154,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             existing.violence = bool(events.get("violence", False))
             existing.dangerous_items = bool(events.get("dangerous_items", False))
             existing.event_reason = events.get("reason", "") if events.get("reason") else None
+            existing.events_extra = _events_extra_json_from_events(events)
             
             # [已移除] events_en, events_zh, events_json 欄位（改用個別布林欄位）
             # 個別的事件布林欄位已經在上面更新（行 3286-3294）
@@ -3208,6 +3264,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 violence=bool(events.get("violence", False)),
                 dangerous_items=bool(events.get("dangerous_items", False)),
                 event_reason=events.get("reason", "") if events.get("reason") else None,
+                events_extra=_events_extra_json_from_events(events),
                 embedding=embedding,  # [NEW] 自動生成的 embedding
                 # [NEW] YOLO 結果（整合到 summaries 表）
                 yolo_detections=None,

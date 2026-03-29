@@ -10,11 +10,20 @@ RUN sed -i 's/https:/http:/g' /etc/apt/sources.list.d/debian.sources
 WORKDIR /app
 
 # 3. 安裝套件
+# docker 靜態二進位 + 獨立 docker-compose（Compose V2）：VLM 編排請用 docker-compose；
+# 靜態 docker 通常不含「docker compose」外掛，後端 vlm_profile_service 亦優先呼叫 docker-compose。
 RUN apt-get update && apt-get install -y \
     ffmpeg \
     libgl1 \
     libglib2.0-0 \
     git \
+    ca-certificates \
+    curl \
+    && curl -fsSL https://download.docker.com/linux/static/stable/x86_64/docker-26.1.4.tgz | tar -xz -C /tmp \
+    && mv /tmp/docker/docker /usr/local/bin/docker \
+    && curl -fsSL https://github.com/docker/compose/releases/download/v2.29.7/docker-compose-linux-x86_64 -o /usr/local/bin/docker-compose \
+    && chmod +x /usr/local/bin/docker-compose \
+    && rm -rf /tmp/docker \
     && rm -rf /var/lib/apt/lists/*
 
 # 2. 先安裝 Python 依賴，利用 Docker Layer Cache

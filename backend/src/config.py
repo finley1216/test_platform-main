@@ -49,8 +49,24 @@ class Config:
         self.QWEN3_VLLM_BASE: str = os.getenv("QWEN3_VLLM_BASE", "http://host.docker.internal:8441")
         self.VLLM_API_KEY: Optional[str] = os.getenv("VLLM_API_KEY") or None
         self.VLLM_REQUEST_TIMEOUT: int = int(os.getenv("VLLM_REQUEST_TIMEOUT", "600"))
-        # vLLM 批次：同時發出的 HTTP 請求數（遠端 vLLM 由 Continuous Batching 消化；設 1 則變成逐筆）
-        self.VLLM_BATCH_MAX_WORKERS: int = int(os.getenv("VLLM_BATCH_MAX_WORKERS", "8"))
+        # 送 vLLM 的 JPEG 壓縮品質（降低 payload、縮短 api_total_time）
+        self.VLLM_JPEG_QUALITY: int = int(os.getenv("VLLM_JPEG_QUALITY", "70"))
+        # 非同步批次時同時在飛的 HTTP 數上限（應 ≤ vLLM --max-num-seqs）
+        self.VLLM_BATCH_MAX_IN_FLIGHT: int = int(os.getenv("VLLM_BATCH_MAX_IN_FLIGHT", "16"))
+        # 前端切換 VLM 時可選：掛載 docker.sock + 設定 compose 檔路徑後，由後端執行 stop/start（具 root 等價風險，僅建議內網）
+        self.VLM_ORCHESTRATION_ENABLED: bool = os.getenv("VLM_ORCHESTRATION_ENABLED", "false").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        self.VLM_COMPOSE_FILE: str = os.getenv("VLM_COMPOSE_FILE", "").strip()
+        self.VLM_COMPOSE_PROJECT_DIR: str = os.getenv("VLM_COMPOSE_PROJECT_DIR", "").strip()
+        # 須與主機 docker compose 專案名一致；否則 --project-directory 掛在 /vlm-compose-host 時預設名會變成 vlm-compose-host，stop/up 找不到容器
+        self.VLM_COMPOSE_PROJECT_NAME: str = os.getenv("VLM_COMPOSE_PROJECT_NAME", "").strip()
+        # 選 vLLM profile 時是否一併 docker stop ollama（單卡時釋放 VRAM；若需同時用 RAG「回答」依賴 Ollama LLM 請設 false）
+        self.VLM_ORCHESTRATION_STOP_OLLAMA_ON_VLLM: bool = os.getenv(
+            "VLM_ORCHESTRATION_STOP_OLLAMA_ON_VLLM", "false"
+        ).lower() in ("true", "1", "yes")
 
         # ================== Database Configuration ==================
         # PostgreSQL connection URL

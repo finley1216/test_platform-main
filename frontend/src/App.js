@@ -1,4 +1,4 @@
-import React, { useState, useEffect } from "react";
+import React, { useState, useEffect, useRef } from "react";
 import "./App.css";
 
 // Hooks
@@ -21,6 +21,31 @@ import RTSPStatusModal from "./components/RTSPStatusModal";
 
 // Services
 import apiService from "./services/api";
+
+/** 與後端 vlm_profile_service 的 profile_id 對齊 */
+function mapToVlmProfileId(modelType, qwenModel) {
+  const qm = (qwenModel || "").trim();
+  if (modelType === "qwen" && qm === "qwen2.5vl:latest") return "ollama_qwen25";
+  if (modelType === "vllm_qwen") {
+    if (qm.includes("Qwen3") || qm.toLowerCase().includes("qwen3")) return "vllm_qwen3";
+    return "vllm_qwen25";
+  }
+  return null;
+}
+
+/**
+ * 依 /v1/system/vlm 的 probes 推斷「實際在服務」的 vLLM profile。
+ * 解決：檔案偏好是 Qwen2.5 但 GPU 上只有 Qwen3 在跑 → 避免 UI 永遠顯示未就緒又鎖死。
+ */
+function inferVllmProfileIdFromProbes(vlm) {
+  if (!vlm?.probes || vlm?.switch?.phase === "loading") return null;
+  const sel = vlm.selected_profile_id;
+  const mainOk = vlm.probes.vllm_main?.ok === true;
+  const q3Ok = vlm.probes.vllm_qwen3?.ok === true;
+  if (sel === "vllm_qwen25" && !mainOk && q3Ok) return "vllm_qwen3";
+  if (sel === "vllm_qwen3" && !q3Ok && mainOk) return "vllm_qwen25";
+  return null;
+}
 
 function App() {
   // Authentication
@@ -58,9 +83,15 @@ function App() {
     updateStats,
   } = useRAG(apiKey, authenticated);
 
-  // Model configuration
-  const [modelType, setModelType] = useState("qwen");
-  const [qwenModel, setQwenModel] = useState("qwen2.5vl:latest");
+  // Model configuration（預設與後端 DEFAULT_PROFILE vLLM Qwen2.5 一致）
+  const [modelType, setModelType] = useState("vllm_qwen");
+  const [qwenModel, setQwenModel] = useState("Qwen/Qwen2.5-VL-7B-Instruct-AWQ");
+  const [vlmStatus, setVlmStatus] = useState(null);
+  /** 使用者剛觸發切換、尚未收到後端 idle+ready 前，用於立即鎖 UI */
+  const [vlmLocalSwitching, setVlmLocalSwitching] = useState(false);
+  const vlmHydratedRef = useRef(false);
+  /** 每次登入僅做一次：依 probes 與偏好不一致時自動對齊 UI + 後端偏好檔 */
+  const vlmProbeAlignDoneRef = useRef(false);
   const [source, setSource] = useState("upload");
   const [videoUrl, setVideoUrl] = useState("");
   const [videoFile, setVideoFile] = useState(null);
@@ -106,27 +137,71 @@ function App() {
         console.log("%c[Ollama 狀態檢查]", "color: #3b82f6; font-weight: bold; font-size: 14px");
         console.log("%c正在檢查 Ollama 服務狀態...", "color: #6b7280");
         
-        const status = await apiService.checkOllamaStatus(apiKey);
-        
-        if (status.available) {
-          console.log("%c✓ Ollama 服務可用", "color: #10b981; font-weight: bold");
-          console.log("%c  服務地址: " + status.ollama_base, "color: #6b7280; font-size: 12px");
-          console.log("%c  可用模型數量: " + (status.model_count || 0), "color: #6b7280; font-size: 12px");
-          if (status.models && status.models.length > 0) {
-            console.log("%c  可用模型列表:", "color: #6b7280; font-size: 12px");
-            status.models.forEach((model, idx) => {
-              console.log("%c    " + (idx + 1) + ". " + model, "color: #10b981; font-size: 12px");
-            });
-          } else {
-            console.log("%c  ⚠️ 沒有找到可用模型", "color: #f59e0b; font-size: 12px");
+        let vlm = await apiService.getVlmStatus(apiKey);
+        const alignTo = inferVllmProfileIdFromProbes(vlm);
+        if (
+          alignTo &&
+          !vlmProbeAlignDoneRef.current &&
+          vlm?.profiles?.length
+        ) {
+          const ap = vlm.profiles.find((x) => x.id === alignTo);
+          if (ap) {
+            vlmProbeAlignDoneRef.current = true;
+            setModelType(ap.model_type);
+            setQwenModel(ap.qwen_model);
+            vlmHydratedRef.current = true;
+            try {
+              await apiService.selectVlmProfile(apiKey, alignTo);
+              vlm = await apiService.getVlmStatus(apiKey);
+            } catch (e) {
+              console.error("VLM probe align:", e);
+            }
           }
+        } else if (
+          !vlmHydratedRef.current &&
+          vlm?.profiles &&
+          vlm.selected_profile_id
+        ) {
+          const p = vlm.profiles.find((x) => x.id === vlm.selected_profile_id);
+          if (p) {
+            setModelType(p.model_type);
+            setQwenModel(p.qwen_model);
+            vlmHydratedRef.current = true;
+          }
+        }
+        setVlmStatus(vlm);
+
+        const skipOllamaHealth =
+          vlm?.selected_profile_id === "vllm_qwen25" ||
+          vlm?.selected_profile_id === "vllm_qwen3";
+        if (skipOllamaHealth) {
+          console.log(
+            "%c[Ollama 狀態檢查] 略過（目前為 vLLM profile，避免對 Ollama 發請求／喚醒載入）",
+            "color: #6b7280; font-size: 12px"
+          );
         } else {
-          console.log("%c✗ Ollama 服務不可用", "color: #ef4444; font-weight: bold");
-          console.log("%c  狀態: " + status.status, "color: #ef4444; font-size: 12px");
-          if (status.error) {
-            console.log("%c  錯誤訊息: " + status.error, "color: #ef4444; font-size: 12px");
+          const status = await apiService.checkOllamaStatus(apiKey);
+
+          if (status.available) {
+            console.log("%c✓ Ollama 服務可用", "color: #10b981; font-weight: bold");
+            console.log("%c  服務地址: " + status.ollama_base, "color: #6b7280; font-size: 12px");
+            console.log("%c  可用模型數量: " + (status.model_count || 0), "color: #6b7280; font-size: 12px");
+            if (status.models && status.models.length > 0) {
+              console.log("%c  可用模型列表:", "color: #6b7280; font-size: 12px");
+              status.models.forEach((model, idx) => {
+                console.log("%c    " + (idx + 1) + ". " + model, "color: #10b981; font-size: 12px");
+              });
+            } else {
+              console.log("%c  ⚠️ 沒有找到可用模型", "color: #f59e0b; font-size: 12px");
+            }
+          } else {
+            console.log("%c✗ Ollama 服務不可用", "color: #ef4444; font-weight: bold");
+            console.log("%c  狀態: " + status.status, "color: #ef4444; font-size: 12px");
+            if (status.error) {
+              console.log("%c  錯誤訊息: " + status.error, "color: #ef4444; font-size: 12px");
+            }
+            console.log("%c  建議: 請檢查 Ollama 服務是否正常運行", "color: #f59e0b; font-size: 12px");
           }
-          console.log("%c  建議: 請檢查 Ollama 服務是否正常運行", "color: #f59e0b; font-size: 12px");
         }
         console.log("%c" + "=".repeat(60), "color: #3b82f6; font-weight: bold; font-size: 14px");
       };
@@ -135,16 +210,118 @@ function App() {
     }
   }, [authenticated, apiKey]);
 
-  // Update model when modelType changes
   useEffect(() => {
-    if (modelType === "gemini") {
-      setQwenModel("gemini-2.5-flash");
-    } else if (modelType === "qwen") {
-      setQwenModel("qwen2.5vl:latest");
-    } else if (modelType === "vllm_qwen") {
-      setQwenModel("Qwen/Qwen2.5-VL-7B-Instruct-AWQ");
+    if (!authenticated) {
+      vlmHydratedRef.current = false;
+      vlmProbeAlignDoneRef.current = false;
     }
-  }, [modelType]);
+  }, [authenticated]);
+
+  const usesVlmProfile =
+    modelType === "qwen" || modelType === "vllm_qwen";
+  const expectedVlmProfileId = mapToVlmProfileId(modelType, qwenModel);
+
+  /** 後端已就緒且與目前下拉選項一致（避免輪詢到舊狀態就誤解鎖） */
+  const vlmBackendReadyForSelection =
+    !!vlmStatus &&
+    vlmStatus.switch?.phase === "idle" &&
+    vlmStatus.readiness?.ready === true &&
+    expectedVlmProfileId &&
+    vlmStatus.readiness?.profile_id === expectedVlmProfileId;
+
+  /**
+   * 使用者觸發切換後，直到後端 readiness 與選項一致才解除 vlmLocalSwitching。
+   */
+  const vlmSwitchBlocking =
+    usesVlmProfile &&
+    !!expectedVlmProfileId &&
+    vlmStatus?.switch?.phase !== "error" &&
+    vlmLocalSwitching;
+
+  /** 後端正在 docker compose 切換（含重新整理頁面後仍卡在 loading）— 鎖模型選項、禁止分析 */
+  const vlmBackendSwitching =
+    usesVlmProfile && vlmStatus?.switch?.phase === "loading";
+
+  const vlmUiLocked =
+    usesVlmProfile &&
+    !!expectedVlmProfileId &&
+    vlmStatus?.switch?.phase !== "error" &&
+    (vlmSwitchBlocking || vlmBackendSwitching);
+
+  useEffect(() => {
+    if (!authenticated || !apiKey) return undefined;
+    const tick = () => {
+      apiService.getVlmStatus(apiKey).then(setVlmStatus);
+    };
+    tick();
+    const intervalMs = vlmUiLocked ? 1000 : 3000;
+    const id = setInterval(tick, intervalMs);
+    return () => clearInterval(id);
+  }, [authenticated, apiKey, vlmUiLocked]);
+
+  useEffect(() => {
+    if (!vlmLocalSwitching || !vlmStatus) return;
+    if (vlmStatus.switch?.phase === "error") {
+      setVlmLocalSwitching(false);
+      return;
+    }
+    if (vlmBackendReadyForSelection) {
+      setVlmLocalSwitching(false);
+    }
+  }, [vlmStatus, vlmLocalSwitching, vlmBackendReadyForSelection]);
+
+  const handleModelTypeChange = async (v) => {
+    let qm = qwenModel;
+    if (v === "gemini") {
+      qm = "gemini-2.5-flash";
+    } else if (v === "qwen") {
+      qm = "qwen2.5vl:latest";
+    } else if (v === "vllm_qwen") {
+      qm = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ";
+    } else if (v === "moondream") {
+      qm = "moondream3-preview";
+    }
+    const pid = mapToVlmProfileId(v, qm);
+    if (pid && apiKey) {
+      setVlmLocalSwitching(true);
+    } else {
+      setVlmLocalSwitching(false);
+    }
+    setModelType(v);
+    setQwenModel(qm);
+
+    if (pid && apiKey) {
+      try {
+        await apiService.selectVlmProfile(apiKey, pid);
+        const next = await apiService.getVlmStatus(apiKey);
+        setVlmStatus(next);
+        if (!next) setVlmLocalSwitching(false);
+      } catch (e) {
+        console.error(e);
+        setVlmLocalSwitching(false);
+      }
+    }
+  };
+
+  const handleQwenModelChange = async (qm) => {
+    const pid = mapToVlmProfileId(modelType, qm);
+    if (pid && apiKey) {
+      setVlmLocalSwitching(true);
+    }
+    setQwenModel(qm);
+
+    if (pid && apiKey) {
+      try {
+        await apiService.selectVlmProfile(apiKey, pid);
+        const next = await apiService.getVlmStatus(apiKey);
+        setVlmStatus(next);
+        if (!next) setVlmLocalSwitching(false);
+      } catch (e) {
+        console.error(e);
+        setVlmLocalSwitching(false);
+      }
+    }
+  };
 
   // File change handler
   const handleFileChange = (e) => {
@@ -160,6 +337,22 @@ function App() {
     if (!authenticated) {
       showMessage("尚未通過驗證，請先登入", "error");
       return;
+    }
+    if (vlmUiLocked) {
+      showMessage("VLM 後端仍在切換或載入中（VRAM 釋放／載入），請待就緒後再執行。", "warning");
+      return;
+    }
+
+    const vlmPid = mapToVlmProfileId(modelType, qwenModel);
+    if (vlmPid) {
+      const r = vlmStatus?.readiness;
+      if (!r?.ready || r.profile_id !== vlmPid) {
+        showMessage(
+          r?.detail || "VLM 後端尚未就緒或仍在切換中，請稍候再試。",
+          "warning"
+        );
+        return;
+      }
     }
 
     const formData = new FormData();
@@ -303,6 +496,8 @@ function App() {
           <ModelConfig
             modelType={modelType}
             qwenModel={qwenModel}
+            vlmStatus={vlmStatus}
+            vlmUiLocked={vlmUiLocked}
             source={source}
             videoUrl={videoUrl}
             videoFile={videoFile}
@@ -310,8 +505,8 @@ function App() {
             selectedVideoId={selectedVideoId}
             apiKey={apiKey}
             authenticated={authenticated}
-            onModelTypeChange={setModelType}
-            onQwenModelChange={setQwenModel}
+            onModelTypeChange={handleModelTypeChange}
+            onQwenModelChange={handleQwenModelChange}
             onSourceChange={setSource}
             onVideoUrlChange={setVideoUrl}
             onFileChange={handleFileChange}
@@ -358,11 +553,20 @@ function App() {
               <button
                 onClick={handleRun}
                 className="btn btn-primary"
-                disabled={isAnalyzing}
+                disabled={isAnalyzing || vlmUiLocked}
+                title={
+                  vlmUiLocked
+                    ? "VLM 後端切換中（VRAM 釋放／載入），請待就緒後再執行"
+                    : undefined
+                }
               >
                 <span>▶</span>
                 <span>
-                  {isAnalyzing ? "Processing..." : "Execute"}
+                  {isAnalyzing
+                    ? "Processing..."
+                    : vlmUiLocked
+                      ? "VLM 切換／載入中…"
+                      : "Execute"}
                 </span>
               </button>
             </div>

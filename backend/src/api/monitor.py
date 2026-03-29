@@ -1,6 +1,11 @@
 # -*- coding: utf-8 -*-
-from fastapi import APIRouter
+import logging
+
+from fastapi import APIRouter, Depends, HTTPException
+from pydantic import BaseModel, Field
 import psutil
+
+logger = logging.getLogger(__name__)
 import os
 import torch
 from typing import Dict, Any, Optional
@@ -14,6 +19,10 @@ except ImportError:
 from src.api.video_analysis import get_active_requests
 
 router = APIRouter(tags=["系統監控"])
+
+
+class VlmProfileSelectBody(BaseModel):
+    profile_id: str = Field(..., description="ollama_qwen25 | vllm_qwen25 | vllm_qwen3")
 
 def get_gpu_status() -> Optional[Dict[str, Any]]:
     """獲取 GPU 使用狀況"""
@@ -118,3 +127,24 @@ def get_system_status():
             "free_gb": round(disk.free / (1024**3), 2)
         }
     }
+
+
+# 須在 router 建立後再匯入 main，避免 main → monitor → main 循環匯入時 router 尚未指派
+from src.main import get_api_key
+from src.services import vlm_profile_service
+
+
+@router.get("/v1/system/vlm")
+def get_vlm_system_status(api_key: str = Depends(get_api_key)):
+    """VLM 後端選項、連線探測、目前偏好 profile 與是否已可送分析請求。"""
+    return vlm_profile_service.build_status_payload()
+
+
+@router.post("/v1/system/vlm/select")
+def post_vlm_profile_select(body: VlmProfileSelectBody, api_key: str = Depends(get_api_key)):
+    """請求切換 VLM（可選 Docker compose 自動停啟服務）；同一時間僅一個切換工作。"""
+    logger.info("POST /v1/system/vlm/select profile_id=%s", body.profile_id.strip())
+    ok, msg = vlm_profile_service.request_profile_switch(body.profile_id.strip())
+    if not ok:
+        raise HTTPException(status_code=409, detail=msg)
+    return {"ok": True, "message": msg, "switch": vlm_profile_service.get_switch_state()}
