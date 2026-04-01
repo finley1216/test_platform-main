@@ -24,9 +24,11 @@ from src.config import config
 try:
     from src.utils.vllm_utils import _vllm_chat
     from src.utils.vllm_utils import _vllm_chat_batch
+    from src.utils.vllm_utils import _vllm_chat_batch_video_direct
     HAS_VLLM = True
 except Exception as _e:
     _vllm_chat = None
+    _vllm_chat_batch_video_direct = None
     HAS_VLLM = False
 
 # 本機 HF Qwen2.5-VL（batch 推論用）；未安裝 transformers 時為 None
@@ -1325,6 +1327,155 @@ class AnalysisService:
             for future in as_completed(futures):
                 results.append(future.result())
         
+        results.sort(key=lambda x: x["segment"])
+        return results
+
+    @staticmethod
+    def infer_segment_vllm_batch_video_direct(
+        model_name: str,
+        path_strs: List[str],
+        event_prompt: str,
+        summary_prompt: str,
+    ) -> List[Tuple[Dict, str]]:
+        """
+        vLLM 批次推論（影片直送，不做截圖取幀）。
+        """
+        print(
+            f"--- [vLLM VideoDirect Batch] 開始處理 {len(path_strs)} 個片段, model={model_name} ---",
+            flush=True,
+        )
+        qwen3_disable_thinking = ("qwen3" in (model_name or "").lower())
+        if not HAS_VLLM or _vllm_chat_batch_video_direct is None:
+            return [({"error": "vLLM 不可用"}, "")] * len(path_strs)
+
+        instruction = (
+            f"{event_prompt}\n\n"
+            f"{summary_prompt}\n\n"
+            "請輸出「一個」JSON 物件，且必須包含以下欄位：\n"
+            "- events: 事件描述物件（可含 reason 等）\n"
+            "- persons: 人員相關陣列\n"
+            "- summary: 50–100 字繁體中文畫面摘要（字串）\n"
+            "只輸出該 JSON，不要其他文字。"
+        )
+        combined_msgs = [
+            {
+                "role": "system",
+                "content": "你是災害與人員異常偵測器，並產出影片摘要。只輸出一個 JSON 物件，含 events、persons、summary。",
+            },
+            {"role": "user", "content": instruction},
+        ]
+
+        all_parsed: List[Tuple[Dict, str]] = [({"error": "未處理"}, "")] * len(path_strs)
+        valid_indices: List[int] = []
+        batch_requests = []
+        for i, path in enumerate(path_strs):
+            if not os.path.exists(path):
+                all_parsed[i] = ({"error": f"找不到影片檔案: {path}"}, "")
+                continue
+            batch_requests.append(
+                {
+                    "messages": combined_msgs,
+                    "video_path": path,
+                    "enable_thinking": False if qwen3_disable_thinking else True,
+                }
+            )
+            valid_indices.append(i)
+
+        if not batch_requests:
+            return all_parsed
+
+        _mw = max(1, min(int(getattr(config, "VLLM_BATCH_MAX_WORKERS", 16)), 32, len(batch_requests)))
+        try:
+            raw_outputs = _vllm_chat_batch_video_direct(
+                model_name=model_name,
+                batch_requests=batch_requests,
+                max_workers=_mw,
+                enable_thinking=False if qwen3_disable_thinking else None,
+            )
+        except Exception as e:
+            for idx in valid_indices:
+                all_parsed[idx] = ({"error": f"vLLM VideoDirect Batch 失敗: {e}"}, "")
+            return all_parsed
+
+        for j, raw in enumerate(raw_outputs):
+            orig_idx = valid_indices[j]
+            combined = _safe_parse_json(raw) or _extract_first_json(raw) or {}
+            events_in = combined.get("events") if isinstance(combined.get("events"), dict) else {}
+            reason = (
+                combined.get("event_reason")
+                or combined.get("reason")
+                or (events_in.get("reason", "") if isinstance(events_in, dict) else "")
+            )
+            if reason and isinstance(events_in, dict) and "reason" not in events_in:
+                events_in = {**events_in, "reason": reason}
+            frame_obj = {
+                "events": events_in or {"reason": ""},
+                "persons": combined.get("persons", []),
+            }
+            if not isinstance(frame_obj.get("events"), dict):
+                frame_obj["events"] = {"reason": ""}
+            summary_txt = _clean_summary_text(combined.get("summary") or raw or "")
+            if not summary_txt and raw:
+                summary_txt = _clean_summary_text(raw)
+            all_parsed[orig_idx] = (frame_obj, summary_txt)
+        return all_parsed
+
+    @staticmethod
+    def run_vllm_video_direct_pipeline(
+        seg_files: List[Path],
+        total_duration: float,
+        segment_duration: float,
+        overlap: float,
+        qwen_model: str,
+        event_detection_prompt: str,
+        summary_prompt: str,
+        qwen_inference_batch_size: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        新流程：僅跑 infer_segment_vllm_batch_video_direct（不跑 YOLO）。
+        """
+        results: List[Dict] = []
+        vlm_batch_size = qwen_inference_batch_size or 10
+
+        class Req:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        for batch_start in range(0, len(seg_files), vlm_batch_size):
+            batch_paths = seg_files[batch_start : batch_start + vlm_batch_size]
+            path_strs = [str(p) for p in batch_paths]
+            t_batch_start = time.time()
+            vlm_list = AnalysisService.infer_segment_vllm_batch_video_direct(
+                model_name=qwen_model,
+                path_strs=path_strs,
+                event_prompt=event_detection_prompt,
+                summary_prompt=summary_prompt,
+            )
+            batch_elapsed_sec = round(time.time() - t_batch_start, 2)
+
+            for i, seg_path in enumerate(batch_paths):
+                idx = batch_start + i
+                start = idx * (segment_duration - overlap)
+                end = min(start + segment_duration, total_duration)
+                req = Req(
+                    segment_path=str(seg_path),
+                    start_time=start,
+                    end_time=end,
+                )
+                frame_obj, summary_txt = vlm_list[i] if i < len(vlm_list) else ({"error": "batch 長度不符"}, "")
+                merged = AnalysisService._merge_vlm_and_yolo_result(
+                    req,
+                    frame_obj,
+                    summary_txt,
+                    yolo_res={},
+                    batch_elapsed_sec=batch_elapsed_sec,
+                )
+                merged["raw_detection"] = {}
+                merged["success"] = ("error" not in frame_obj)
+                if "error" in frame_obj:
+                    merged["error"] = frame_obj.get("error")
+                results.append(merged)
         results.sort(key=lambda x: x["segment"])
         return results
 

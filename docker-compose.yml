@@ -141,6 +141,8 @@ services:
       - HF_HUB_OFFLINE=${QWEN3_OFFLINE:-0}
     volumes:
       - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
+      # 讓 vLLM 可讀取 backend 切出的本地影片片段（video_direct 的 file:// URI）
+      - ./backend/segment:/app/segment:ro
     shm_size: "2gb"
     deploy:
       resources:
@@ -159,6 +161,7 @@ services:
       --dtype auto
       --gpu-memory-utilization ${QWEN3_GPU_MEMORY_UTILIZATION:-0.7}
       --max-model-len ${QWEN3_MAX_MODEL_LEN:-16384}
+      --allowed-local-media-path /app/segment
 
   # PostgreSQL Database with pgvector extension
   postgres:

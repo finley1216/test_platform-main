@@ -4,6 +4,7 @@ import json
 import copy
 import requests
 import concurrent.futures
+from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 
 from src.config import config
@@ -269,4 +270,123 @@ def _vllm_chat_batch(
                 results[index] = ""
 
     print(f"--- [vLLM Batch] 所有任務執行完畢，成功取得 {len(results)} 筆結果 ---", flush=True)
+    return results
+
+
+def _vllm_chat_video_direct(
+    model_name: str,
+    messages: List[Dict],
+    video_path: str,
+    stream: bool = False,
+    enable_thinking: Optional[bool] = None,
+) -> str:
+    """
+    影片直送 vLLM（不做本地截圖取幀）。
+    會把最後一則 user 訊息轉成多模態 content，附上 video_url。
+    """
+    payload_messages = copy.deepcopy(messages)
+
+    # 使用標準 file URI，避免 file://segment/... 這種非標準路徑造成 vLLM 400。
+    vp = Path(video_path).expanduser()
+    if not vp.is_absolute():
+        vp = (Path.cwd() / vp).resolve()
+    video_uri = vp.as_uri()
+
+    for msg in reversed(payload_messages):
+        if msg.get("role") != "user":
+            continue
+        text = msg.get("content") or ""
+        if isinstance(text, list):
+            # 呼叫端已經給多模態內容時，不覆蓋
+            break
+        msg["content"] = [
+            {"type": "text", "text": str(text)},
+            {"type": "video_url", "video_url": {"url": video_uri}},
+        ]
+        break
+
+    payload = {
+        "model": model_name,
+        "messages": payload_messages,
+        "stream": stream,
+        "max_tokens": 2048,
+        "temperature": 0.1,
+    }
+    if enable_thinking is not None and _is_qwen3_model(model_name):
+        payload["enable_thinking"] = bool(enable_thinking)
+
+    base = _resolve_vllm_base(model_name)
+    url = f"{base}/v1/chat/completions"
+    timeout = getattr(config, "VLLM_REQUEST_TIMEOUT", 600)
+    headers = {"Content-Type": "application/json"}
+    if getattr(config, "VLLM_API_KEY", None):
+        headers["Authorization"] = f"Bearer {config.VLLM_API_KEY}"
+
+    print(
+        f"--- [vLLM-VideoDirect] POST {url} (model={model_name}, video_path={video_path}) ---",
+        flush=True,
+    )
+    try:
+        payload_for_log = _sanitize_openai_payload_for_log(payload)
+        print(
+            "--- [vLLM-VideoDirect][Request] ---\n"
+            + json.dumps(payload_for_log, ensure_ascii=False, indent=2)[:6000]
+            + "\n--- [vLLM-VideoDirect][Request End] ---",
+            flush=True,
+        )
+        r = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        print(f"--- [vLLM-VideoDirect] HTTP {r.status_code} ---", flush=True)
+        r.raise_for_status()
+        data = r.json()
+        choices = data.get("choices") or []
+        if not choices:
+            return ""
+        msg = choices[0].get("message") or {}
+        return msg.get("content") or ""
+    except Exception as e:
+        if isinstance(e, requests.HTTPError) and e.response is not None:
+            body = (e.response.text or "").strip()
+            if body:
+                print(f"--- [vLLM-VideoDirect][ErrorBody] {body[:2000]} ---", flush=True)
+        print(f"--- [vLLM-VideoDirect] 請求失敗: {type(e).__name__}: {e} ---", flush=True)
+        raise
+
+
+def _vllm_chat_batch_video_direct(
+    model_name: str,
+    batch_requests: List[Dict],
+    max_workers: int = 8,
+    enable_thinking: Optional[bool] = None,
+) -> List[str]:
+    """
+    批次影片直送 vLLM（不經過 _vllm_chat，避免截圖路徑）。
+    batch_requests 每筆需包含 messages 與 video_path。
+    """
+    nreq = len(batch_requests)
+    mw = max(1, min(max_workers, nreq or 1))
+    results = ["" for _ in range(nreq)]
+    print(f"--- [vLLM-VideoDirect-Batch] 任務數={nreq}, threads={mw} ---", flush=True)
+
+    def _single_worker(req_item: Dict) -> str:
+        req_enable_thinking = req_item.get("enable_thinking", enable_thinking)
+        return _vllm_chat_video_direct(
+            model_name=model_name,
+            messages=req_item.get("messages", []),
+            video_path=req_item.get("video_path", ""),
+            stream=False,
+            enable_thinking=req_enable_thinking,
+        )
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=mw) as executor:
+        future_to_index = {
+            executor.submit(_single_worker, item): i
+            for i, item in enumerate(batch_requests)
+        }
+        for future in concurrent.futures.as_completed(future_to_index):
+            idx = future_to_index[future]
+            try:
+                results[idx] = future.result()
+            except Exception as exc:
+                print(f"--- [vLLM-VideoDirect-Batch] idx={idx} 異常: {exc} ---", flush=True)
+                results[idx] = ""
     return results

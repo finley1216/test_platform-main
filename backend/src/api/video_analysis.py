@@ -154,8 +154,8 @@ def analyze_single_segment(
             end_time=end_time,
             model_type="qwen",
             qwen_model="qwen2.5vl:latest",
-            frames_per_segment=8,
-            target_short=720,
+            frames_per_segment=5,
+            target_short=432,
             event_detection_prompt=get_event_prompt(),
             summary_prompt=get_summary_prompt(),
             yolo_labels="person,car",
@@ -185,7 +185,7 @@ def segment_pipeline_multipart(
     overlap: float = Form(0.0),
     qwen_model: str = Form("qwen2.5vl:latest"),
     frames_per_segment: int = Form(5),
-    target_short: int = Form(720),
+    target_short: int = Form(432),
     sampling_fps: Optional[float] = Form(None),
     strict_segmentation: bool = Form(False),
     yolo_labels: Optional[str] = Form(None),
@@ -557,6 +557,161 @@ def segment_pipeline_batch(
                 temp_dir.rmdir()
             except OSError:
                 pass
+
+
+@router.post("/v1/segment_pipeline_multipart_vllm_video_direct")
+def segment_pipeline_multipart_vllm_video_direct(
+    request: Request,
+    file: UploadFile = File(None),
+    video_url: str = Form(None),
+    video_id: str = Form(None),
+    segment_duration: float = Form(10.0),
+    overlap: float = Form(0.0),
+    qwen_model: str = Form("qwen3-vl"),
+    target_short: int = Form(432),  # 保留參數型態相容，實際不使用
+    sampling_fps: Optional[float] = Form(None),  # 保留參數型態相容，實際不使用
+    strict_segmentation: bool = Form(False),
+    event_detection_prompt: str = Form(""),
+    summary_prompt: str = Form(""),
+    save_json: bool = Form(True),
+    save_basename: str = Form(None),
+    qwen_inference_batch_size: Optional[int] = Form(None),
+):
+    """
+    新流程：
+    1) segment_pipeline_multipart 同樣的輸入與切片流程
+    2) 僅跑 vLLM（不跑 YOLO）
+    3) vLLM 走影片直送（不在後端先截圖）
+    """
+    global active_requests_counter
+    active_requests_counter += 1
+    req_id = uuid.uuid4().hex[:12]
+    t0 = time.time()
+    t1 = None
+    mem_before = psutil.Process().memory_info().rss / (1024 * 1024)
+    client_host = request.client.host if request.client else "?"
+    try:
+        vm_pct = psutil.virtual_memory().percent
+    except Exception:
+        vm_pct = -1.0
+
+    print(
+        f"--- [API][VideoDirect] 收到 POST /v1/segment_pipeline_multipart_vllm_video_direct | req_id={req_id} "
+        f"| active_same_worker={active_requests_counter} | client={client_host} | rss_mb={mem_before:.1f} | vm_pct={vm_pct} ---",
+        flush=True,
+    )
+
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
+
+    if not event_detection_prompt or not event_detection_prompt.strip():
+        event_detection_prompt = get_event_prompt()
+    if not summary_prompt or not summary_prompt.strip():
+        summary_prompt = get_summary_prompt()
+
+    target_filename = "unknown_video"
+    local_path = None
+    cleanup = False
+
+    try:
+        if video_id and video_id.strip():
+            print(f"--- [API][VideoDirect] 使用已存在 video_id: {video_id} ---", flush=True)
+            local_path = None
+        elif file is not None:
+            file_content = file.file.read()
+            file_size = len(file_content)
+            if file_size == 0:
+                raise HTTPException(status_code=400, detail="File is empty (0 bytes).")
+            target_filename = file.filename or "video.mp4"
+            fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(target_filename).suffix)
+            with os.fdopen(fd, "wb") as f:
+                f.write(file_content)
+            local_path, cleanup = tmp, True
+            del file_content
+        elif video_url:
+            target_filename = Path(video_url).name or "video_url.mp4"
+            local_path, cleanup = VideoService.download_to_temp(video_url), True
+        else:
+            raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
+
+        try:
+            seg_dir, seg_files, stem, total_duration = VideoService.prepare_segments(
+                local_path,
+                None if file else video_id,
+                target_filename,
+                segment_duration,
+                overlap,
+                target_short,
+                strict_segmentation,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=500, detail=f"FFmpeg Processing Failed: {ve}")
+
+        t1 = time.time()
+        results = AnalysisService.run_vllm_video_direct_pipeline(
+            seg_files=seg_files,
+            total_duration=total_duration,
+            segment_duration=segment_duration,
+            overlap=overlap,
+            qwen_model=qwen_model,
+            event_detection_prompt=event_detection_prompt,
+            summary_prompt=summary_prompt,
+            qwen_inference_batch_size=qwen_inference_batch_size,
+        )
+
+        t2 = time.time()
+        mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
+        resp = {
+            "model_type": "vllm_qwen3_video_direct",
+            "total_segments": len(results),
+            "success_segments": sum(1 for r in results if r.get("success")),
+            "results": results,
+            "process_time_sec": round(t2 - t1, 2),
+            "total_time_sec": round(t2 - t0, 2),
+            "stem": stem,
+            "diagnostics": {
+                "mem_delta_mb": round(mem_after - mem_before, 2),
+                "strict_mode": strict_segmentation,
+                "video_direct": True,
+                "sampling_fps_ignored": sampling_fps,
+            },
+        }
+
+        if save_json:
+            save_path_obj = seg_dir / (save_basename or f"{stem}.json")
+            with open(save_path_obj, "w", encoding="utf-8") as f:
+                json.dump(resp, f, ensure_ascii=False, indent=2)
+            resp["save_path"] = str(save_path_obj)
+
+        if HAS_DB:
+            from src.database import SessionLocal
+
+            db = SessionLocal()
+            try:
+                _save_results_to_postgres(db, results, video_id or stem)
+            finally:
+                db.close()
+
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected Error: {type(e).__name__} - {str(e)}")
+    finally:
+        active_requests_counter -= 1
+        if cleanup and local_path:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+        try:
+            AnalysisService.release_gpu_memory()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
 
 # POST 端點：來源為 RTSP，其餘流程與 /v1/segment_pipeline_multipart 完全相同
 @router.post("/v1/segment_pipeline_rtsp")
