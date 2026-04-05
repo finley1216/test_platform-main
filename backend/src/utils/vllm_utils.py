@@ -13,6 +13,13 @@ from src.config import config
 def _resolve_vllm_base(model_name: str) -> str:
     """依模型名稱選擇對應的 vLLM endpoint。"""
     model_lower = (model_name or "").lower()
+    if "qwen3-vl" in model_lower and "awq" in model_lower:
+        return (
+            getattr(config, "QWEN3_AWQ_VLLM_BASE", None)
+            or getattr(config, "QWEN3_VLLM_BASE", None)
+            or config.VLLM_BASE
+            or ""
+        ).rstrip("/")
     if "qwen3-vl" in model_lower:
         return (getattr(config, "QWEN3_VLLM_BASE", None) or config.VLLM_BASE or "").rstrip("/")
     return (config.VLLM_BASE or "").rstrip("/")

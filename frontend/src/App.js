@@ -27,7 +27,9 @@ function mapToVlmProfileId(modelType, qwenModel) {
   const qm = (qwenModel || "").trim();
   if (modelType === "qwen" && qm === "qwen2.5vl:latest") return "ollama_qwen25";
   if (modelType === "vllm_qwen") {
-    if (qm.includes("Qwen3") || qm.toLowerCase().includes("qwen3")) return "vllm_qwen3";
+    const qml = qm.toLowerCase();
+    if (qml.includes("qwen3") && qml.includes("awq")) return "vllm_qwen3_awq";
+    if (qml.includes("qwen3")) return "vllm_qwen3";
     return "vllm_qwen25";
   }
   return null;
@@ -42,8 +44,17 @@ function inferVllmProfileIdFromProbes(vlm) {
   const sel = vlm.selected_profile_id;
   const mainOk = vlm.probes.vllm_main?.ok === true;
   const q3Ok = vlm.probes.vllm_qwen3?.ok === true;
-  if (sel === "vllm_qwen25" && !mainOk && q3Ok) return "vllm_qwen3";
-  if (sel === "vllm_qwen3" && !q3Ok && mainOk) return "vllm_qwen25";
+  const q3AwqOk = vlm.probes.vllm_qwen3_awq?.ok === true;
+
+  const available = [];
+  if (mainOk) available.push("vllm_qwen25");
+  if (q3Ok) available.push("vllm_qwen3");
+  if (q3AwqOk) available.push("vllm_qwen3_awq");
+
+  // 僅在「目前所選 profile 不可用」且「只有一個可用 profile」時自動對齊，避免切換時誤鎖。
+  if (!available.length) return null;
+  if (available.includes(sel)) return null;
+  if (available.length === 1) return available[0];
   return null;
 }
 
@@ -173,7 +184,8 @@ function App() {
 
         const skipOllamaHealth =
           vlm?.selected_profile_id === "vllm_qwen25" ||
-          vlm?.selected_profile_id === "vllm_qwen3";
+          vlm?.selected_profile_id === "vllm_qwen3" ||
+          vlm?.selected_profile_id === "vllm_qwen3_awq";
         if (skipOllamaHealth) {
           console.log(
             "%c[Ollama 狀態檢查] 略過（目前為 vLLM profile，避免對 Ollama 發請求／喚醒載入）",

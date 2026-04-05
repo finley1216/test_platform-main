@@ -33,7 +33,7 @@ if [[ ! -f "$COMPOSE_REL" ]]; then
   exit 1
 fi
 echo "主機 compose 檔: $ROOT/$COMPOSE_REL"
-echo "--- 服務名稱（須含 vllm、vllm-qwen3、ollama、backend）---"
+echo "--- 服務名稱（須含 vllm、vllm-qwen3、vllm-qwen3-awq、ollama、backend）---"
 docker compose -p "${ENV_NAME:-test_platform-main}" -f "$COMPOSE_REL" --project-directory "$ROOT" config --services 2>&1
 
 echo "--- ps（-p 與 .env 一致時）---"

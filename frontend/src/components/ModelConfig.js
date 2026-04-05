@@ -153,6 +153,7 @@ const ModelConfig = ({
                 <>
                   <option value="Qwen/Qwen2.5-VL-7B-Instruct-AWQ">Qwen2.5-VL-7B-Instruct-AWQ</option>
                   <option value="Qwen/Qwen3-VL-8B-Instruct-FP8">Qwen3-VL-8B-Instruct-FP8</option>
+                  <option value="Qwen/Qwen3-VL-8B-Instruct-AWQ">Qwen3-VL-8B-Instruct-AWQ</option>
                 </>
               ) : (
                 <>

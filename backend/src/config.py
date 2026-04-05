@@ -47,6 +47,8 @@ class Config:
         self.VLLM_BASE: str = os.getenv("VLLM_BASE", "http://127.0.0.1:8440")
         # Qwen3 專用 vLLM endpoint（若未設定則回退 VLLM_BASE）
         self.QWEN3_VLLM_BASE: str = os.getenv("QWEN3_VLLM_BASE", "http://host.docker.internal:8441")
+        # Qwen3-AWQ 專用 vLLM endpoint（若未設定則回退 QWEN3_VLLM_BASE 再回退 VLLM_BASE）
+        self.QWEN3_AWQ_VLLM_BASE: str = os.getenv("QWEN3_AWQ_VLLM_BASE", "").strip()
         self.VLLM_API_KEY: Optional[str] = os.getenv("VLLM_API_KEY") or None
         self.VLLM_REQUEST_TIMEOUT: int = int(os.getenv("VLLM_REQUEST_TIMEOUT", "600"))
         # 送 vLLM 的 JPEG 壓縮品質（降低 payload、縮短 api_total_time）
@@ -61,6 +63,8 @@ class Config:
         )
         self.VLM_COMPOSE_FILE: str = os.getenv("VLM_COMPOSE_FILE", "").strip()
         self.VLM_COMPOSE_PROJECT_DIR: str = os.getenv("VLM_COMPOSE_PROJECT_DIR", "").strip()
+        # backend 在容器內執行 compose 時，若需讓 daemon 以主機路徑解析 bind mount，可指定 host 專用 project dir
+        self.VLM_COMPOSE_PROJECT_DIR_HOST: str = os.getenv("VLM_COMPOSE_PROJECT_DIR_HOST", "").strip()
         # 須與主機 docker compose 專案名一致；否則 --project-directory 掛在 /vlm-compose-host 時預設名會變成 vlm-compose-host，stop/up 找不到容器
         self.VLM_COMPOSE_PROJECT_NAME: str = os.getenv("VLM_COMPOSE_PROJECT_NAME", "").strip()
         # 選 vLLM profile 時是否一併 docker stop ollama（單卡時釋放 VRAM；若需同時用 RAG「回答」依賴 Ollama LLM 請設 false）

@@ -30,7 +30,7 @@ VLM_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "Ollama · qwen2.5vl:latest",
         "model_type": "qwen",
         "qwen_model": "qwen2.5vl:latest",
-        "stop_services": ("vllm", "vllm-qwen3"),
+        "stop_services": ("vllm", "vllm-qwen3", "vllm-qwen3-awq"),
         "start_services": ("ollama",),
         "ready_check": "ollama_qwen",
     },
@@ -38,7 +38,7 @@ VLM_PROFILES: Dict[str, Dict[str, Any]] = {
         "label": "vLLM · Qwen2.5-VL-7B-Instruct-AWQ",
         "model_type": "vllm_qwen",
         "qwen_model": "Qwen/Qwen2.5-VL-7B-Instruct-AWQ",
-        "stop_services": ("vllm-qwen3",),
+        "stop_services": ("vllm-qwen3", "vllm-qwen3-awq"),
         "start_services": ("vllm",),
         "ready_check": "vllm_main",
     },
@@ -49,6 +49,14 @@ VLM_PROFILES: Dict[str, Dict[str, Any]] = {
         "stop_services": ("vllm",),
         "start_services": ("vllm-qwen3",),
         "ready_check": "vllm_qwen3",
+    },
+    "vllm_qwen3_awq": {
+        "label": "vLLM · Qwen3-VL-8B-Instruct-AWQ",
+        "model_type": "vllm_qwen",
+        "qwen_model": "Qwen/Qwen3-VL-8B-Instruct-AWQ",
+        "stop_services": ("vllm", "vllm-qwen3"),
+        "start_services": ("vllm-qwen3-awq",),
+        "ready_check": "vllm_qwen3_awq",
     },
 }
 
@@ -90,7 +98,10 @@ def profile_id_from_ui(model_type: str, qwen_model: str) -> Optional[str]:
         return "ollama_qwen25"
     if model_type == "vllm_qwen":
         m = (qwen_model or "").strip()
-        if "Qwen3" in m or "qwen3" in m.lower():
+        ml = m.lower()
+        if "qwen3" in ml and "awq" in ml:
+            return "vllm_qwen3_awq"
+        if "qwen3" in ml:
             return "vllm_qwen3"
         return "vllm_qwen25"
     return None
@@ -257,6 +268,9 @@ def orchestration_configured() -> bool:
 
 
 def _compose_project_dir() -> str:
+    host_pd = (getattr(config, "VLM_COMPOSE_PROJECT_DIR_HOST", None) or "").strip()
+    if host_pd:
+        return host_pd
     pd = (getattr(config, "VLM_COMPOSE_PROJECT_DIR", None) or "").strip()
     if pd:
         return pd
@@ -420,6 +434,7 @@ def readiness_from_probes(
     ollama_p: Dict[str, Any],
     vllm_main: Dict[str, Any],
     vllm_q3: Dict[str, Any],
+    vllm_q3_awq: Dict[str, Any],
 ) -> Tuple[bool, str]:
     """與 profile_ready 邏輯一致，但使用已快取的探測結果（避免 build_status_payload 重複 HTTP）。"""
     spec = VLM_PROFILES.get(selected_profile_id)
@@ -442,6 +457,10 @@ def readiness_from_probes(
         if not vllm_q3.get("ok"):
             return False, vllm_q3.get("error") or "vLLM(Qwen3)無法連線"
         return True, "vLLM(Qwen3) 已回應 /v1/models"
+    if check == "vllm_qwen3_awq":
+        if not vllm_q3_awq.get("ok"):
+            return False, vllm_q3_awq.get("error") or "vLLM(Qwen3-AWQ)無法連線"
+        return True, "vLLM(Qwen3-AWQ) 已回應 /v1/models"
     return False, "未實作 ready_check"
 
 
@@ -469,6 +488,16 @@ def profile_ready(profile_id: str) -> Tuple[bool, str]:
         if not pr["ok"]:
             return False, pr.get("error") or "vLLM(Qwen3)無法連線"
         return True, "vLLM(Qwen3) 已回應 /v1/models"
+    if check == "vllm_qwen3_awq":
+        base = (
+            getattr(config, "QWEN3_AWQ_VLLM_BASE", None)
+            or getattr(config, "QWEN3_VLLM_BASE", None)
+            or config.VLLM_BASE
+        )
+        pr = probe_vllm_models(base)
+        if not pr["ok"]:
+            return False, pr.get("error") or "vLLM(Qwen3-AWQ)無法連線"
+        return True, "vLLM(Qwen3-AWQ) 已回應 /v1/models"
     return False, "未實作 ready_check"
 
 
@@ -495,7 +524,7 @@ def _switch_worker(profile_id: str) -> None:
     _set_switch("loading", f"正在切換至 {spec['label']}…", profile_id, None)
     write_selected_profile_id(profile_id)
     try:
-        if profile_id.startswith("vllm_"):
+        if profile_id.startswith("vllm_") and getattr(config, "VLM_ORCHESTRATION_STOP_OLLAMA_ON_VLLM", False):
             unload_ollama_vlm_for_vllm_switch()
         if orchestration_configured():
             cf = (getattr(config, "VLM_COMPOSE_FILE", None) or "").strip()
@@ -586,6 +615,11 @@ def request_profile_switch(profile_id: str) -> Tuple[bool, str]:
 def build_status_payload() -> Dict[str, Any]:
     selected = read_selected_profile_id()
     q3_base = getattr(config, "QWEN3_VLLM_BASE", None) or config.VLLM_BASE
+    q3_awq_base = (
+        getattr(config, "QWEN3_AWQ_VLLM_BASE", None)
+        or getattr(config, "QWEN3_VLLM_BASE", None)
+        or config.VLLM_BASE
+    )
     # 選定 vLLM 時略過 Ollama /api/tags，避免單卡環境下不必要喚醒 Ollama；Ollama profile 仍會探測
     if selected.startswith("vllm_"):
         ollama_p = {
@@ -599,17 +633,21 @@ def build_status_payload() -> Dict[str, Any]:
         with ThreadPoolExecutor(max_workers=2) as pool:
             f_vllm_main = pool.submit(probe_vllm_models, config.VLLM_BASE)
             f_vllm_q3 = pool.submit(probe_vllm_models, q3_base)
+            f_vllm_q3_awq = pool.submit(probe_vllm_models, q3_awq_base)
             vllm_main = f_vllm_main.result()
             vllm_q3 = f_vllm_q3.result()
+            vllm_q3_awq = f_vllm_q3_awq.result()
     else:
-        with ThreadPoolExecutor(max_workers=3) as pool:
+        with ThreadPoolExecutor(max_workers=4) as pool:
             f_ollama = pool.submit(probe_ollama_tags)
             f_vllm_main = pool.submit(probe_vllm_models, config.VLLM_BASE)
             f_vllm_q3 = pool.submit(probe_vllm_models, q3_base)
+            f_vllm_q3_awq = pool.submit(probe_vllm_models, q3_awq_base)
             ollama_p = f_ollama.result()
             vllm_main = f_vllm_main.result()
             vllm_q3 = f_vllm_q3.result()
-    ready, ready_detail = readiness_from_probes(selected, ollama_p, vllm_main, vllm_q3)
+            vllm_q3_awq = f_vllm_q3_awq.result()
+    ready, ready_detail = readiness_from_probes(selected, ollama_p, vllm_main, vllm_q3, vllm_q3_awq)
     sw = get_switch_state()
     if sw.get("phase") == "loading":
         ready = False
@@ -635,6 +673,7 @@ def build_status_payload() -> Dict[str, Any]:
             "ollama": ollama_p,
             "vllm_main": vllm_main,
             "vllm_qwen3": vllm_q3,
+            "vllm_qwen3_awq": vllm_q3_awq,
         },
         "readiness": {
             "profile_id": selected,

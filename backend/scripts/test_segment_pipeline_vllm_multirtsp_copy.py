@@ -72,7 +72,7 @@ DEFAULT_BASE = os.environ.get("BACKEND_URL", "http://140.117.176.42:3000/api")
 DEFAULT_RTSP = os.environ.get("RTSP_URL", "rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream")
 API_KEY = os.environ.get("API_KEY") or ""
 # DEFAULT_VLLM_MODEL = "Qwen/Qwen2.5-VL-7B-Instruct-AWQ"
-DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct-FP8"
+DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct-AWQ"
 
 # 當錄製好一段影片後，會將所有相關資訊打包成這個物件，丟入佇列（Queue）
 @dataclass

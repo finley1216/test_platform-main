@@ -2,7 +2,19 @@
 
 {
   "events": {
+    "water_flood": false,
+    "fire": false,
+    "abnormal_attire_face_cover_at_entry": false,
+    "person_fallen_unmoving": false,
+    "double_parking_lane_block": false,
     "smoking_outside_zone": false,
+    "crowd_loitering": false,
+    "security_door_tamper": false,
+    "dangerous_items": false,
+    "violence": false,
+    "violence": false,
+    "dangerous_items": false,
+    "stay": false,
     "smoking": false,
 
     "reason": ""
@@ -10,8 +22,20 @@
 }
 
 ### 事件判斷標準（**一旦符合任一「明確徵象」就必須標記 true**；否則為 false）
-1) smoking_outside_zone（非管制區吸菸）：偵測越過欄杆進入黃色交叉區，站在區外抽菸者。 → **true**。
-2) smoking（手持香菸）：有人員手持香菸、抽菸等行為 → **true**。
+1) water_flood（水災）：車輛明顯濺水 / 標線被水覆蓋 / 大片連續積水 → **true**。
+2) fire（火災）：可見火焰或持續濃煙竄出 → **true**。
+3) abnormal_attire_face_cover_at_entry（異常著裝/遮臉入場）：門禁/閘機畫面中，臉被硬質裝備（如安全帽）遮擋仍嘗試通行 → **true**。
+4) person_fallen_unmoving（人員倒地不起）：有人躺/倒於地面，且連續兩張以上影格姿勢不變 → **true**。
+5) double_parking_lane_block（併排停車/車道阻塞）：車道/出入口並排兩輛以上造成通行縮減/受阻 → **true**。
+6) smoking_outside_zone（非管制區吸菸）：偵測越過欄杆進入黃色交叉區，站在區外抽菸者。 → **true**。
+7) crowd_loitering（聚眾逗留）：同位置 ≥3 人在連續影格位置基本不變或樓梯旁多人閒坐（單張影像不足則 false） → **true**。
+8) security_door_tamper（突破安全門）：反覆拉門把/推門縫/對鎖孔操作或操作「安全門/禁止進入」之門 → **true**。
+9) dangerous_items（持有危險武器）：人員手持危險武器，手持槍械，可能涉及危險物品。 → **true**。
+10) violence（暴力行為）：企圖攻擊他人或造成物理性衝突 → **true**。
+11) violence（暴力行為）：企圖攻擊他人或造成物理性衝突、持械威脅等 → **true**。
+12) dangerous_items（危險物品）：可辨識之刀械、槍械、爆裂物等危險物品 → **true**。
+13) stay（坐等停留）：有人盤坐於階梯或圍牆 → **true**。
+14) smoking（手持香菸）：有人員手持香菸、抽菸等行為 → **true**。
 
 ### 決斷與一致性
 - 觀察到明確徵象就設 **true**；否則 **false**。
