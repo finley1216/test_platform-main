@@ -938,7 +938,7 @@ class AnalysisService:
         labels: str = "person,car",
         every_sec: float = 2.0,
         score_thr: float = 0.25,
-        yolo_batch_size: int = 20,
+        yolo_batch_size: int = 5,
     ) -> List[Dict]:
         # print(
         #     "[API][infer_segment_yolo_batch][INPUT] "
@@ -968,7 +968,7 @@ class AnalysisService:
         labels: str,
         every_sec: float,
         score_thr: float,
-        batch_size: int = 20,
+        batch_size: int = 5,
     ) -> List[Dict]:
 
         if not seg_paths:
