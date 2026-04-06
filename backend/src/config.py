@@ -51,6 +51,35 @@ class Config:
         self.QWEN3_AWQ_VLLM_BASE: str = os.getenv("QWEN3_AWQ_VLLM_BASE", "").strip()
         self.VLLM_API_KEY: Optional[str] = os.getenv("VLLM_API_KEY") or None
         self.VLLM_REQUEST_TIMEOUT: int = int(os.getenv("VLLM_REQUEST_TIMEOUT", "600"))
+        # Video Direct：送 vLLM 前是否用 ffprobe 印出該影片檔的時長／FPS／容器標示的 nb_frames（實際取樣幀數仍由 vLLM 內部決定）
+        self.VLLM_VIDEO_FFPROBE_LOG: bool = os.getenv("VLLM_VIDEO_FFPROBE_LOG", "true").lower() in (
+            "true",
+            "1",
+            "yes",
+        )
+        # Video Direct：在 vLLM 請求的 video_url 附帶 num_frames（引擎內均勻取樣）。優先序見 resolve_vllm_video_direct_num_frames。
+        _vnf = os.getenv("VLLM_VIDEO_DIRECT_NUM_FRAMES", "").strip()
+        try:
+            self.VLLM_VIDEO_DIRECT_NUM_FRAMES: Optional[int] = int(_vnf) if _vnf else None
+            if self.VLLM_VIDEO_DIRECT_NUM_FRAMES is not None and self.VLLM_VIDEO_DIRECT_NUM_FRAMES <= 0:
+                self.VLLM_VIDEO_DIRECT_NUM_FRAMES = None
+        except ValueError:
+            self.VLLM_VIDEO_DIRECT_NUM_FRAMES = None
+        _vsf = os.getenv("VLLM_VIDEO_DIRECT_SAMPLE_FPS", "5").strip().lower()
+        if _vsf in ("", "none", "off", "false", "0"):
+            self.VLLM_VIDEO_DIRECT_SAMPLE_FPS: Optional[float] = None
+        else:
+            try:
+                self.VLLM_VIDEO_DIRECT_SAMPLE_FPS = float(_vsf)
+                if self.VLLM_VIDEO_DIRECT_SAMPLE_FPS <= 0:
+                    self.VLLM_VIDEO_DIRECT_SAMPLE_FPS = None
+            except ValueError:
+                self.VLLM_VIDEO_DIRECT_SAMPLE_FPS = 5.0
+        self.VLLM_VIDEO_DIRECT_MAX_FRAMES: int = max(1, int(os.getenv("VLLM_VIDEO_DIRECT_MAX_FRAMES", "256")))
+        # Video Direct：chat/completions 的 max_tokens（長 JSON 若打到上限會 finish_reason=length、內容被截斷）
+        self.VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS: int = max(
+            256, int(os.getenv("VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", "4096"))
+        )
         # 送 vLLM 的 JPEG 壓縮品質（降低 payload、縮短 api_total_time）
         self.VLLM_JPEG_QUALITY: int = int(os.getenv("VLLM_JPEG_QUALITY", "70"))
         # 非同步批次時同時在飛的 HTTP 數上限（應 ≤ vLLM --max-num-seqs）

@@ -116,8 +116,10 @@ services:
       --trust-remote-code
       --dtype half
       --quantization awq_marlin
+      --max-num-seqs 16
+      --enable-chunked-prefill
       --gpu-memory-utilization ${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.7}
-      --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-16384}
+      --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-10240}
       --allowed-local-media-path /app/segment
 
   # Qwen3-VL（host network，預設主機 8441）— max context 由 QWEN3_MAX_MODEL_LEN 決定，與上方 vllm 的 56000 無關。
@@ -181,6 +183,8 @@ services:
       - TRANSFORMERS_CACHE=/root/.cache/huggingface
       - TRANSFORMERS_OFFLINE=${QWEN3_AWQ_OFFLINE:-0}
       - HF_HUB_OFFLINE=${QWEN3_AWQ_OFFLINE:-0}
+      # 設為 DEBUG 可在 logs 看到較多引擎內部訊息（量大）；預設 INFO
+      - VLLM_LOGGING_LEVEL=${VLLM_LOGGING_LEVEL:-INFO}
     volumes:
       - ${HF_CACHE_HOST:-${HOME}/.cache/huggingface}:/root/.cache/huggingface
       - ./backend/segment:/app/segment:ro
@@ -201,7 +205,9 @@ services:
       --trust-remote-code
       --dtype half
       --gpu-memory-utilization ${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.7}
-      --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-16384}
+      --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-10240}
+      --max-num-seqs 16
+      --enable-chunked-prefill
       --allowed-local-media-path /app/segment
 
   # PostgreSQL Database with pgvector extension
@@ -302,6 +308,11 @@ services:
       # 遠端 vLLM 批次同時 HTTP 連線數（預設 8）；設 1 則逐筆送，易拖慢 pipeline
       - VLLM_BATCH_MAX_WORKERS=${VLLM_BATCH_MAX_WORKERS:-8}
       - VLLM_API_KEY=${VLLM_API_KEY:-}
+      # Video Direct：每段影片送 vLLM 的均勻取樣幀數 = ceil(segment_duration × SAMPLE_FPS)，上限 MAX_FRAMES
+      - VLLM_VIDEO_DIRECT_SAMPLE_FPS=${VLLM_VIDEO_DIRECT_SAMPLE_FPS:-5}
+      - VLLM_VIDEO_DIRECT_MAX_FRAMES=${VLLM_VIDEO_DIRECT_MAX_FRAMES:-256}
+      - VLLM_VIDEO_DIRECT_NUM_FRAMES=${VLLM_VIDEO_DIRECT_NUM_FRAMES:-}
+      - VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS=${VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS:-4096}
       # --- VLM 自動編排（釋放 VRAM：例如切到 Qwen2.5 時 stop vllm-qwen3 再 up vllm）---
       # .env 須設 VLM_COMPOSE_PROJECT_NAME=與主機 compose 專案名相同（例 test_platform-main），否則 stop 會找不到容器。
       # 預設 false。要啟用請在 .env 設 VLM_ORCHESTRATION_ENABLED=true，並取消註解下方 docker.sock + vlm-compose-host，

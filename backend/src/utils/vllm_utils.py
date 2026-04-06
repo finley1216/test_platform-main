@@ -2,12 +2,110 @@
 """vLLM 推論工具。提供與 ollama_utils 相容的 _vllm_chat 介面，供 analysis_service.infer_segment_vllm 使用。"""
 import json
 import copy
+import re
+import subprocess
 import requests
 import concurrent.futures
 from pathlib import Path
-from typing import List, Dict, Tuple, Optional
+from typing import List, Dict, Tuple, Optional, Any
 
 from src.config import config
+
+
+def _parse_fraction_fps(s: Optional[str]) -> Optional[float]:
+    if not s or s in ("0/0", "N/A"):
+        return None
+    m = re.match(r"^(\d+(?:\.\d+)?)/(\d+(?:\.\d+)?)$", str(s).strip())
+    if m:
+        a, b = float(m.group(1)), float(m.group(2))
+        return (a / b) if b else None
+    try:
+        return float(s)
+    except ValueError:
+        return None
+
+
+def _log_ffprobe_video_stats(video_path: str, model_name: str) -> None:
+    """送 vLLM 前印出影片檔本身資訊（非 vLLM 內部實際取樣幀數）。"""
+    if not getattr(config, "VLLM_VIDEO_FFPROBE_LOG", True):
+        return
+    vp = Path(video_path).expanduser()
+    if not vp.is_absolute():
+        vp = (Path.cwd() / vp).resolve()
+    if not vp.is_file():
+        print(f"--- [vLLM-VideoDirect][ffprobe] 略過（非檔案）: {video_path} ---", flush=True)
+        return
+    cmd = [
+        "ffprobe",
+        "-v",
+        "error",
+        "-select_streams",
+        "v:0",
+        "-show_entries",
+        "stream=codec_name,width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+        "-show_entries",
+        "format=duration,size,bit_rate",
+        "-of",
+        "json",
+        str(vp),
+    ]
+    try:
+        proc = subprocess.run(cmd, capture_output=True, text=True, timeout=45)
+    except FileNotFoundError:
+        print(
+            "--- [vLLM-VideoDirect][ffprobe] 未安裝 ffprobe，無法印出影片幀資訊 ---",
+            flush=True,
+        )
+        return
+    except subprocess.TimeoutExpired:
+        print(f"--- [vLLM-VideoDirect][ffprobe] 逾時: {vp} ---", flush=True)
+        return
+    if proc.returncode != 0 or not (proc.stdout or "").strip():
+        err = (proc.stderr or proc.stdout or "").strip()[:300]
+        print(f"--- [vLLM-VideoDirect][ffprobe] 失敗 rc={proc.returncode} {err} ---", flush=True)
+        return
+    try:
+        meta: Dict[str, Any] = json.loads(proc.stdout)
+    except json.JSONDecodeError:
+        print(f"--- [vLLM-VideoDirect][ffprobe] JSON 解析失敗: {vp} ---", flush=True)
+        return
+    streams = meta.get("streams") or []
+    st0 = streams[0] if streams else {}
+    fmt = meta.get("format") or {}
+    dur_s = st0.get("duration") or fmt.get("duration")
+    try:
+        duration_sec = float(dur_s) if dur_s not in (None, "N/A", "") else None
+    except (TypeError, ValueError):
+        duration_sec = None
+    fps = _parse_fraction_fps(st0.get("r_frame_rate")) or _parse_fraction_fps(st0.get("avg_frame_rate"))
+    nb = st0.get("nb_frames")
+    nb_int: Optional[int] = None
+    if nb not in (None, "N/A", ""):
+        try:
+            nb_int = int(float(nb))
+        except (TypeError, ValueError):
+            nb_int = None
+    est_frames: Optional[int] = None
+    if duration_sec is not None and fps is not None and fps > 0:
+        est_frames = max(1, int(round(duration_sec * fps)))
+    size_b = fmt.get("size")
+    print(
+        "--- [vLLM-VideoDirect][ffprobe] "
+        f"file={vp.name} path={vp} | "
+        f"codec={st0.get('codec_name')} {st0.get('width')}x{st0.get('height')} | "
+        f"duration_sec={duration_sec} | fps_r={st0.get('r_frame_rate')} fps_avg={st0.get('avg_frame_rate')} "
+        f"-> fps_parsed={fps} | "
+        f"nb_frames_container={nb_int if nb_int is not None else nb} | "
+        f"est_frames_duration_x_fps={est_frames} | "
+        f"size_bytes={size_b} | "
+        f"model={model_name} ---",
+        flush=True,
+    )
+    print(
+        "--- [vLLM-VideoDirect][hint] 上列為「影片檔」層級；若請求已附 video_url.num_frames 則由該值決定均勻取樣幀數，"
+        "否則由 vLLM 預設（常見約 32）。可設 VLLM_LOGGING_LEVEL=DEBUG 看引擎 log。 ---",
+        flush=True,
+    )
 
 
 def _resolve_vllm_base(model_name: str) -> str:
@@ -43,14 +141,20 @@ def _sanitize_openai_payload_for_log(payload: Dict) -> Dict:
         if not isinstance(content, list):
             continue
         for part in content:
-            if part.get("type") != "image_url":
-                continue
-            image_obj = part.get("image_url")
-            if not isinstance(image_obj, dict):
-                continue
-            url = image_obj.get("url")
-            if isinstance(url, str) and url.startswith("data:image"):
-                image_obj["url"] = "<data:image;base64,...(omitted)>"
+            ptype = part.get("type")
+            if ptype == "image_url":
+                image_obj = part.get("image_url")
+                if not isinstance(image_obj, dict):
+                    continue
+                url = image_obj.get("url")
+                if isinstance(url, str) and url.startswith("data:image"):
+                    image_obj["url"] = "<data:image;base64,...(omitted)>"
+            elif ptype == "video_url":
+                vo = part.get("video_url")
+                if isinstance(vo, dict) and isinstance(vo.get("url"), str) and len(vo["url"]) > 120:
+                    vo = dict(vo)
+                    vo["url"] = vo["url"][:80] + "...(omitted)"
+                    part["video_url"] = vo
     return masked
 
 
@@ -286,6 +390,7 @@ def _vllm_chat_video_direct(
     video_path: str,
     stream: bool = False,
     enable_thinking: Optional[bool] = None,
+    video_num_frames: Optional[int] = None,
 ) -> str:
     """
     影片直送 vLLM（不做本地截圖取幀）。
@@ -306,17 +411,25 @@ def _vllm_chat_video_direct(
         if isinstance(text, list):
             # 呼叫端已經給多模態內容時，不覆蓋
             break
+        # 註：部分 vLLM 版本對 OpenAI 相容欄位 video_url.num_frames 會忽略（prompt_tokens 與省略時相同）。
+        # 若要以伺服器端統一控制影片取樣，請在 vLLM 啟動參數加 --mm-processor-kwargs（見 docker-compose）。
+        # Qwen3-VL 在 vLLM 0.17.x 通常用 fps；Qwen2.5-VL 等可能用 num_frames，請依映像／原始碼調整。
+        # 另可改用截圖路徑（segment_pipeline_multipart + sampling_fps）在後端控制取樣。
+        video_obj: Dict[str, Any] = {"url": video_uri}
+        if video_num_frames is not None and int(video_num_frames) > 0:
+            video_obj["num_frames"] = int(video_num_frames)
         msg["content"] = [
             {"type": "text", "text": str(text)},
-            {"type": "video_url", "video_url": {"url": video_uri}},
+            {"type": "video_url", "video_url": video_obj},
         ]
         break
 
+    _max_out = int(getattr(config, "VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", 4096) or 4096)
     payload = {
         "model": model_name,
         "messages": payload_messages,
         "stream": stream,
-        "max_tokens": 2048,
+        "max_tokens": max(256, _max_out),
         "temperature": 0.1,
     }
     if enable_thinking is not None and _is_qwen3_model(model_name):
@@ -329,10 +442,12 @@ def _vllm_chat_video_direct(
     if getattr(config, "VLLM_API_KEY", None):
         headers["Authorization"] = f"Bearer {config.VLLM_API_KEY}"
 
+    _nf_log = f", num_frames={int(video_num_frames)}" if video_num_frames else ""
     print(
-        f"--- [vLLM-VideoDirect] POST {url} (model={model_name}, video_path={video_path}) ---",
+        f"--- [vLLM-VideoDirect] POST {url} (model={model_name}, video_path={video_path}{_nf_log}) ---",
         flush=True,
     )
+    _log_ffprobe_video_stats(video_path, model_name)
     try:
         payload_for_log = _sanitize_openai_payload_for_log(payload)
         print(
@@ -345,6 +460,20 @@ def _vllm_chat_video_direct(
         print(f"--- [vLLM-VideoDirect] HTTP {r.status_code} ---", flush=True)
         r.raise_for_status()
         data = r.json()
+        usage = data.get("usage")
+        if isinstance(usage, dict):
+            print(
+                f"[usage] prompt_tokens={usage.get('prompt_tokens')} "
+                f"completion_tokens={usage.get('completion_tokens')} "
+                f"total_tokens={usage.get('total_tokens')} "
+                f"video={Path(video_path).name}",
+                flush=True,
+            )
+        else:
+            print(
+                f"[usage] (無 usage 欄位，無法用 token 反推視覺幀數) keys={list(data.keys())}",
+                flush=True,
+            )
         choices = data.get("choices") or []
         if not choices:
             return ""
@@ -382,6 +511,7 @@ def _vllm_chat_batch_video_direct(
             video_path=req_item.get("video_path", ""),
             stream=False,
             enable_thinking=req_enable_thinking,
+            video_num_frames=req_item.get("video_num_frames"),
         )
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=mw) as executor:

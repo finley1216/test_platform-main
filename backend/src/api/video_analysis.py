@@ -23,7 +23,7 @@ import torch
 
 from src.config import config
 from src.services.video_service import VideoService
-from src.services.analysis_service import AnalysisService
+from src.services.analysis_service import AnalysisService, resolve_vllm_video_direct_num_frames
 from src.utils.video_utils import _fmt_hms
 
 # 設定日誌
@@ -576,12 +576,14 @@ def segment_pipeline_multipart_vllm_video_direct(
     save_json: bool = Form(True),
     save_basename: str = Form(None),
     qwen_inference_batch_size: Optional[int] = Form(None),
+    video_num_frames: Optional[int] = Form(None),
+    video_sample_fps: Optional[float] = Form(None),
 ):
     """
     新流程：
     1) segment_pipeline_multipart 同樣的輸入與切片流程
     2) 僅跑 vLLM（不跑 YOLO）
-    3) vLLM 走影片直送（不在後端先截圖）
+    3) vLLM 走影片直送（不在後端先截圖）；可附帶 video_url.num_frames 或依每秒取樣幀數換算。
     """
     global active_requests_counter
     active_requests_counter += 1
@@ -656,10 +658,17 @@ def segment_pipeline_multipart_vllm_video_direct(
             event_detection_prompt=event_detection_prompt,
             summary_prompt=summary_prompt,
             qwen_inference_batch_size=qwen_inference_batch_size,
+            video_num_frames=video_num_frames,
+            video_sample_fps=video_sample_fps,
         )
 
         t2 = time.time()
         mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
+        _vd_nf = resolve_vllm_video_direct_num_frames(
+            segment_duration,
+            request_num_frames=video_num_frames,
+            request_sample_fps=video_sample_fps,
+        )
         resp = {
             "model_type": "vllm_qwen3_video_direct",
             "total_segments": len(results),
@@ -673,6 +682,9 @@ def segment_pipeline_multipart_vllm_video_direct(
                 "strict_mode": strict_segmentation,
                 "video_direct": True,
                 "sampling_fps_ignored": sampling_fps,
+                "video_direct_num_frames": _vd_nf,
+                "video_direct_sample_fps_request": video_sample_fps,
+                "video_direct_num_frames_request": video_num_frames,
             },
         }
 

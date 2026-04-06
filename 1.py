@@ -9,6 +9,7 @@ import argparse
 import json
 import mimetypes
 import os
+import sys
 from copy import deepcopy
 from pathlib import Path
 
@@ -19,7 +20,7 @@ DEFAULT_VIDEO = (
 )
 DEFAULT_BASE_URL = os.environ.get("BACKEND_URL", "http://140.117.176.42:3000/api")
 DEFAULT_API_KEY = os.environ.get("API_KEY") or os.environ.get("MY_API_KEY", "")
-DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct-FP8"
+DEFAULT_VLLM_MODEL = "Qwen/Qwen3-VL-8B-Instruct-AWQ"
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -38,6 +39,18 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--save-json", action="store_true", help="要求 API 端存 json")
     parser.add_argument("--timeout", type=float, default=1200.0, help="HTTP timeout 秒數")
+    parser.add_argument(
+        "--video-sample-fps",
+        type=float,
+        default=None,
+        help="覆寫後端：每段內每秒取樣幀數（與 --segment-duration 相乘後送 vLLM num_frames）；不填則用後端設定",
+    )
+    parser.add_argument(
+        "--video-num-frames",
+        type=int,
+        default=None,
+        help="覆寫後端：每段固定送 vLLM 的 num_frames（優先於 --video-sample-fps）",
+    )
     return parser
 
 
@@ -67,6 +80,10 @@ def main() -> None:
     }
     if args.qwen_inference_batch_size is not None:
         data["qwen_inference_batch_size"] = str(args.qwen_inference_batch_size)
+    if args.video_sample_fps is not None:
+        data["video_sample_fps"] = str(args.video_sample_fps)
+    if args.video_num_frames is not None:
+        data["video_num_frames"] = str(args.video_num_frames)
 
     print("=== 開始呼叫 API ===")
     print(f"POST {endpoint}")
@@ -90,17 +107,32 @@ def main() -> None:
     response = _post_once(endpoint, data)
 
     print(f"\n=== HTTP {response.status_code} ===")
-    try:
-        payload = response.json()
-    except ValueError:
-        print(response.text)
+
+    def _print_non_json_body() -> None:
+        body = (response.text or "").strip()
+        print(body[:12000] if body else "(empty body)")
+
+    if response.status_code >= 400:
+        try:
+            err_obj = response.json()
+            print(json.dumps(err_obj, ensure_ascii=False, indent=2))
+        except (json.JSONDecodeError, ValueError, requests.exceptions.JSONDecodeError):
+            _print_non_json_body()
+        if response.status_code in (502, 503, 504):
+            print(
+                "\n提示：502/503/504 多為 nginx 與上游 API 之間問題（backend 未起、當掉、"
+                "或 proxy_read_timeout 太短）。請在伺服器查 backend / vLLM 容器與 nginx error log。",
+                file=sys.stderr,
+            )
         response.raise_for_status()
         return
 
-    if response.status_code >= 400:
-        print(json.dumps(payload, ensure_ascii=False, indent=2))
-        response.raise_for_status()
-        return
+    try:
+        payload = response.json()
+    except (json.JSONDecodeError, ValueError, requests.exceptions.JSONDecodeError):
+        _print_non_json_body()
+        print("\n錯誤：狀態碼為成功但回應不是 JSON。", file=sys.stderr)
+        raise SystemExit(1) from None
 
     print("=== 結果摘要 ===")
     print(f"model_type: {payload.get('model_type')}")

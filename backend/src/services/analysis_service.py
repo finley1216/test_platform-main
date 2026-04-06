@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 import os
 import gc
+import math
 import time
 import cv2
 import json
@@ -20,6 +21,35 @@ from src.utils.ollama_utils import (
     _clean_summary_text, _extract_first_json_and_tail
 )
 from src.config import config
+
+
+def resolve_vllm_video_direct_num_frames(
+    segment_duration: float,
+    request_num_frames: Optional[int] = None,
+    request_sample_fps: Optional[float] = None,
+) -> Optional[int]:
+    """
+    決定送給 vLLM video_url 的 num_frames（引擎內對該短片均勻取樣）。
+    優先序：請求 num_frames > 請求 sample_fps×段長 > 設定檔 NUM_FRAMES > 設定檔 SAMPLE_FPS×段長。
+    """
+    cap = max(1, int(getattr(config, "VLLM_VIDEO_DIRECT_MAX_FRAMES", 256)))
+    nf: Optional[int] = None
+    if request_num_frames is not None and int(request_num_frames) > 0:
+        nf = int(request_num_frames)
+    elif request_sample_fps is not None and float(request_sample_fps) > 0 and segment_duration > 0:
+        nf = math.ceil(float(segment_duration) * float(request_sample_fps))
+    elif getattr(config, "VLLM_VIDEO_DIRECT_NUM_FRAMES", None):
+        v = int(config.VLLM_VIDEO_DIRECT_NUM_FRAMES)
+        if v > 0:
+            nf = v
+    else:
+        sfps = getattr(config, "VLLM_VIDEO_DIRECT_SAMPLE_FPS", None)
+        if sfps and float(sfps) > 0 and segment_duration > 0:
+            nf = math.ceil(float(segment_duration) * float(sfps))
+    if nf is None:
+        return None
+    return max(1, min(cap, int(nf)))
+
 
 try:
     from src.utils.vllm_utils import _vllm_chat
@@ -1336,6 +1366,7 @@ class AnalysisService:
         path_strs: List[str],
         event_prompt: str,
         summary_prompt: str,
+        video_num_frames: Optional[int] = None,
     ) -> List[Tuple[Dict, str]]:
         """
         vLLM 批次推論（影片直送，不做截圖取幀）。
@@ -1347,6 +1378,12 @@ class AnalysisService:
         qwen3_disable_thinking = ("qwen3" in (model_name or "").lower())
         if not HAS_VLLM or _vllm_chat_batch_video_direct is None:
             return [({"error": "vLLM 不可用"}, "")] * len(path_strs)
+
+        if video_num_frames is not None:
+            print(
+                f"--- [vLLM VideoDirect Batch] video_url.num_frames={video_num_frames} ---",
+                flush=True,
+            )
 
         instruction = (
             f"{event_prompt}\n\n"
@@ -1377,6 +1414,7 @@ class AnalysisService:
                     "messages": combined_msgs,
                     "video_path": path,
                     "enable_thinking": False if qwen3_disable_thinking else True,
+                    "video_num_frames": video_num_frames,
                 }
             )
             valid_indices.append(i)
@@ -1430,12 +1468,19 @@ class AnalysisService:
         event_detection_prompt: str,
         summary_prompt: str,
         qwen_inference_batch_size: Optional[int] = None,
+        video_num_frames: Optional[int] = None,
+        video_sample_fps: Optional[float] = None,
     ) -> List[Dict]:
         """
         新流程：僅跑 infer_segment_vllm_batch_video_direct（不跑 YOLO）。
         """
         results: List[Dict] = []
         vlm_batch_size = qwen_inference_batch_size or 10
+        resolved_nf = resolve_vllm_video_direct_num_frames(
+            segment_duration,
+            request_num_frames=video_num_frames,
+            request_sample_fps=video_sample_fps,
+        )
 
         class Req:
             def __init__(self, **kwargs):
@@ -1451,6 +1496,7 @@ class AnalysisService:
                 path_strs=path_strs,
                 event_prompt=event_detection_prompt,
                 summary_prompt=summary_prompt,
+                video_num_frames=resolved_nf,
             )
             batch_elapsed_sec = round(time.time() - t_batch_start, 2)
 
