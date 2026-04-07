@@ -211,6 +211,7 @@ def _vllm_chat(
         "max_tokens": 2048,
         "temperature": 0.1,
     }
+    
     if enable_thinking is not None and _is_qwen3_model(model_name):
         payload["enable_thinking"] = bool(enable_thinking)
 

@@ -28,6 +28,7 @@ chmod +x scripts/restart_backend_worker_on_vram_high.sh   # 若尚未可執行
 自動搜尋：--auto-find-streams 以二分搜尋找最大可行路數（可搭配 --fixture-mp4 縮短時間）。
 """
 import argparse
+import json
 import math
 import os
 import queue
@@ -210,6 +211,15 @@ def upload_segment_to_api_vllm(
         "summary_prompt": summary_p,
         "save_json": "True",
     }
+    request_debug = {
+        "method": "POST",
+        "url": url,
+        "headers": headers,
+        "data": data,
+        "files": {"file": {"filename": file_path.name, "content_type": "video/mp4"}},
+        "timeout": {"connect": timeout[0], "read": timeout[1]} if isinstance(timeout, tuple) and len(timeout) == 2 else timeout,
+    }
+    print("[API-REQUEST]\n" + json.dumps(request_debug, ensure_ascii=False, indent=2), flush=True)
     with open(file_path, "rb") as f:
         files = {"file": (file_path.name, f, "video/mp4")}
         post = session.post if session is not None else requests.post
