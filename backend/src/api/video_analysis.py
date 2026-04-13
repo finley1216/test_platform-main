@@ -190,6 +190,7 @@ def segment_pipeline_multipart(
     strict_segmentation: bool = Form(False),
     yolo_labels: Optional[str] = Form(None),
     yolo_every_sec: float = Form(2.0),
+    yolo_num_frames: int = Form(5),
     yolo_score_thr: float = Form(0.25),
     event_detection_prompt: str = Form(""),
     summary_prompt: str = Form(""),
@@ -280,7 +281,8 @@ def segment_pipeline_multipart(
             results = AnalysisService.run_full_pipeline(
                 seg_files, total_duration, segment_duration, overlap,
                 model_type, qwen_model, frames_per_segment, target_short, sampling_fps,
-                event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr
+                event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr,
+                yolo_num_frames if yolo_num_frames > 0 else None,
             )
         except torch.cuda.OutOfMemoryError as e:
             print(f"--- [API] req_id={req_id} CUDA OOM ---", flush=True)
@@ -401,162 +403,173 @@ def segment_pipeline_multipart(
         except Exception:
             pass
 
-# 批次端點：配合 test_segment_pipeline_rtsp_batch.py 使用
-@router.post("/v1/segment_pipeline_batch")
-def segment_pipeline_batch(
+@router.post("/v1/segment_pipeline_multipart_batch")
+async def segment_pipeline_multipart_batch(
     request: Request,
-    files: List[UploadFile] = File(...),
+    model_type: str = Form(...),
+    files: List[UploadFile] = File(...), # 核心改動：改為接收檔案清單
+    video_url: str = Form(None),         # 保留參數
+    video_id: str = Form(None),          # 保留參數
     segment_duration: float = Form(10.0),
-    qwen_model: str = Form("Qwen/Qwen2.5-VL-7B-Instruct"),
+    overlap: float = Form(0.0),
+    qwen_model: str = Form("Qwen/Qwen3-VL-8B-Instruct-AWQ"),
     frames_per_segment: int = Form(5),
     target_short: int = Form(432),
     sampling_fps: Optional[float] = Form(None),
+    strict_segmentation: bool = Form(False),
     yolo_labels: Optional[str] = Form(None),
     yolo_every_sec: float = Form(2.0),
+    yolo_num_frames: int = Form(5),
     yolo_score_thr: float = Form(0.25),
     event_detection_prompt: str = Form(""),
     summary_prompt: str = Form(""),
-    save_json: bool = Form(False),
-    qwen_inference_batch_size: Optional[int] = Form(None),
-    yolo_batch_size: Optional[int] = Form(None),
+    save_json: bool = Form(True),
+    save_basename: str = Form(None),
 ):
-
-    # 全域計數器，用來監控目前有多少個請求正在處理中。
     global active_requests_counter
     active_requests_counter += 1
+    req_id = uuid.uuid4().hex[:12]
     t0 = time.time()
-
-    # 記錄處理前的系統記憶體使用量（MB），用於後續診斷。
+    t1 = None 
     mem_before = psutil.Process().memory_info().rss / (1024 * 1024)
+    client_host = request.client.host if request.client else "?"
+    
+    try:
+        vm_pct = psutil.virtual_memory().percent
+    except Exception:
+        vm_pct = -1.0
 
-    # 限制單次 API 請求最多只能處理的影片片段數，防止過載。
-    MAX_BATCH = 16
-    if len(files) > MAX_BATCH:
-        raise HTTPException(status_code=422, detail=f"最多上傳 {MAX_BATCH} 個檔案")
+    # --- [原始診斷日誌] ---
+    print(
+        f"--- [API] 收到批量 POST /v1/segment_pipeline_multipart_batch | req_id={req_id} | 檔案數={len(files)} "
+        f"| active_same_worker={active_requests_counter} | client={client_host} | rss_mb={mem_before:.1f} ---",
+        flush=True,
+    )
 
-    # 取得資料庫連線與 API 金鑰，以及預設的 event_detection_prompt 和 summary_prompt。
     get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
+
     if not event_detection_prompt or not event_detection_prompt.strip():
         event_detection_prompt = get_event_prompt()
     if not summary_prompt or not summary_prompt.strip():
         summary_prompt = get_summary_prompt()
 
-    temp_dir = None
-    seg_files: List[Path] = []
+    _print_ram_diagnosis(f"[START] req_id={req_id} 批量模式（處理檔案前）")
+
+    # 1. 處理上傳檔案 (取代原有的 prepare_segments 流程)
+    seg_files = []
+    # 與 segment_pipeline_multipart 對齊：批次檔案也落在 SEGMENT_DIR，避免 vLLM local media path 限制。
+    segment_root = Path(config.SEGMENT_DIR).resolve()
+    segment_root.mkdir(parents=True, exist_ok=True)
+    seg_dir_path = Path(tempfile.mkdtemp(prefix=f"batch_run_{req_id}_", dir=str(segment_root)))
+    stem = f"batch_{req_id}" # 定義一個統一的 stem
+
     try:
-
-        # 在系統中建立一個唯一的臨時資料夾，存放上傳的影片片段。
-        temp_dir = Path(tempfile.mkdtemp(prefix="segment_batch_"))
-
-        # 遍歷所有上傳的檔案，讀取二進位內容並寫入磁碟。這是為了讓後續的 OpenCV 或 FFmpeg 能透過路徑讀取影片。
-        for i, uf in enumerate(files):
-            content = uf.file.read()
+        # 將所有上傳的小影片存入臨時目錄
+        for idx, file in enumerate(files):
+            # 保持原始檔名或編號
+            filename = file.filename or f"seg_{idx}.mp4"
+            file_tmp_path = seg_dir_path / filename
+            
+            content = await file.read()
             if len(content) == 0:
-                raise HTTPException(status_code=400, detail=f"檔案 {i+1} 為空")
-            seg_path = temp_dir / f"segment_{i:03d}.mp4"
-            seg_path.write_bytes(content)
-            seg_files.append(seg_path)
+                logger.warning(f"--- [Upload Warning] 檔案 {filename} 為空 ---")
+            
+            with open(file_tmp_path, "wb") as f:
+                f.write(content)
+            seg_files.append(file_tmp_path)
+            del content
 
-        if not seg_files:
-            raise HTTPException(status_code=400, detail="無有效影片檔")
-
-        num_segments = len(seg_files)
-       
-        # 計算 VLM 一次需要處理的段數（未傳 qwen_inference_batch_size 則使用 MAX_BATCH）。
-        qwen_batch = qwen_inference_batch_size if qwen_inference_batch_size is not None else MAX_BATCH
-
-        # 計算每段影片需要處理的幀數（每 segment_duration 秒處理一幀）。
-        frames_per_seg = max(1, int(segment_duration / yolo_every_sec))
-
-        # 計算 YOLO 一次需要處理的幀數（num_segments * frames_per_seg）。
-        yolo_frame_batch = yolo_batch_size if yolo_batch_size is not None else (num_segments * frames_per_seg)
-
-        # 計算總影片長度（num_segments * segment_duration）。
-        total_duration = num_segments * segment_duration
-
-        # 記錄開始時間，用於計算整個處理過程的耗時。
+        # 2. 執行 Pipeline (跳過 VideoService.prepare_segments)
+        # 注意：total_duration 這裡估算為 檔案數 * segment_duration
+        total_duration = len(seg_files) * segment_duration
+        
+        print(f"--- [API] req_id={req_id} 開始執行批量分析 pipeline, 共 {len(seg_files)} 段 ---", flush=True)
         t1 = time.time()
+        
         try:
             results = AnalysisService.run_full_pipeline(
-                seg_files,
-                total_duration,
-                segment_duration,
-                0.0,
-                "qwen_hf",
-                qwen_model,
-                frames_per_segment,
-                target_short,
-                sampling_fps,
-                event_detection_prompt,
-                summary_prompt,
-                yolo_labels,
-                yolo_every_sec,
-                yolo_score_thr,
-                worker_count=4,
-                qwen_inference_batch_size=qwen_batch,
-                yolo_batch_size=yolo_frame_batch,
+                seg_files, total_duration, segment_duration, overlap,
+                model_type, qwen_model, frames_per_segment, target_short, sampling_fps,
+                event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr,
+                yolo_num_frames if yolo_num_frames > 0 else None,
             )
         except torch.cuda.OutOfMemoryError as e:
-            logger.error(f"--- [Batch Pipeline] CUDA OOM: {e} ---")
-            raise HTTPException(status_code=500, detail="GPU 記憶體不足")
-        except MemoryError as e:
-            logger.error(f"--- [Batch Pipeline] OOM: {e} ---")
-            raise HTTPException(status_code=500, detail="系統記憶體不足")
+            traceback.print_exc()
+            raise HTTPException(status_code=500, detail="CUDA Out of Memory")
         finally:
             AnalysisService.release_gpu_memory()
-
+        
         t2 = time.time()
         mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
-        logger.info(f"--- [Batch Pipeline] Time: {round(t2-t0, 2)}s, Mem Delta: {round(mem_after - mem_before, 2)}MB ---")
+        ok_count = sum(1 for r in results if r.get("success"))
+        wall_total = t2 - t0
+        
+        # --- [原始 SlowRequest 診斷] ---
+        if wall_total > 10.0 and t1 is not None:
+            proc_only = t2 - t1
+            print(
+                f"--- [API][SlowRequest] req_id={req_id} api_process_time={round(proc_only, 2)}s "
+                f"api_total_time={round(wall_total, 2)}s | success={ok_count}/{len(results)} ---",
+                flush=True,
+            )
 
-        stem = temp_dir.name
-
-        # 組合回傳結果
+        # 3. 封裝 Response (保留原始格式)
         resp = {
-            "model_type": "qwen_hf",
+            "model_type": model_type,
             "total_segments": len(results),
-            "success_segments": sum(1 for r in results if r.get("success")),
+            "success_segments": ok_count,
             "results": results,
             "process_time_sec": round(t2 - t1, 2),
-            "total_time_sec": round(t2 - t0, 2),
+            "total_time_sec": round(wall_total, 2),
             "stem": stem,
             "diagnostics": {
                 "mem_delta_mb": round(mem_after - mem_before, 2),
-                "batch_size": len(seg_files),
-                "qwen_inference_batch_size": qwen_batch,
-                "yolo_batch_size": yolo_frame_batch,
-            },
+                "batch_mode": True
+            }
         }
-        if save_json:
-            save_path = temp_dir / f"{stem}.json"
-            with open(save_path, "w", encoding="utf-8") as f:
-                json.dump(resp, f, ensure_ascii=False, indent=2)
-            resp["save_path"] = str(save_path)
 
-        # 如果資料庫連線成功，則將結果存入資料庫。
+        # 4. [原始存檔邏輯] - JSON 存檔
+        if save_json:
+            save_path_obj = seg_dir_path / (save_basename or f"{stem}.json")
+            with open(save_path_obj, "w", encoding="utf-8") as f:
+                json.dump(resp, f, ensure_ascii=False, indent=2)
+            resp["save_path"] = str(save_path_obj)
+
+        # 5. [原始存檔邏輯] - PostgreSQL 存檔
         if HAS_DB:
             from src.database import SessionLocal
             db = SessionLocal()
             try:
-                _save_results_to_postgres(db, results, stem)
+                _save_results_to_postgres(db, results, video_id or stem)
             finally:
                 db.close()
-        return JSONResponse(resp)
-    except HTTPException:
-        raise
+
+        # 6. [原始清理邏輯] - YOLO Crops 清理
+        if config.CLEANUP_YOLO_CROPS:
+            try:
+                AnalysisService.cleanup_yolo_object_crop_files(results, seg_dir_path)
+            except Exception as crop_clean_err:
+                logger.warning(f"--- object_crops 清理失敗: {crop_clean_err} ---")
+
+        # 7. 強制垃圾回收與快取清理
+        response_obj = JSONResponse(resp)
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+        return response_obj
+
     except Exception as e:
-        logger.error(f"--- [Batch Pipeline Error] {type(e).__name__}: {e} ---", exc_info=True)
-        raise HTTPException(status_code=500, detail=f"{type(e).__name__}: {str(e)}")
+        print(f"--- [API] req_id={req_id} 未預期錯誤 ---", flush=True)
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=str(e))
     finally:
         active_requests_counter -= 1
-        if temp_dir and temp_dir.exists():
-            try:
-                for p in seg_files:
-                    if p.exists():
-                        p.unlink()
-                temp_dir.rmdir()
-            except OSError:
-                pass
+        # 清理這批次產生的臨時影片檔案
+        if seg_dir_path.exists():
+            import shutil
+            shutil.rmtree(seg_dir_path, ignore_errors=True)
+
 
 
 @router.post("/v1/segment_pipeline_multipart_vllm_video_direct")
@@ -742,6 +755,7 @@ def segment_pipeline_rtsp(
     strict_segmentation: bool = Form(False),
     yolo_labels: Optional[str] = Form(None),
     yolo_every_sec: float = Form(2.0),
+    yolo_num_frames: int = Form(5),
     yolo_score_thr: float = Form(0.25),
     event_detection_prompt: str = Form(""),
     summary_prompt: str = Form(""),
@@ -790,7 +804,8 @@ def segment_pipeline_rtsp(
             results = AnalysisService.run_full_pipeline(
                 seg_files, total_duration, segment_duration, overlap,
                 model_type, qwen_model, frames_per_segment, target_short, sampling_fps,
-                event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr
+                event_detection_prompt, summary_prompt, yolo_labels, yolo_every_sec, yolo_score_thr,
+                yolo_num_frames if yolo_num_frames > 0 else None,
             )
         except torch.cuda.OutOfMemoryError as e:
             logger.error(f"--- [CUDA OOM] {e} ---")

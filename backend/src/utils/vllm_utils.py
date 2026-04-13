@@ -324,66 +324,54 @@ def _vllm_chat_batch(
     max_workers: int = 8,
     enable_thinking: Optional[bool] = None,
 ) -> List[str]:
-    """
-    批次呼叫 vLLM API。
-    透過 ThreadPoolExecutor 並行發送請求，觸發伺服器端的 Continuous Batching。
-    
-    batch_requests 格式範例:
-    [
-        {
-            "messages": [...], 
-            "video_path": "...", 
-            "sampling_fps": 1.0, 
-            "frames_per_segment": 8
-        },
-        ...
-    ]
-    """
     nreq = len(batch_requests)
     mw = max(1, min(max_workers, nreq or 1))
     print(f"--- [vLLM Batch] 開始並行處理 {nreq} 個任務 (Threads: {mw}) ---", flush=True)
 
-    # 定義一個內部 Worker，負責執行單一請求
-    # 這裡直接呼叫您現有的 _vllm_chat 函式，完整繼承其取樣、b64 轉換與錯誤處理邏輯
     def _single_worker(req_item: Dict) -> str:
         try:
             req_enable_thinking = req_item.get("enable_thinking", enable_thinking)
+            video_path = req_item.get("video_path")
+            
+            # 有 video_path 就走 video_direct，不做本地截圖
+            if video_path:
+                return _vllm_chat_video_direct(
+                    model_name=model_name,
+                    messages=req_item.get("messages", []),
+                    video_path=video_path,
+                    stream=False,
+                    enable_thinking=req_enable_thinking,
+                    video_num_frames=req_item.get("video_num_frames"),
+                )
+            # 沒有 video_path 才走原本截圖路徑
             return _vllm_chat(
                 model_name=model_name,
                 messages=req_item.get("messages", []),
-                video_path=req_item.get("video_path"),
                 sampling_fps=req_item.get("sampling_fps"),
                 frames_per_segment=req_item.get("frames_per_segment", 5),
                 enable_thinking=req_enable_thinking,
-                stream=False  # 批次模式通常不建議使用串流
+                stream=False,
             )
         except Exception as e:
             print(f"--- [vLLM Batch Worker] 請求出錯: {e} ---")
             return ""
 
-    # 使用執行緒池並行執行
     results = ["" for _ in range(len(batch_requests))]
-    
-    # 使用 ThreadPoolExecutor 同時進行影像取樣 (CPU) 與 API 請求 (I/O)
     with concurrent.futures.ThreadPoolExecutor(max_workers=mw) as executor:
-        # 建立 Future 物件與索引的對照，確保回傳順序一致
         future_to_index = {
-            executor.submit(_single_worker, item): i 
+            executor.submit(_single_worker, item): i
             for i, item in enumerate(batch_requests)
         }
-        
         for future in concurrent.futures.as_completed(future_to_index):
             index = future_to_index[future]
             try:
-                data = future.result()
-                results[index] = data
+                results[index] = future.result()
             except Exception as exc:
                 print(f"--- [vLLM Batch] 片段索引 {index} 產生異常: {exc} ---")
                 results[index] = ""
 
     print(f"--- [vLLM Batch] 所有任務執行完畢，成功取得 {len(results)} 筆結果 ---", flush=True)
     return results
-
 
 def _vllm_chat_video_direct(
     model_name: str,

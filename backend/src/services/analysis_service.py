@@ -3,6 +3,7 @@ import os
 import gc
 import math
 import time
+from collections import Counter
 import cv2
 import json
 import numpy as np
@@ -14,13 +15,34 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
 from src.core.model_loader import get_yolo_model, get_reid_model, get_clip_model, gpu_inference_lock_traced
-from src.utils.video_utils import _sample_frames_evenly_to_pil, _fmt_hms
+from src.utils.video_utils import _sample_frames_evenly_to_pil, _fmt_hms, _probe_duration_seconds
 from src.utils.image_utils import _resize_short_side, _pil_to_b64
 from src.utils.ollama_utils import (
     _ollama_chat, _safe_parse_json, _extract_first_json,
     _clean_summary_text, _extract_first_json_and_tail
 )
 from src.config import config
+
+
+def _yolo_batch_frame_indices(
+    total_frames: int,
+    fps: float,
+    every_sec: float,
+    num_frames: Optional[int],
+) -> List[int]:
+    """
+    YOLO batch 取樣：num_frames > 0 時在該段內均勻取固定張數；否則依 every_sec 間隔取樣。
+    """
+    if total_frames <= 0:
+        return []
+    if num_frames is not None and int(num_frames) > 0:
+        n = min(int(num_frames), total_frames)
+        raw = np.linspace(0, total_frames - 1, num=n)
+        return sorted(
+            {min(total_frames - 1, max(0, int(round(float(x))))) for x in raw}
+        )
+    interval = max(1, int(round(fps * every_sec)))
+    return list(range(0, total_frames, interval))
 
 
 def resolve_vllm_video_direct_num_frames(
@@ -404,6 +426,32 @@ class AnalysisService:
         return frame_obj, ""
 
     @staticmethod
+    def _count_equiv_local_sample_frames(
+        video_path: str, max_frames: int, sampling_fps: Optional[float]
+    ) -> Optional[int]:
+        """與 video_utils._sample_frames_evenly_to_pil 取樣邏輯一致的幀數（不解碼像素），供日誌對照。"""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        try:
+            fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total_frames <= 0:
+                return None
+            duration_sec = total_frames / fps
+            if sampling_fps and float(sampling_fps) > 0:
+                t = 0.0
+                cnt = 0
+                interval_sec = 1.0 / float(sampling_fps)
+                while t < duration_sec:
+                    cnt += 1
+                    t += interval_sec
+                return cnt
+            return int(min(int(max_frames), total_frames))
+        finally:
+            cap.release()
+
+    @staticmethod
     def infer_segment_vllm_batch(
         model_name: str,
         path_strs: List[str],
@@ -458,6 +506,13 @@ class AnalysisService:
                 all_parsed[i] = ({"error": f"找不到影片檔案: {path}"}, "")
                 continue
             
+            # video_direct 只認 video_num_frames；與本地截圖一致：有 sampling_fps 則 ceil(段長×fps)，否則用 frames_per_segment
+            seg_dur = _probe_duration_seconds(path)
+            video_nf = resolve_vllm_video_direct_num_frames(
+                segment_duration=seg_dur,
+                request_num_frames=None if sampling_fps else frames_per_segment,
+                request_sample_fps=sampling_fps,
+            )
             # 封裝成 vLLM 批次請求格式
             batch_requests.append({
                 "model_name": model_name,
@@ -465,12 +520,37 @@ class AnalysisService:
                 "video_path": path,
                 "sampling_fps": sampling_fps,
                 "frames_per_segment": frames_per_segment,
+                "video_num_frames": video_nf,
                 "enable_thinking": False if qwen3_disable_thinking else True,
             })
             valid_indices.append(i)
 
         if not batch_requests:
             return all_parsed
+
+        equiv_each = [
+            AnalysisService._count_equiv_local_sample_frames(
+                r["video_path"], frames_per_segment, sampling_fps
+            )
+            for r in batch_requests
+        ]
+        equiv_sum = sum(c or 0 for c in equiv_each)
+        n_nf = 0
+        sum_nf = 0
+        for r in batch_requests:
+            vn = r.get("video_num_frames")
+            if vn is not None and int(vn) > 0:
+                n_nf += 1
+                sum_nf += int(vn)
+        per_detail = equiv_each if len(equiv_each) <= 24 else None
+        print(
+            "--- [vLLM Batch][進模型前] "
+            f"段數={len(batch_requests)} | "
+            f"video_direct 請求含 num_frames：{n_nf} 段（合計 {sum_nf} 幀）| "
+            f"未帶 num_frames 者實際取樣由 vLLM 引擎決定 | "
+            f"對照：若改走本地均分截圖路徑，每段約 {per_detail if per_detail is not None else '…'} 幀，全批合計約 {equiv_sum} 幀 ---",
+            flush=True,
+        )
 
         # 2. 執行 vLLM 批次推論 (Inference)
         # 這裡呼叫支援 List 輸入的 _vllm_chat 封裝，啟動 Continuous Batching
@@ -936,9 +1016,10 @@ class AnalysisService:
     def infer_segment_yolo_batch(
         seg_paths: List[str],
         labels: str = "person,car",
-        every_sec: float = 2.0,
+        every_sec: float = 5.0,
         score_thr: float = 0.25,
         yolo_batch_size: int = 20,
+        yolo_num_frames: Optional[int] = 5,
     ) -> List[Dict]:
         # print(
         #     "[API][infer_segment_yolo_batch][INPUT] "
@@ -959,7 +1040,13 @@ class AnalysisService:
         # 同一時間只允許一個執行緒做推論，避免多執行緒同時用 GPU 造成設備不一致或 CUDA 錯誤。
         with gpu_inference_lock_traced():
             return AnalysisService._infer_segment_yolo_batch_impl(
-                seg_paths, labels, every_sec, score_thr, yolo_batch_size)
+                seg_paths,
+                labels,
+                every_sec,
+                score_thr,
+                yolo_batch_size,
+                yolo_num_frames,
+            )
 
     # 物件偵測 (YOLO) 與 行人重識別 (ReID) 的核心實作。它的精髓在於「打平 (Flattening)」了多段影片的影格，將其整合成一個巨大的批次進行運算，以極大化 GPU 的吞吐量。
     @staticmethod
@@ -969,6 +1056,7 @@ class AnalysisService:
         every_sec: float,
         score_thr: float,
         batch_size: int = 20,
+        yolo_num_frames: Optional[int] = 5,
     ) -> List[Dict]:
 
         if not seg_paths:
@@ -1015,8 +1103,9 @@ class AnalysisService:
 
             fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
             total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
-            interval = max(1, int(round(fps * every_sec)))
-            frame_indices = list(range(0, total_frames, interval))
+            frame_indices = _yolo_batch_frame_indices(
+                total_frames, fps, every_sec, yolo_num_frames
+            )
 
             for fi in frame_indices:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
@@ -1036,6 +1125,20 @@ class AnalysisService:
             )
         except Exception:
             pass
+
+        seg_read_counts = Counter(x[0] for x in flat_frames)
+        yolo_per_seg = [seg_read_counts.get(i, 0) for i in range(len(seg_paths))]
+        per_txt = (
+            str(yolo_per_seg)
+            if len(seg_paths) <= 24
+            else f"{len(seg_paths)} 段（略列，總幀={len(flat_frames)}）"
+        )
+        print(
+            "--- [YOLO Batch][進模型前] "
+            f"送入 YOLO 的總幀數={len(flat_frames)} | 每段成功讀取幀數={per_txt} | "
+            f"predict batch_size={batch_size} | every_sec={every_sec} ---",
+            flush=True,
+        )
 
         # 4. 執行 YOLO Batch 推論
         flat_for_reid: List[tuple] = []
@@ -1228,6 +1331,7 @@ class AnalysisService:
         yolo_labels: Optional[str],
         yolo_every_sec: float,
         yolo_score_thr: float,
+        yolo_num_frames: Optional[int] = 5,
         worker_count: int = 4,
         qwen_inference_batch_size: Optional[int] = None,
         yolo_batch_size: Optional[int] = None,
@@ -1275,8 +1379,10 @@ class AnalysisService:
             # vLLM 支援更高的並行，batch_size 可以設大 (例如 64)
             # 為了讓每個 worker 的 GPU RAM 使用量在請求結束後更接近「未執行前」的基線，
             # 這裡預設不要用太大的 batch，避免觸發一次性較大的 CUDA/allocator 保留記憶體。
-            vlm_batch_size = qwen_inference_batch_size or 10
-            yolo_frame_batch = yolo_batch_size or 10
+
+            # 16, 80
+            vlm_batch_size = 25
+            yolo_frame_batch = 125
 
             print(
                 f"--- [Pipeline vllm_qwen] 共 {len(seg_files)} 段 | VLM batch={vlm_batch_size} YOLO 幀batch={yolo_frame_batch} "
@@ -1306,6 +1412,7 @@ class AnalysisService:
                         labels=yolo_labels,
                         every_sec=yolo_every_sec,
                         yolo_batch_size=yolo_frame_batch,
+                        yolo_num_frames=yolo_num_frames,
                     )
 
                 # 兩者並行，最大化 GPU 吞吐量
