@@ -237,6 +237,31 @@ def _sync_detection_items(engine):
         db.close()
 
 
+def _ensure_detection_items_columns(engine):
+    """
+    舊版資料庫的 detection_items 可能缺少 alert_count；
+    ORM 查詢會選該欄位，導致 /detection-items 回 500。
+    """
+    from sqlalchemy import inspect, text
+
+    inspector = inspect(engine)
+    if not inspector.has_table("detection_items"):
+        return
+    columns = [c["name"] for c in inspector.get_columns("detection_items")]
+    if "alert_count" in columns:
+        print("  ✓ detection_items 欄位與模型一致（含 alert_count）")
+        return
+    print("  ✗ detection_items 缺少 alert_count，正在新增…")
+    with engine.begin() as conn:
+        conn.execute(
+            text(
+                "ALTER TABLE detection_items ADD COLUMN IF NOT EXISTS "
+                "alert_count INTEGER NOT NULL DEFAULT 0"
+            )
+        )
+    print("  ✓ 已新增 detection_items.alert_count")
+
+
 def migrate_database():
     """執行資料庫遷移"""
     print("=" * 80)
@@ -294,6 +319,7 @@ def migrate_database():
             if "summaries" in missing_tables:
                 # 新建表已由 create_all 依模型順序建立，僅需補齊 detection_items
                 print("\n[3/5] 補齊偵測項目字典…")
+                _ensure_detection_items_columns(engine)
                 _sync_detection_items(engine)
                 print("\n" + "=" * 80)
                 print("資料庫遷移完成！")
@@ -360,6 +386,7 @@ def migrate_database():
             traceback.print_exc()
 
         print("\n[5/5] 補齊 detection_items（警報用）…")
+        _ensure_detection_items_columns(engine)
         _sync_detection_items(engine)
 
         inspector = inspect(engine)

@@ -24,6 +24,7 @@ const EventTagModal = ({ isOpen, onClose, apiKey }) => {
     "離開吸菸區吸菸",
     "聚眾逗留",
     "安全門破壞/撬動",
+    "持有危險武器/暴力衝突",
     "其他",
   ];
 

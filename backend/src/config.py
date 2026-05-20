@@ -78,7 +78,7 @@ class Config:
         self.VLLM_VIDEO_DIRECT_MAX_FRAMES: int = max(1, int(os.getenv("VLLM_VIDEO_DIRECT_MAX_FRAMES", "256")))
         # Video Direct：chat/completions 的 max_tokens（長 JSON 若打到上限會 finish_reason=length、內容被截斷）
         self.VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS: int = max(
-            256, int(os.getenv("VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", "4096"))
+            256, int(os.getenv("VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", "10240"))
         )
         # 送 vLLM 的 JPEG 壓縮品質（降低 payload、縮短 api_total_time）
         self.VLLM_JPEG_QUALITY: int = int(os.getenv("VLLM_JPEG_QUALITY", "70"))

@@ -167,6 +167,8 @@ def _vllm_chat(
     sampling_fps: Optional[float] = None,
     frames_per_segment: int = 5,
     enable_thinking: Optional[bool] = None,
+    max_tokens: int = 10240,
+    temperature: float = 0.1,
     **kwargs,
 ) -> str:
     """呼叫 vLLM OpenAI-compatible API 進行多模態對話（影像+文字或影片）。"""
@@ -208,8 +210,8 @@ def _vllm_chat(
         "model": model_name,
         "messages": payload_messages,
         "stream": stream,
-        "max_tokens": 2048,
-        "temperature": 0.1,
+        "max_tokens": max(256, int(max_tokens)),
+        "temperature": float(temperature),
     }
     
     if enable_thinking is not None and _is_qwen3_model(model_name):
@@ -413,7 +415,7 @@ def _vllm_chat_video_direct(
         ]
         break
 
-    _max_out = int(getattr(config, "VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", 4096) or 4096)
+    _max_out = int(getattr(config, "VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS", 10240) or 10240)
     payload = {
         "model": model_name,
         "messages": payload_messages,

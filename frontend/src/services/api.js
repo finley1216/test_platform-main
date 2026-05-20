@@ -50,16 +50,18 @@ class ApiService {
         if (response.status === 502) {
           console.error("❌ Backend Unresponsive. Possible Causes: Timeout (>60s), OOM Crash, or Container Restarting.");
         }
-        
+
+        // 只讀取 body 一次：先 text 再 JSON.parse，避免 json() 失敗後 text() 觸發「body stream already read」
+        const errorBody = await response.text();
         let errorDetail = `HTTP ${response.status}`;
         try {
-          const data = await response.json();
+          const data = errorBody ? JSON.parse(errorBody) : {};
           errorDetail = data.detail || data.message || errorDetail;
           console.error(`❌ ${method} ${endpoint} Failed:`, errorDetail);
           console.log("Raw Error Data:", data);
-        } catch (e) {
-          const text = await response.text();
-          console.error(`❌ ${method} ${endpoint} Failed (Non-JSON):`, text.substring(0, 200));
+        } catch {
+          const snippet = errorBody ? errorBody.substring(0, 200) : "";
+          console.error(`❌ ${method} ${endpoint} Failed (Non-JSON):`, snippet || errorDetail);
         }
         console.groupEnd();
         

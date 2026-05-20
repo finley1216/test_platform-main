@@ -249,9 +249,11 @@ async def startup_event():
     # 補齊 detection_items（violence / dangerous_items 等），避免警報流程查不到項目
     if HAS_DB:
         try:
-            from src.database import SessionLocal
+            from src.database import SessionLocal, engine
             from src.init_detection_items import sync_missing_detection_items
+            from src.migrate_database import _ensure_detection_items_columns
 
+            _ensure_detection_items_columns(engine)
             _db = SessionLocal()
             try:
                 _n = sync_missing_detection_items(_db)
@@ -3086,6 +3088,34 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
     inserted_count = 0
     skipped_count = 0
     
+    def _annotate_crop_times(yolo_result: Dict[str, Any], seg_start: Optional[datetime], seg_end: Optional[datetime]):
+        """為每個 crop/detection 補上段落起訖時間與絕對時間（ISO 格式）。"""
+        if not isinstance(yolo_result, dict):
+            return
+
+        start_iso = seg_start.isoformat() if seg_start else None
+        end_iso = seg_end.isoformat() if seg_end else None
+
+        def _apply(items):
+            if not isinstance(items, list):
+                return
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                item["segment_start_timestamp"] = start_iso
+                item["segment_end_timestamp"] = end_iso
+                rel_ts = item.get("timestamp")
+                try:
+                    if seg_start is not None and rel_ts is not None:
+                        item["absolute_timestamp"] = (seg_start + timedelta(seconds=float(rel_ts))).isoformat()
+                    else:
+                        item["absolute_timestamp"] = None
+                except Exception:
+                    item["absolute_timestamp"] = None
+
+        _apply(yolo_result.get("crop_paths"))
+        _apply(yolo_result.get("detections"))
+
     for idx, result in enumerate(results):
         # 只處理成功的結果
         if not result.get("success", False):
@@ -3164,6 +3194,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             if raw_detection and isinstance(raw_detection, dict):
                 yolo_result = raw_detection.get("yolo")
                 if yolo_result:
+                    _annotate_crop_times(yolo_result, start_time, end_time)
                     existing.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
                     existing.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
                     existing.yolo_total_detections = yolo_result.get("total_detections", 0)
@@ -3281,6 +3312,7 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
             if raw_detection and isinstance(raw_detection, dict):
                 yolo_result = raw_detection.get("yolo")
                 if yolo_result:
+                    _annotate_crop_times(yolo_result, start_time, end_time)
                     summary.yolo_detections = json.dumps(yolo_result.get("detections", []), ensure_ascii=False)
                     summary.yolo_object_count = json.dumps(yolo_result.get("object_count", {}), ensure_ascii=False)
                     summary.yolo_total_detections = yolo_result.get("total_detections", 0)
@@ -4043,7 +4075,7 @@ def _merge_and_rank_results(
 
 # ================== 註冊 API 路由 ==================
 # 必須在所有函數定義之後註冊，避免循環導入
-from src.api import health, prompts, video_analysis, rag, video_management, detection_items, monitor, rtsp_control
+from src.api import health, prompts, video_analysis, rag, video_management, detection_items, monitor, rtsp_control, vlm_same_object_judge
 
 app.include_router(health.router)
 app.include_router(prompts.router)
@@ -4053,6 +4085,7 @@ app.include_router(video_management.router)
 app.include_router(detection_items.router)
 app.include_router(monitor.router)
 app.include_router(rtsp_control.router)
+app.include_router(vlm_same_object_judge.router)
 
 if __name__ == "__main__":
     import uvicorn

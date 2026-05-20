@@ -11,6 +11,7 @@ import tempfile
 import uuid
 import traceback
 import threading
+from datetime import timedelta
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException, Body
@@ -190,7 +191,7 @@ def segment_pipeline_multipart(
     strict_segmentation: bool = Form(False),
     yolo_labels: Optional[str] = Form(None),
     yolo_every_sec: float = Form(2.0),
-    yolo_num_frames: int = Form(5),
+    yolo_num_frames: int = Form(30),
     yolo_score_thr: float = Form(0.25),
     event_detection_prompt: str = Form(""),
     summary_prompt: str = Form(""),
@@ -222,17 +223,7 @@ def segment_pipeline_multipart(
     if strict_segmentation:
         logger.warning("--- [Diagnostics] Performing Re-encoding (CPU Intensive) ---")
 
-    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
-
-    # 若前端未送或送空字串，則每次請求從 prompts/*.md 重新讀取（無需重啟 worker）
-    if not event_detection_prompt or not event_detection_prompt.strip():
-        event_detection_prompt = get_event_prompt()
-    if not summary_prompt or not summary_prompt.strip():
-        summary_prompt = get_summary_prompt()
-
-    _print_ram_diagnosis(f"[START] req_id={req_id} segment_pipeline_multipart（讀取影片前）")
-
-    # 1. 處理上傳與下載
+    # 1. 處理上傳與下載：先完成檔案／URL／video_id，再載入 DB／prompt，避免重型 import 延後 file.read() 造成上傳停滯
     target_filename = "unknown_video"
     local_path = None
     cleanup = False
@@ -263,6 +254,16 @@ def segment_pipeline_multipart(
             local_path, cleanup = VideoService.download_to_temp(video_url), True
         else:
             raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
+
+        get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
+
+        # 若前端未送或送空字串，則每次請求從 prompts/*.md 重新讀取（無需重啟 worker）
+        if not event_detection_prompt or not event_detection_prompt.strip():
+            event_detection_prompt = get_event_prompt()
+        if not summary_prompt or not summary_prompt.strip():
+            summary_prompt = get_summary_prompt()
+
+        _print_ram_diagnosis(f"[START] req_id={req_id} segment_pipeline_multipart（讀取影片前）")
 
         # 2. 準備片段（上傳檔案時不傳 video_id 給 prepare_segments，讓它用 local_path）
         try:
@@ -571,7 +572,6 @@ async def segment_pipeline_multipart_batch(
             shutil.rmtree(seg_dir_path, ignore_errors=True)
 
 
-
 @router.post("/v1/segment_pipeline_multipart_vllm_video_direct")
 def segment_pipeline_multipart_vllm_video_direct(
     request: Request,
@@ -698,6 +698,171 @@ def segment_pipeline_multipart_vllm_video_direct(
                 "video_direct_num_frames": _vd_nf,
                 "video_direct_sample_fps_request": video_sample_fps,
                 "video_direct_num_frames_request": video_num_frames,
+            },
+        }
+
+        if save_json:
+            save_path_obj = seg_dir / (save_basename or f"{stem}.json")
+            with open(save_path_obj, "w", encoding="utf-8") as f:
+                json.dump(resp, f, ensure_ascii=False, indent=2)
+            resp["save_path"] = str(save_path_obj)
+
+        if HAS_DB:
+            from src.database import SessionLocal
+
+            db = SessionLocal()
+            try:
+                _save_results_to_postgres(db, results, video_id or stem)
+            finally:
+                db.close()
+
+        return JSONResponse(resp)
+    except HTTPException:
+        raise
+    except Exception as e:
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail=f"Unexpected Error: {type(e).__name__} - {str(e)}")
+    finally:
+        active_requests_counter -= 1
+        if cleanup and local_path:
+            try:
+                if os.path.exists(local_path):
+                    os.remove(local_path)
+            except OSError:
+                pass
+        try:
+            AnalysisService.release_gpu_memory()
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+        except Exception:
+            pass
+
+
+@router.post("/v1/segment_pipeline_multipart_vllm_video_direct_all_frames")
+def segment_pipeline_multipart_vllm_video_direct_all_frames(
+    request: Request,
+    file: UploadFile = File(None),
+    video_url: str = Form(None),
+    video_id: str = Form(None),
+    segment_duration: float = Form(3.0),
+    overlap: float = Form(0.0),
+    qwen_model: str = Form("qwen3-vl"),
+    target_short: int = Form(432),  # 保留參數型態相容，實際不使用
+    sampling_fps: Optional[float] = Form(None),  # 保留參數型態相容，實際不使用
+    strict_segmentation: bool = Form(False),
+    event_detection_prompt: str = Form(""),
+    summary_prompt: str = Form(""),
+    save_json: bool = Form(True),
+    save_basename: str = Form(None),
+    qwen_inference_batch_size: Optional[int] = Form(None),
+):
+    """
+    新流程（全幀模式）：
+    1) 與 segment_pipeline_multipart 同樣的輸入與切片流程（預設每 3 秒一段）
+    2) 僅跑 vLLM（不跑 YOLO）
+    3) 每個片段先探測總幀數，將所有 frame（video_url.num_frames=總幀數）送入 vLLM。
+    """
+    global active_requests_counter
+    active_requests_counter += 1
+    req_id = uuid.uuid4().hex[:12]
+    t0 = time.time()
+    t1 = None
+    mem_before = psutil.Process().memory_info().rss / (1024 * 1024)
+    client_host = request.client.host if request.client else "?"
+    try:
+        vm_pct = psutil.virtual_memory().percent
+    except Exception:
+        vm_pct = -1.0
+
+    print(
+        f"--- [API][VideoDirect-AllFrames] 收到 POST /v1/segment_pipeline_multipart_vllm_video_direct_all_frames | req_id={req_id} "
+        f"| active_same_worker={active_requests_counter} | client={client_host} | rss_mb={mem_before:.1f} | vm_pct={vm_pct} ---",
+        flush=True,
+    )
+
+    get_db, get_api_key, _save_results_to_postgres, HAS_DB, _, get_event_prompt, get_summary_prompt = _get_db_and_models()
+
+    if not event_detection_prompt or not event_detection_prompt.strip():
+        event_detection_prompt = get_event_prompt()
+    if not summary_prompt or not summary_prompt.strip():
+        summary_prompt = get_summary_prompt()
+
+    target_filename = "unknown_video"
+    local_path = None
+    cleanup = False
+
+    try:
+        if video_id and video_id.strip():
+            print(f"--- [API][VideoDirect-AllFrames] 使用已存在 video_id: {video_id} ---", flush=True)
+            local_path = None
+        elif file is not None:
+            file_content = file.file.read()
+            file_size = len(file_content)
+            if file_size == 0:
+                raise HTTPException(status_code=400, detail="File is empty (0 bytes).")
+            target_filename = file.filename or "video.mp4"
+            fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(target_filename).suffix)
+            with os.fdopen(fd, "wb") as f:
+                f.write(file_content)
+            local_path, cleanup = tmp, True
+            del file_content
+        elif video_url:
+            target_filename = Path(video_url).name or "video_url.mp4"
+            local_path, cleanup = VideoService.download_to_temp(video_url), True
+        else:
+            raise HTTPException(status_code=422, detail="需要 file、video_url 或 video_id")
+
+        try:
+            seg_dir, seg_files, stem, total_duration = VideoService.prepare_segments(
+                local_path,
+                None if file else video_id,
+                target_filename,
+                segment_duration,
+                overlap,
+                target_short,
+                strict_segmentation,
+            )
+        except ValueError as ve:
+            raise HTTPException(status_code=500, detail=f"FFmpeg Processing Failed: {ve}")
+
+        t1 = time.time()
+        results = AnalysisService.run_vllm_video_direct_all_frames_pipeline(
+            seg_files=seg_files,
+            total_duration=total_duration,
+            segment_duration=segment_duration,
+            overlap=overlap,
+            qwen_model=qwen_model,
+            event_detection_prompt=event_detection_prompt,
+            summary_prompt=summary_prompt,
+            qwen_inference_batch_size=qwen_inference_batch_size,
+        )
+
+        t2 = time.time()
+        mem_after = psutil.Process().memory_info().rss / (1024 * 1024)
+        success_segments = sum(1 for r in results if r.get("success"))
+        resolved_frames = [int(r["video_direct_num_frames"]) for r in results if r.get("video_direct_num_frames")]
+        print(
+            f"--- [API][VideoDirect-AllFrames] req_id={req_id} 抓到成功段數 {success_segments}/{len(results)} "
+            f"| each_segment_frames={resolved_frames} ---",
+            flush=True,
+        )
+        resp = {
+            "model_type": "vllm_qwen3_video_direct_all_frames",
+            "total_segments": len(results),
+            "success_segments": success_segments,
+            "results": results,
+            "process_time_sec": round(t2 - t1, 2),
+            "total_time_sec": round(t2 - t0, 2),
+            "stem": stem,
+            "diagnostics": {
+                "mem_delta_mb": round(mem_after - mem_before, 2),
+                "strict_mode": strict_segmentation,
+                "video_direct": True,
+                "all_frames_mode": True,
+                "segment_duration_sec": segment_duration,
+                "sampling_fps_ignored": sampling_fps,
+                "resolved_video_num_frames_each_segment": resolved_frames,
             },
         }
 
@@ -939,6 +1104,8 @@ def search_by_image(
                 s.video,
                 s.segment,
                 s.time_range,
+                s.start_timestamp,
+                s.end_timestamp,
                 1 - (oc.{embedding_column} <=> '{query_embedding_str}'::vector) as similarity
             FROM object_crops oc
             JOIN summaries s ON oc.summary_id = s.id
@@ -960,7 +1127,13 @@ def search_by_image(
         search_results = []
         for row in rows:
             (crop_id, summary_id, crop_path, label, score, timestamp, 
-             frame, box, video, segment, time_range, similarity) = row
+             frame, box, video, segment, time_range, start_timestamp, end_timestamp, similarity) = row
+            abs_ts = None
+            try:
+                if start_timestamp is not None and timestamp is not None:
+                    abs_ts = (start_timestamp + timedelta(seconds=float(timestamp))).isoformat()
+            except Exception:
+                abs_ts = None
             
             search_results.append({
                 "crop_id": crop_id,
@@ -974,6 +1147,9 @@ def search_by_image(
                 "video": video,
                 "segment": segment,
                 "time_range": time_range,
+                "segment_start_timestamp": start_timestamp.isoformat() if start_timestamp else None,
+                "segment_end_timestamp": end_timestamp.isoformat() if end_timestamp else None,
+                "absolute_timestamp": abs_ts,
                 "similarity": float(similarity)
             })
             

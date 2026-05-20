@@ -3,11 +3,17 @@ import os
 import gc
 import math
 import time
+import re
+from datetime import datetime, timedelta
 from collections import Counter
 import cv2
 import json
 import numpy as np
 import torch
+try:
+    import easyocr as _easyocr_mod
+except ImportError:
+    _easyocr_mod = None
 from pathlib import Path
 from typing import List, Dict, Any, Optional, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -149,6 +155,259 @@ def _ensure_reid_model_fp32(reid_model, reid_device):
             reid_model = reid_model.to(reid_device)
         reid_model.eval()
     return reid_model
+
+
+_ocr_reader_instance = None
+_ocr_reader_init_lock = threading.Lock()
+_ocr_reader_init_event = threading.Event()
+_ocr_reader_init_in_progress = False
+_ocr_reader_last_error = None
+_ocr_reader_retry_not_before = 0.0
+
+
+def _get_ocr_reader():
+    """Lazy-init EasyOCR，整個 process 只初始化一次。"""
+    global _ocr_reader_instance, _ocr_reader_init_in_progress, _ocr_reader_last_error, _ocr_reader_retry_not_before
+    if _easyocr_mod is None:
+        print("--- [OCR] easyocr module unavailable, skip wall-time OCR ---", flush=True)
+        return None
+
+    # 快速路徑：已初始化完成
+    if _ocr_reader_instance is not None:
+        return _ocr_reader_instance
+
+    now = time.time()
+    retry_cooldown_sec = float(os.environ.get("EASYOCR_INIT_RETRY_COOLDOWN_SEC", "30"))
+    if _ocr_reader_retry_not_before > now:
+        remain = round(_ocr_reader_retry_not_before - now, 2)
+        print(
+            f"--- [OCR] skip init during cooldown ({remain}s left) | last_error={_ocr_reader_last_error} ---",
+            flush=True,
+        )
+        return None
+
+    is_initializer = False
+    with _ocr_reader_init_lock:
+        if _ocr_reader_instance is not None:
+            return _ocr_reader_instance
+        now_locked = time.time()
+        if _ocr_reader_retry_not_before > now_locked:
+            remain = round(_ocr_reader_retry_not_before - now_locked, 2)
+            print(
+                f"--- [OCR] skip init during cooldown ({remain}s left) | last_error={_ocr_reader_last_error} ---",
+                flush=True,
+            )
+            return None
+        if not _ocr_reader_init_in_progress:
+            _ocr_reader_init_in_progress = True
+            _ocr_reader_init_event.clear()
+            _ocr_reader_last_error = None
+            is_initializer = True
+
+    if is_initializer:
+        t0 = time.time()
+        try:
+            print(
+                f"--- [OCR] initializing EasyOCR Reader (gpu={torch.cuda.is_available()}) ---",
+                flush=True,
+            )
+            reader = _easyocr_mod.Reader(['ch_tra', 'en'], gpu=torch.cuda.is_available())
+            with _ocr_reader_init_lock:
+                _ocr_reader_instance = reader
+                _ocr_reader_init_in_progress = False
+                _ocr_reader_last_error = None
+            print(
+                f"--- [OCR] EasyOCR Reader ready | elapsed={round(time.time() - t0, 2)}s ---",
+                flush=True,
+            )
+            _ocr_reader_init_event.set()
+            return _ocr_reader_instance
+        except Exception as e:
+            with _ocr_reader_init_lock:
+                _ocr_reader_init_in_progress = False
+                _ocr_reader_last_error = f"{type(e).__name__}: {e}"
+                _ocr_reader_retry_not_before = time.time() + max(1.0, retry_cooldown_sec)
+            print(f"--- [OCR] EasyOCR init failed: {_ocr_reader_last_error} ---", flush=True)
+            print(
+                f"--- [OCR] retry cooldown set to {retry_cooldown_sec}s "
+                f"(until {round(_ocr_reader_retry_not_before, 2)}) ---",
+                flush=True,
+            )
+            _ocr_reader_init_event.set()
+            return None
+
+    # 非初始化執行緒：等待初始化完成，避免重複下載模型
+    wait_sec = float(os.environ.get("EASYOCR_INIT_WAIT_SEC", "180"))
+    print(f"--- [OCR] waiting for EasyOCR initialization (timeout={wait_sec}s) ---", flush=True)
+    ready = _ocr_reader_init_event.wait(wait_sec)
+    if not ready:
+        print("--- [OCR] wait timeout: EasyOCR initialization still in progress ---", flush=True)
+        return None
+    if _ocr_reader_instance is not None:
+        return _ocr_reader_instance
+    if _ocr_reader_last_error:
+        print(f"--- [OCR] init not ready due to prior error: {_ocr_reader_last_error} ---", flush=True)
+    return None
+
+
+def _extract_wall_time(frame) -> "str | None":
+    """
+    從畫面左上角固定位置 OCR 抓絕對時間。
+    格式：2025/11/10 下午 01:27:11  →  '2025-11-10T13:27:11'
+    失敗回傳 None。
+    """
+    def _normalize_ocr_text(raw_text: str) -> str:
+        if not raw_text:
+            return ""
+        text = raw_text.replace("\u3000", " ").replace("\uff1a", ":")
+        text = re.sub(r"\s+", " ", text).strip()
+        table = str.maketrans(
+            {
+                "O": "0",
+                "o": "0",
+                "S": "5",
+                "B": "8",
+                "K": "1",
+                ";": ":",
+                "=": "-",
+                "_": "-",
+            }
+        )
+        return text.translate(table)
+
+    def _build_ocr_variants(roi):
+        up = cv2.resize(roi, None, fx=3, fy=3, interpolation=cv2.INTER_CUBIC)
+        gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY)
+        blur = cv2.GaussianBlur(gray, (3, 3), 0)
+        otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)[1]
+        otsu_inv = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)[1]
+        adap = cv2.adaptiveThreshold(
+            blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 31, 5
+        )
+        hsv = cv2.cvtColor(up, cv2.COLOR_BGR2HSV)
+        white_mask = cv2.inRange(hsv, (0, 0, 150), (180, 70, 255))
+        white_mask = cv2.morphologyEx(
+            white_mask, cv2.MORPH_OPEN, cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+        )
+        return {
+            "up": up,
+            "gray": gray,
+            "otsu": otsu,
+            "otsu_inv": otsu_inv,
+            "adaptive": adap,
+            "white_mask": white_mask,
+        }
+
+    def _extract_time_only_from_variants(reader, variants) -> str:
+        allow = "0123456789:"
+        best = {"score": -1, "text": ""}
+        for name in ("white_mask", "up", "gray"):
+            img = variants.get(name)
+            if img is None:
+                continue
+            h, w = img.shape[:2]
+            for l_ratio, r_ratio in ((0.30, 0.98),):
+                sub = img[:, int(w * l_ratio) : int(w * r_ratio)]
+                texts = reader.readtext(sub, detail=0, allowlist=allow)
+                raw = _normalize_ocr_text(" ".join(texts).strip())
+                m = re.search(r"(\d{1,2}\D+\d{2}\D+\d{2})", raw)
+                if not m:
+                    continue
+                t = m.group(1)
+                nums = re.findall(r"\d+", t)
+                if len(nums) < 3:
+                    continue
+                hh, mm, ss = nums[0], nums[1], nums[2]
+                cand = f"{int(hh):02d}:{int(mm):02d}:{int(ss):02d}"
+                score = cand.count(":") * 10 + len(re.findall(r"\d", cand))
+                if score > best["score"]:
+                    best = {"score": score, "text": cand}
+        return best["text"]
+
+    def _merge_date_and_time(raw_text: str, time_text: str) -> str:
+        base = _normalize_ocr_text(raw_text)
+        base = re.sub(r"\b2[-/]?25\b", "2025", base)
+        base = re.sub(r"\b2525\b", "2025", base)
+        if not time_text:
+            return base
+        if re.search(r"\b([01]?\d|2[0-3])[:：]([0-5]\d)[:：]([0-5]\d)\b", base):
+            return base
+        return f"{base} {time_text}".strip()
+
+    try:
+        ocr_reader = _get_ocr_reader()
+        if ocr_reader is None:
+            return None
+
+        fh, fw = frame.shape[:2]
+        roi_x = int(os.environ.get("OCR_ROI_X", "0"))
+        roi_y = int(os.environ.get("OCR_ROI_Y", "52"))
+        roi_w = int(os.environ.get("OCR_ROI_W", "520"))
+        roi_h = int(os.environ.get("OCR_ROI_H", "54"))
+        x1, y1 = max(0, roi_x), max(0, roi_y)
+        x2 = min(fw, x1 + roi_w)
+        y2 = min(fh, y1 + roi_h)
+        if x2 <= x1 or y2 <= y1:
+            return None
+
+        roi = frame[y1:y2, x1:x2]
+        variants = _build_ocr_variants(roi)
+        allow_time = "0123456789:/- 上午下午APMapm"
+        allow_generic = "0123456789:/- .上午下午APMapm"
+        variant_order = ("white_mask", "up", "gray")
+
+        best_raw = ""
+        best_score = -1
+        for name in variant_order:
+            img = variants.get(name)
+            if img is None:
+                continue
+            texts = ocr_reader.readtext(img, detail=0, allowlist=allow_time)
+            if not texts:
+                texts = ocr_reader.readtext(img, detail=0, allowlist=allow_generic)
+            raw = _normalize_ocr_text(" ".join(texts).strip())
+            score = 0
+            score += sum(ch.isdigit() for ch in raw)
+            if re.search(r"20\d{2}\D+\d{1,2}\D+\d{1,2}", raw):
+                score += 40
+            if re.search(r"\d{1,2}\D+\d{2}\D+\d{2}", raw):
+                score += 30
+            score += raw.count("/") * 4 + raw.count(":") * 4
+            if ("下午" in raw) or ("上午" in raw) or ("PM" in raw) or ("AM" in raw):
+                score += 6
+            if score > best_score:
+                best_score = score
+                best_raw = raw
+
+        time_only = _extract_time_only_from_variants(ocr_reader, variants)
+        merged = _merge_date_and_time(best_raw, time_only)
+
+        date_m = re.search(r"(\d{4})[/\-](\d{1,2})[/\-](\d{1,2})", merged)
+        time_m = re.search(r"(\d{1,2})[:：](\d{2})[:：](\d{2})", merged)
+        if not date_m or not time_m:
+            if os.environ.get("OCR_DEBUG", "0") == "1":
+                print(
+                    f"--- [OCR] parse_failed | roi=({x1},{y1},{x2 - x1},{y2 - y1}) "
+                    f"| best_raw={best_raw!r} | time_only={time_only!r} | merged={merged!r} ---",
+                    flush=True,
+                )
+            return None
+
+        y, mo, d = date_m.groups()
+        h, mi, s = time_m.groups()
+        h = int(h)
+        if "下午" in merged and h != 12:
+            h += 12
+        elif "上午" in merged and h == 12:
+            h = 0
+        return datetime(int(y), int(mo), int(d), h, int(mi), int(s)).isoformat()
+    except Exception as e:
+        if os.environ.get("OCR_DEBUG", "0") == "1":
+            print(
+                f"--- [OCR] extract_exception | type={type(e).__name__} | msg={str(e)} ---",
+                flush=True,
+            )
+        return None
 
 class AnalysisService:
 
@@ -448,6 +707,20 @@ class AnalysisService:
                     t += interval_sec
                 return cnt
             return int(min(int(max_frames), total_frames))
+        finally:
+            cap.release()
+
+    @staticmethod
+    def _probe_total_video_frames(video_path: str) -> Optional[int]:
+        """取得影片總幀數；失敗時回傳 None。"""
+        cap = cv2.VideoCapture(video_path)
+        if not cap.isOpened():
+            return None
+        try:
+            total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT) or 0)
+            if total_frames > 0:
+                return total_frames
+            return None
         finally:
             cap.release()
 
@@ -1062,17 +1335,36 @@ class AnalysisService:
         if not seg_paths:
             return []
 
+        t_impl_start = time.time()
+        print(
+            f"--- [YOLO Batch][Stage] START | segs={len(seg_paths)} | labels={labels} | "
+            f"every_sec={every_sec} | score_thr={score_thr} | batch_size={batch_size} | yolo_num_frames={yolo_num_frames} ---",
+            flush=True,
+        )
+
         # 1. 獲取模型與基礎參數
+        t_model_load_start = time.time()
         model = get_yolo_model()
         reid_model, reid_device = get_reid_model()
+        print(
+            f"--- [YOLO Batch][Stage] model_ready | elapsed={round(time.time() - t_model_load_start, 2)}s "
+            f"| reid_model={'yes' if reid_model is not None else 'no'} | reid_device={reid_device} ---",
+            flush=True,
+        )
         labels_list = [l.strip() for l in (labels or "person,car").split(",") if l.strip()]
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
         # 2. 設備初始化與類別設定 (僅處理設備邏輯，不在此處 print 尚未宣告的變數)
+        t_device_setup_start = time.time()
         try:
             model.to(device)
             model.set_classes(labels_list)
             model.to(device)
+            print(
+                f"--- [YOLO Batch][Stage] device_ready | device={device} | labels={labels_list} "
+                f"| elapsed={round(time.time() - t_device_setup_start, 2)}s ---",
+                flush=True,
+            )
         except RuntimeError as e:
             if "same device" in str(e):
                 print(f"--- [YOLO Batch] 偵測到張量設備不一致，嘗試 CPU 修復再回傳 {device} ---", flush=True)
@@ -1081,6 +1373,10 @@ class AnalysisService:
                     model.set_classes(labels_list)
                     model.to(device)
                     print("--- [YOLO Batch] 設備同步修復完成 ---", flush=True)
+                    print(
+                        f"--- [YOLO Batch][Stage] device_ready_after_fix | elapsed={round(time.time() - t_device_setup_start, 2)}s ---",
+                        flush=True,
+                    )
                 except Exception as e2:
                     return [{"error": f"Device Fix Failed: {str(e2)}", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
             else:
@@ -1089,6 +1385,7 @@ class AnalysisService:
             return [{"error": f"Init Error: {str(e)}", "detections": [], "crop_paths": [], "object_count": {}, "total_frames_processed": 0}] * len(seg_paths)
 
         # 3. 收集所有影格 (Flat Frames)
+        t_extract_start = time.time()
         flat_frames: List[tuple] = []
         frames_per_seg: List[int] = [0] * len(seg_paths)
 
@@ -1111,8 +1408,9 @@ class AnalysisService:
                 cap.set(cv2.CAP_PROP_POS_FRAMES, fi)
                 ok, frame = cap.read()
                 if ok:
-                    # (段索引, 影格索引, 影像陣列, FPS, 儲存目錄)
-                    flat_frames.append((seg_idx, fi, frame.copy(), fps, crops_dir))
+                    wall_time = None
+                    # (段索引, 影格索引, 影像陣列, FPS, 儲存目錄, 畫面絕對時間)
+                    flat_frames.append((seg_idx, fi, frame.copy(), fps, crops_dir, wall_time))
 
             frames_per_seg[seg_idx] = len(frame_indices)
             cap.release()
@@ -1139,18 +1437,32 @@ class AnalysisService:
             f"predict batch_size={batch_size} | every_sec={every_sec} ---",
             flush=True,
         )
+        print(
+            f"--- [YOLO Batch][Stage] frames_ready | total_frames={len(flat_frames)} "
+            f"| elapsed={round(time.time() - t_extract_start, 2)}s ---",
+            flush=True,
+        )
 
         # 4. 執行 YOLO Batch 推論
+        t_predict_start = time.time()
         flat_for_reid: List[tuple] = []
         seg_detections: List[List[Dict]] = [[] for _ in range(len(seg_paths))]
+        total_chunks = (len(flat_frames) + batch_size - 1) // batch_size if batch_size > 0 else 0
 
         for start in range(0, len(flat_frames), batch_size):
+            chunk_idx = (start // batch_size) + 1
             chunk = flat_frames[start : start + batch_size]
             batch_frames = [x[2] for x in chunk]
 
             batch_predict_res: List[Any] = []
+            t_chunk = time.time()
             try:
                 batch_predict_res = list(model.predict(batch_frames, conf=score_thr, verbose=False))
+                print(
+                    f"--- [YOLO Batch][Chunk] {chunk_idx}/{total_chunks} predict_ok | "
+                    f"frames={len(batch_frames)} | elapsed={round(time.time() - t_chunk, 2)}s ---",
+                    flush=True,
+                )
             except Exception as e:
                 print(
                     f"--- [YOLO Batch] 批次 Predict 失敗，改單幀重試: {type(e).__name__}: {e} ---",
@@ -1171,6 +1483,11 @@ class AnalysisService:
                             flush=True,
                         )
                         batch_predict_res.append(None)
+                print(
+                    f"--- [YOLO Batch][Chunk] {chunk_idx}/{total_chunks} fallback_done | "
+                    f"frames={len(batch_frames)} | elapsed={round(time.time() - t_chunk, 2)}s ---",
+                    flush=True,
+                )
 
             while len(batch_predict_res) < len(chunk):
                 batch_predict_res.append(None)
@@ -1186,7 +1503,7 @@ class AnalysisService:
                     print(f"--- [YOLO Batch] 結果物件無效 idx={idx}: {type(e_parse).__name__}: {e_parse} ---", flush=True)
                     continue
 
-                seg_idx, fi, frame, fps, crops_dir = chunk[idx]
+                seg_idx, fi, frame, fps, crops_dir, wall_time = chunk[idx]
                 timestamp = round(fi / fps, 2)
                 temp_detections = []
                 crops_imgs = []
@@ -1200,14 +1517,16 @@ class AnalysisService:
                     # 裁切物件影像
                     crop = frame[xyxy[1]:xyxy[3], xyxy[0]:xyxy[2]]
                     if crop.size > 0:
-                        crop_filename = f"crop_{fi}_{b_idx}_{label}.jpg"
+                        crop_filename = f"crop_s{seg_idx:03d}_{fi}_{b_idx}_{label}.jpg"
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)
                         
                         rel_crop_path = AnalysisService._safe_crop_path_for_storage(crop_path, crops_dir.parent.parent)
                         
                         det_info = {
-                            "timestamp": timestamp, "label": label, "score": conf,
+                            "timestamp": timestamp,
+                            "wall_time": wall_time,
+                            "label": label, "score": conf,
                             "box": xyxy, "frame": fi, "path": rel_crop_path,
                         }
                         temp_detections.append(det_info)
@@ -1235,6 +1554,7 @@ class AnalysisService:
         # )
 
         # 6. 執行 ReID Embedding Batch
+        t_reid_start = time.time()
         if flat_for_reid and reid_model:
             all_crops = [x[2] for x in flat_for_reid]
             # 一次將所有裁切圖送入 ReID 提取特徵向量
@@ -1246,6 +1566,17 @@ class AnalysisService:
                     flat_for_reid[i][1]["reid_embedding"] = emb
             del all_crops
             del embeddings
+            print(
+                f"--- [YOLO Batch][Stage] reid_done | crops={len(flat_for_reid)} "
+                f"| elapsed={round(time.time() - t_reid_start, 2)}s ---",
+                flush=True,
+            )
+        else:
+            print(
+                f"--- [YOLO Batch][Stage] reid_skip | crops={len(flat_for_reid)} | "
+                f"reid_model={'yes' if reid_model is not None else 'no'} ---",
+                flush=True,
+            )
 
         _release_gpu_memory()
 
@@ -1270,6 +1601,10 @@ class AnalysisService:
 
         print(
             f"--- [YOLO Batch] 完成 {len(seg_paths)} 段分析，處理 {len(flat_frames)} 幀，產生 {len(flat_for_reid)} 個 ReID 特徵 ---",
+            flush=True,
+        )
+        print(
+            f"--- [YOLO Batch][Stage] END | total_elapsed={round(time.time() - t_impl_start, 2)}s ---",
             flush=True,
         )
         del flat_frames
@@ -1381,8 +1716,8 @@ class AnalysisService:
             # 這裡預設不要用太大的 batch，避免觸發一次性較大的 CUDA/allocator 保留記憶體。
 
             # 16, 80
-            vlm_batch_size = 25
-            yolo_frame_batch = 125
+            vlm_batch_size = 30
+            yolo_frame_batch = 1000
 
             print(
                 f"--- [Pipeline vllm_qwen] 共 {len(seg_files)} 段 | VLM batch={vlm_batch_size} YOLO 幀batch={yolo_frame_batch} "
@@ -1474,6 +1809,7 @@ class AnalysisService:
         event_prompt: str,
         summary_prompt: str,
         video_num_frames: Optional[int] = None,
+        video_num_frames_list: Optional[List[Optional[int]]] = None,
     ) -> List[Tuple[Dict, str]]:
         """
         vLLM 批次推論（影片直送，不做截圖取幀）。
@@ -1516,12 +1852,17 @@ class AnalysisService:
             if not os.path.exists(path):
                 all_parsed[i] = ({"error": f"找不到影片檔案: {path}"}, "")
                 continue
+            req_video_num_frames: Optional[int] = video_num_frames
+            if video_num_frames_list and i < len(video_num_frames_list):
+                cand = video_num_frames_list[i]
+                if cand is not None and int(cand) > 0:
+                    req_video_num_frames = int(cand)
             batch_requests.append(
                 {
                     "messages": combined_msgs,
                     "video_path": path,
                     "enable_thinking": False if qwen3_disable_thinking else True,
-                    "video_num_frames": video_num_frames,
+                    "video_num_frames": req_video_num_frames,
                 }
             )
             valid_indices.append(i)
@@ -1544,7 +1885,13 @@ class AnalysisService:
 
         for j, raw in enumerate(raw_outputs):
             orig_idx = valid_indices[j]
+            if not raw or not str(raw).strip():
+                all_parsed[orig_idx] = ({"error": "vLLM 回應為空（可能連線失敗或服務不可用）"}, "")
+                continue
             combined = _safe_parse_json(raw) or _extract_first_json(raw) or {}
+            if not isinstance(combined, dict) or not combined:
+                all_parsed[orig_idx] = ({"error": "vLLM 回應無法解析為有效 JSON"}, "")
+                continue
             events_in = combined.get("events") if isinstance(combined.get("events"), dict) else {}
             reason = (
                 combined.get("event_reason")
@@ -1628,6 +1975,79 @@ class AnalysisService:
                 merged["success"] = ("error" not in frame_obj)
                 if "error" in frame_obj:
                     merged["error"] = frame_obj.get("error")
+                results.append(merged)
+        results.sort(key=lambda x: x["segment"])
+        return results
+
+    @staticmethod
+    def run_vllm_video_direct_all_frames_pipeline(
+        seg_files: List[Path],
+        total_duration: float,
+        segment_duration: float,
+        overlap: float,
+        qwen_model: str,
+        event_detection_prompt: str,
+        summary_prompt: str,
+        qwen_inference_batch_size: Optional[int] = None,
+    ) -> List[Dict]:
+        """
+        vLLM 影片直送 + 每段全幀模式（不跑 YOLO）。
+        會先探測每個 segment 的總幀數，並帶入 video_url.num_frames。
+        """
+        results: List[Dict] = []
+        vlm_batch_size = qwen_inference_batch_size or 10
+
+        class Req:
+            def __init__(self, **kwargs):
+                for k, v in kwargs.items():
+                    setattr(self, k, v)
+
+        for batch_start in range(0, len(seg_files), vlm_batch_size):
+            batch_paths = seg_files[batch_start : batch_start + vlm_batch_size]
+            path_strs = [str(p) for p in batch_paths]
+            per_segment_frames: List[Optional[int]] = []
+            for path in path_strs:
+                nf = AnalysisService._probe_total_video_frames(path)
+                per_segment_frames.append(nf)
+                print(
+                    f"--- [vLLM VideoDirect AllFrames] segment={Path(path).name} probed_total_frames={nf} ---",
+                    flush=True,
+                )
+
+            t_batch_start = time.time()
+            vlm_list = AnalysisService.infer_segment_vllm_batch_video_direct(
+                model_name=qwen_model,
+                path_strs=path_strs,
+                event_prompt=event_detection_prompt,
+                summary_prompt=summary_prompt,
+                video_num_frames_list=per_segment_frames,
+            )
+            batch_elapsed_sec = round(time.time() - t_batch_start, 2)
+
+            for i, seg_path in enumerate(batch_paths):
+                idx = batch_start + i
+                start = idx * (segment_duration - overlap)
+                end = min(start + segment_duration, total_duration)
+                req = Req(
+                    segment_path=str(seg_path),
+                    start_time=start,
+                    end_time=end,
+                )
+                frame_obj, summary_txt = vlm_list[i] if i < len(vlm_list) else ({"error": "batch 長度不符"}, "")
+                merged = AnalysisService._merge_vlm_and_yolo_result(
+                    req,
+                    frame_obj,
+                    summary_txt,
+                    yolo_res={},
+                    batch_elapsed_sec=batch_elapsed_sec,
+                )
+                merged["raw_detection"] = {}
+                merged["success"] = ("error" not in frame_obj)
+                if "error" in frame_obj:
+                    merged["error"] = frame_obj.get("error")
+                merged["video_direct_num_frames"] = (
+                    int(per_segment_frames[i]) if i < len(per_segment_frames) and per_segment_frames[i] else None
+                )
                 results.append(merged)
         results.sort(key=lambda x: x["segment"])
         return results
@@ -1812,7 +2232,8 @@ class AnalysisService:
                     x1, y1, x2, y2 = xyxy
                     crop = frame[y1:y2, x1:x2]  # numpy 切片：從原幀裁出 bbox 區域
                     if crop.size > 0:  # 若裁切區域有效（非空）
-                        crop_filename = f"crop_{fi}_{b_idx}_{label}.jpg"
+                        seg_stem = Path(seg_path).stem
+                        crop_filename = f"crop_{seg_stem}_{fi}_{b_idx}_{label}.jpg"
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)  # 將裁剪圖存成 jpg
 

@@ -160,10 +160,14 @@ services:
       --host 0.0.0.0
       --port ${QWEN3_PORT:-8441}
       --trust-remote-code
-      --dtype auto
-      --gpu-memory-utilization ${QWEN3_GPU_MEMORY_UTILIZATION:-0.7}
-      --max-model-len ${QWEN3_MAX_MODEL_LEN:-16384}
+      --dtype half
+      --gpu-memory-utilization ${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.7}
+      --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-16384}
+      --max-num-seqs 256
+      --enable-chunked-prefill
       --allowed-local-media-path /app/segment
+      --media-io-kwargs '{"video": {"num_frames": 5}}'
+      --mm-processor-kwargs '{"num_frames": 5}'
 
   # Qwen3-VL AWQ（host network，預設主機 8442）
   vllm-qwen3-awq:
@@ -178,7 +182,7 @@ services:
       - QWEN3_AWQ_SERVED_MODEL_NAME=${QWEN3_AWQ_SERVED_MODEL_NAME:-Qwen/Qwen3-VL-8B-Instruct-AWQ}
       - QWEN3_AWQ_HOST=0.0.0.0
       - QWEN3_AWQ_PORT=8442
-      - QWEN3_AWQ_GPU_MEMORY_UTILIZATION=${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.7}
+      - QWEN3_AWQ_GPU_MEMORY_UTILIZATION=${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.4}
       - QWEN3_AWQ_MAX_MODEL_LEN=${QWEN3_AWQ_MAX_MODEL_LEN:-16384}
       - QWEN3_AWQ_API_KEY=${QWEN3_AWQ_API_KEY:-}
       - HF_HOME=/root/.cache/huggingface
@@ -206,7 +210,7 @@ services:
       --port ${QWEN3_AWQ_PORT:-8442}
       --trust-remote-code
       --dtype half
-      --gpu-memory-utilization ${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.7}
+      --gpu-memory-utilization ${QWEN3_AWQ_GPU_MEMORY_UTILIZATION:-0.4}
       --max-model-len ${QWEN3_AWQ_MAX_MODEL_LEN:-16384}
       --max-num-seqs 256
       --enable-chunked-prefill
@@ -220,7 +224,7 @@ services:
     restart: unless-stopped
     environment:
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=postgres
     volumes:
       - postgres_data:/var/lib/postgresql/data
@@ -280,6 +284,7 @@ services:
       - PROJECT_ROOT=${PROJECT_ROOT}
       - HOST=${HOST}
       - PORT=8080
+      - OCR_DEBUG=1
       - RELOAD=${RELOAD:-false}
       # gunicorn：-w WORKERS，UvicornWorker；worker 死後 master 會再起。
       # uvicorn：WORKERS=1 為單一 process；WORKERS>1 則 uvicorn --workers N（多 process，仍非 Gunicorn）。
@@ -316,7 +321,7 @@ services:
       - VLLM_VIDEO_DIRECT_SAMPLE_FPS=${VLLM_VIDEO_DIRECT_SAMPLE_FPS:-5}
       - VLLM_VIDEO_DIRECT_MAX_FRAMES=${VLLM_VIDEO_DIRECT_MAX_FRAMES:-256}
       - VLLM_VIDEO_DIRECT_NUM_FRAMES=${VLLM_VIDEO_DIRECT_NUM_FRAMES:-}
-      - VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS=${VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS:-4096}
+      - VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS=${VLLM_VIDEO_DIRECT_MAX_COMPLETION_TOKENS:-10240}
       # --- VLM 自動編排（釋放 VRAM：例如切到 Qwen2.5 時 stop vllm-qwen3 再 up vllm）---
       # .env 須設 VLM_COMPOSE_PROJECT_NAME=與主機 compose 專案名相同（例 test_platform-main），否則 stop 會找不到容器。
       # 預設 false。要啟用請在 .env 設 VLM_ORCHESTRATION_ENABLED=true，並取消註解下方 docker.sock + vlm-compose-host，
@@ -338,7 +343,7 @@ services:
       - GEMINI_API_KEY=${GEMINI_API_KEY}
       - MY_API_KEY=${MY_API_KEY}
       - POSTGRES_USER=postgres
-      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD:-postgres}
       - POSTGRES_DB=postgres
       - POSTGRES_HOST=postgres
       - POSTGRES_PORT=5432
