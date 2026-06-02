@@ -455,8 +455,6 @@ services:
       - HOST=0.0.0.0
       # 經 nginx 以不同 Host 存取 dev server 時避免 Invalid Host header
       - DANGEROUSLY_DISABLE_HOST_CHECK=true
-      - WDS_SOCKET_HOST=localhost
-      - WDS_SOCKET_PORT=3000
     volumes:
       - ./frontend:/app:delegated
       # - node_modules_data:/app/node_modules

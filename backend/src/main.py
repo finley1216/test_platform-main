@@ -3590,7 +3590,11 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
     - event_types: List[str] - 事件類型（對應到資料庫欄位）
     """
     # [NEW] 使用 MCP 客戶端進行日期解析
-    from mcp_client import parse_date_via_mcp
+    # 支援容器與本地不同的模組路徑
+    try:
+        from src.mcp_client import parse_date_via_mcp
+    except ImportError:
+        from mcp_client import parse_date_via_mcp
     
     filters = {
         "date_filter": None,

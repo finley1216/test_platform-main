@@ -14,9 +14,92 @@ from fastapi.responses import JSONResponse
 from sqlalchemy.orm import Session
 from sqlalchemy import and_, or_, func, select
 from datetime import datetime, timedelta
+from src.config import config
+from src.services.vlm_profile_service import read_selected_profile_id, VLM_PROFILES
+from src.utils.vllm_utils import _vllm_chat
 
 # 先定義 router，避免循環導入問題
 router = APIRouter(tags=["RAG 相關 API"])
+
+def _normalize_summary_text(raw: Any) -> str:
+    """將可能是 JSON/Markdown 的摘要內容轉為可讀純文字。"""
+    if raw is None:
+        return ""
+    text = str(raw).strip()
+    if not text:
+        return ""
+
+    # 移除常見 markdown code fence
+    text = re.sub(r"^```[a-zA-Z0-9_-]*\s*", "", text)
+    text = re.sub(r"\s*```$", "", text).strip()
+
+    def _extract_from_obj(obj: Any) -> Optional[str]:
+        if isinstance(obj, dict):
+            for key in ("description", "summary", "message", "content"):
+                val = obj.get(key)
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+            for val in obj.values():
+                if isinstance(val, str) and val.strip():
+                    return val.strip()
+        return None
+
+    # 優先嘗試整段 JSON
+    try:
+        obj = json.loads(text)
+        extracted = _extract_from_obj(obj)
+        if extracted:
+            return extracted
+    except Exception:
+        pass
+
+    # 嘗試擷取文字中第一個 JSON 物件
+    m = re.search(r"\{[\s\S]*\}", text)
+    if m:
+        try:
+            obj = json.loads(m.group(0))
+            extracted = _extract_from_obj(obj)
+            if extracted:
+                return extracted
+        except Exception:
+            pass
+
+    # 最後兜底：清掉前導符號，避免前端看到殘片
+    text = text.lstrip(",")
+    return text.strip()
+
+def _should_skip_summary(raw: Any, normalized: str) -> bool:
+    """判斷是否應跳過不適合顯示的摘要內容。"""
+    raw_text = str(raw or "")
+    norm_text = (normalized or "").strip()
+    raw_lower = raw_text.lower()
+    norm_lower = norm_text.lower()
+
+    # 0) 空字串、單一逗號、或只含標點/符號
+    if not norm_text:
+        return True
+    if norm_text in {",", "，", ".", "。", ";", "；", ":", "："}:
+        return True
+    # 只包含空白與常見標點時也視為無效摘要
+    if re.fullmatch(r"[\s,，.。;；:：'\"`{}\[\]\(\)_-]+", norm_text):
+        return True
+
+    # 1) 明確的 YOLO fallback 文字（無 VLM 摘要）
+    if "yolo 偵測結果（無 vlm 摘要）" in norm_lower or "yolo 偵測結果（無 vlm 摘要）" in raw_lower:
+        return True
+
+    # 2) JSON 殘片／description 欄位格式（使用者希望直接跳過，不顯示）
+    if '"description"' in raw_lower:
+        return True
+    if raw_text.lstrip().startswith(",") and "{" in raw_text and "}" in raw_text:
+        return True
+    # 一般 JSON 物件/陣列格式也直接跳過（例如 {"id":...,"clothing":...}）
+    if (norm_text.startswith("{") and norm_text.endswith("}")) or (norm_text.startswith("[") and norm_text.endswith("]")):
+        return True
+    if re.search(r'"\w+"\s*:', norm_text) and ("{" in norm_text or "[" in norm_text):
+        return True
+
+    return False
 
 # 延遲導入以避免循環導入
 def _get_main_imports():
@@ -245,12 +328,16 @@ async def rag_search(
             if time_start:
                 final_score = min(1.0, final_score + 0.3)
 
+            normalized_summary = _normalize_summary_text(summary.message)
+            if _should_skip_summary(summary.message, normalized_summary):
+                continue
+
             hits.append({
                 "id": summary.id,
                 "video": summary.video,
                 "segment": summary.segment,
                 "time_range": summary.time_range,
-                "summary": summary.message,
+                "summary": normalized_summary,
                 "score": final_score,
                 "timestamp": summary.start_timestamp.isoformat() if summary.start_timestamp else None,
                 "events": {
@@ -379,17 +466,32 @@ async def rag_answer(
 
 請根據上述片段摘要回答問題。"""
     
-    # 5. 呼叫 Ollama 生成回答
+    # 5. 呼叫已選定的 LLM 後端生成回答（vLLM profile 優先；否則回退 Ollama）
     try:
+        selected_profile = read_selected_profile_id()
+        selected_spec = VLM_PROFILES.get(selected_profile, {})
         messages = [{"role": "user", "content": prompt}]
-        # 使用 LLM 模型生成回答，而不是 embedding 模型
-        # 減少 timeout 到 5 分鐘（原本是10分鐘），加快錯誤檢測
-        answer = _ollama_chat(config.OLLAMA_LLM_MODEL, messages, timeout=300)
+        llm_backend = "ollama"
+        llm_model = config.OLLAMA_LLM_MODEL
+
+        if selected_profile.startswith("vllm_"):
+            llm_backend = "vllm"
+            llm_model = selected_spec.get("qwen_model") or "Qwen/Qwen3-VL-8B-Instruct-AWQ"
+            answer = _vllm_chat(
+                llm_model,
+                messages,
+                timeout=300,
+                # Qwen3 預設關閉 thinking，避免把輸出塞進 reasoning 區造成 content 過短
+                enable_thinking=False if "qwen3" in llm_model.lower() else None,
+            )
+        else:
+            answer = _ollama_chat(llm_model, messages, timeout=300)
         
         return {
             "answer": answer,
             "hits": hits,  # 返回所有搜索結果
             "success": True,
+            "backend": {"llm_backend": llm_backend, "llm": llm_model},
             "date_parsed": search_resp.get("date_parsed"),
             "keywords_found": search_resp.get("keywords_found"),
             "event_types_found": search_resp.get("event_types_found")

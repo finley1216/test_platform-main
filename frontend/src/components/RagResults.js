@@ -91,6 +91,9 @@ const RagResults = ({ data, apiKey }) => {
             .join("、") || "無事件";
         const videoPath = h.video || "";
         const segment = h.segment || "";
+        // 後端歷史資料有些 video 會帶路徑分隔（例如 人員追蹤_20260528/K8-22），
+        // 但實際 segment 目錄使用底線命名（人員追蹤_20260528_K8-22）。
+        const normalizedVideoPath = videoPath.replace(/\//g, "_");
         // 構建完整路徑：確保包含 /segment/ 前綴
         let fullVideoPath = "";
         if (videoPath && segment) {
@@ -99,7 +102,7 @@ const RagResults = ({ data, apiKey }) => {
             fullVideoPath = `${videoPath}/${segment}`;
           } else {
             // 否則添加 /segment/ 前綴
-            fullVideoPath = `/segment/${videoPath}/${segment}`;
+            fullVideoPath = `/segment/${normalizedVideoPath}/${segment}`;
           }
         }
 

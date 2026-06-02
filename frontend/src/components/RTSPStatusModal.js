@@ -13,8 +13,6 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
 
   // RTSP 位址
   const [url, setUrl] = useState("rtsp://stream.strba.sk:1935/strba/VYHLAD_JAZERO.stream");
-  // 影片 ID
-  const [videoId, setVideoId] = useState("CAM_01");
   const [activeStreams, setActiveStreams] = useState({});
   const [logs, setLogs] = useState([]);
 
@@ -221,9 +219,8 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
         const port = window.location.port || (window.location.protocol === 'https:' ? '443' : '80');
         setHlsUrl(`http://${window.location.hostname}:${port}/hls/live/`);
 
-        // 2. 整理出一份需要追蹤分析結果的 ID 清單（包含本地測試影片、當前選中影片及所有串流），並去除重複項。
-        const idsToTrack = [LOCAL_VIDEO_ID, videoId, ...Object.keys(status || {})].filter(id => id);
-        const uniqueIds = [...new Set(idsToTrack)];
+        // 2. 只追蹤目前播放器影片（本地影片），避免追蹤不存在的硬編碼 ID。
+        const uniqueIds = [LOCAL_VIDEO_ID];
         console.log('[pollTest] 本輪追蹤的 video ids', uniqueIds);
 
         // 併發請求：同時向後端查詢所有 ID 的分析報告。若其中一個請求失敗則回傳 null。
@@ -342,7 +339,7 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
       // 清空日誌緩衝區。
       setLogs([]);
     };
-  }, [isOpen, apiKey, videoId]); // 只在視窗、密鑰或主要 ID 變更時啟動一次邏輯
+  }, [isOpen, apiKey]); // 只在視窗與密鑰變更時啟動一次邏輯
 
   // 用於觸發本地影片分析的完整流程。它負責從前端發送分析參數到後端，並將回傳的 AI 摘要即時轉換為使用者可讀的日誌訊息。
   const handleStart = async () => {
