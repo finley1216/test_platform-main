@@ -49,6 +49,8 @@ from repo_paths import (  # noqa: E402
     DEFAULT_VEHICLE_QUERY_0528,
     OUTPUT_ROOT,
     QUERY_FILTER_OUTPUT_ROOT,
+    person_embed_cache_path,
+    vehicle_embed_cache_path,
 )
 
 if not hasattr(np, "float"):
@@ -67,11 +69,9 @@ from query_tracklet import (  # noqa: E402
     build_tracklet_vec,
     load_person_records,
     normalize_vec,
-    person_cache_path,
 )
 from query_vehicle_tracklet import (  # noqa: E402
     load_vehicle_records,
-    vehicle_cache_path,
     vehicle_crop_dir,
 )
 from run_k809_botsort_clipreid import (  # noqa: E402
@@ -388,9 +388,10 @@ def load_records(
 
 
 def cache_path(spec: DatasetSpec, video_id: str) -> Path:
+    root = spec.crop_root
     if spec.label == "person":
-        return person_cache_path(video_id)
-    return vehicle_cache_path(video_id)
+        return person_embed_cache_path(root, video_id)
+    return vehicle_embed_cache_path(root, video_id)
 
 
 def run_crop_botsort_tracklet_filter(

@@ -17,9 +17,12 @@ from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 CLIP_DIR = REPO_ROOT / "CLIP-ReID"
-OUTPUT_ROOT = REPO_ROOT.parent / "output"
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 if str(CLIP_DIR) not in sys.path:
     sys.path.insert(0, str(CLIP_DIR))
+
+from repo_paths import OUTPUT_ROOT, SEGMENT_ROOT  # noqa: E402
 
 from export_crop_time_mapping import (  # noqa: E402
     _box_json,
@@ -34,7 +37,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--category", required=True, help="e.g. 人員追蹤_20260528")
     p.add_argument(
         "--segment_root",
-        default=str(REPO_ROOT / "backend" / "segment"),
+        default=str(SEGMENT_ROOT),
+        help="segment JSON + crop 來源（git clone 後需自行放入，見 docs/追蹤流程快速開始.md）",
     )
     p.add_argument(
         "--output_dir",
@@ -220,11 +224,28 @@ def build_category_mapping(
     }
 
 
+def _require_segment_root(segment_root: Path, category: str) -> None:
+    if not segment_root.is_dir():
+        raise SystemExit(
+            f"segment 目錄不存在：{segment_root}\n"
+            "此目錄不在 git 內（見 .gitignore）。請先將 backend/segment/{category}_K8-* 放入，"
+            "或從既有環境複製 / 建立 symlink。\n"
+            "詳見 docs/追蹤流程快速開始.md"
+        )
+    stems = list(_iter_category_stems(segment_root, category))
+    if not stems:
+        raise SystemExit(
+            f"在 {segment_root} 找不到符合 {category}_K8-* 的目錄。\n"
+            f"請確認 --category 是否正確（例如 人員追蹤_20260507）。"
+        )
+
+
 def main() -> None:
     args = parse_args()
     segment_root = Path(args.segment_root).resolve()
     output_dir = Path(args.output_dir).resolve()
     output_dir.mkdir(parents=True, exist_ok=True)
+    _require_segment_root(segment_root, args.category)
 
     label_filter = {x.strip().lower() for x in args.labels.split(",") if x.strip()}
     payload = build_category_mapping(
@@ -255,6 +276,17 @@ def main() -> None:
             f"skipped={sync_stats['skipped']} missing={sync_stats['missing']} -> {output_dir}",
             flush=True,
         )
+
+    print(
+        "\n[Next] 執行 query 篩選 + BoT-SORT + merge + filter：\n"
+        f"  cd {REPO_ROOT}\n"
+        f"  python3 CLIP-ReID/download_weights.py person   # 或 vehicle\n"
+        f"  python3 query_filter_botsort_merge_filter_dataset.py \\\n"
+        f"    --dataset {args.category} \\\n"
+        f"    --merge-rule triple \\\n"
+        f"    --data-dir {output_dir}",
+        flush=True,
+    )
 
 
 if __name__ == "__main__":

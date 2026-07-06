@@ -68,6 +68,17 @@ def _legacy_pretrained_dir() -> Optional[Path]:
 
 def _download_gdrive(file_id: str, dest: Path) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import gdown
+
+        print(f"[weights] 使用 gdown 下載 -> {dest}", flush=True)
+        gdown.download(id=file_id, output=str(dest), quiet=False)
+        if dest.is_file() and dest.stat().st_size > 1_000_000:
+            return
+    except Exception as exc:
+        print(f"[weights] gdown 失敗（{exc}），改試 urllib …", flush=True)
+
     session_url = "https://drive.google.com/uc?export=download"
     with urlopen(f"{session_url}&id={file_id}") as resp:
         data = resp.read()
@@ -82,8 +93,10 @@ def _download_gdrive(file_id: str, dest: Path) -> None:
             data = resp.read()
     if len(data) < 1_000_000:
         raise RuntimeError(
-            f"下載 {dest.name} 失敗（檔案過小，可能為 Google Drive 確認頁）。"
-            f"請手動下載後放到 {dest}"
+            f"下載 {dest.name} 失敗。\n"
+            f"請手動從 Google Drive 下載後放到：\n  {dest}\n"
+            f"人員: https://drive.google.com/file/d/{GDRIVE_PERSON_MARKET}/view\n"
+            f"車輛: https://drive.google.com/file/d/{GDRIVE_VEHICLE_VERI_SIE}/view"
         )
     dest.write_bytes(data)
 

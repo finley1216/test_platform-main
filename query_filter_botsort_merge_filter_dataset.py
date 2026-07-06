@@ -245,6 +245,14 @@ def main() -> None:
     if not STEP2.is_file():
         raise SystemExit(f"找不到 Step2 腳本：{STEP2}")
 
+    mapping_json = (args.mapping_json or (data_dir / f"{dataset_key}_crop_time_mapping.json")).resolve()
+    if not mapping_json.is_file():
+        raise SystemExit(
+            f"找不到 mapping：{mapping_json}\n"
+            "請先執行 backend/scripts/export_category_crop_time_mapping.py\n"
+            "詳見 docs/追蹤流程快速開始.md"
+        )
+
     print(f"資料集：{dataset_key}")
     print(f"data_dir（mapping + crop）：{data_dir}")
     print(f"輸出目錄（merge/filter）：{output_dir}")
