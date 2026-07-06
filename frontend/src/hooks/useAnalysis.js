@@ -11,6 +11,8 @@ export const useAnalysis = (apiKey) => {
   const pollingRef = useRef(null);
   const lastProgressRef = useRef(0);
   const lastProgressTimeRef = useRef(Date.now());
+  const loggedMilestonesRef = useRef(new Set());
+  const clientSendTimeRef = useRef(null);
 
   // 清理定時器
   const clearTimers = () => {
@@ -62,8 +64,11 @@ export const useAnalysis = (apiKey) => {
     setUploadProgress(0);
     lastProgressRef.current = 0;
     lastProgressTimeRef.current = Date.now();
+    loggedMilestonesRef.current = new Set();
+    clientSendTimeRef.current = Date.now();
 
     const startTime = Date.now();
+    const tsMs = () => new Date().toISOString();
     console.log("%c" + "=".repeat(80), "color: #3b82f6; font-weight: bold; font-size: 14px");
     console.log("%c[分析流程開始] " + new Date().toLocaleString(), "color: #3b82f6; font-weight: bold; font-size: 14px");
     
@@ -86,6 +91,27 @@ export const useAnalysis = (apiKey) => {
       const data = await apiService.runAnalysis(formData, apiKey, (progressEvent) => {
         const percentCompleted = Math.round((progressEvent.loaded * 100) / progressEvent.total);
         setUploadProgress(percentCompleted);
+
+        if (lastProgressRef.current === 0 && percentCompleted > 0) {
+          console.log(
+            `%c[LATENCY] upload_first_progress=${tsMs()} | percent=${percentCompleted}% | loaded=${progressEvent.loaded} | total=${progressEvent.total}`,
+            "color: #f59e0b; font-weight: bold"
+          );
+        }
+
+        for (let milestone = 10; milestone <= 100; milestone += 10) {
+          if (
+            percentCompleted >= milestone &&
+            !loggedMilestonesRef.current.has(milestone)
+          ) {
+            loggedMilestonesRef.current.add(milestone);
+            const sinceSendMs = Date.now() - (clientSendTimeRef.current || startTime);
+            console.log(
+              `%c[LATENCY] upload_progress_${milestone}=${tsMs()} | elapsed_since_send_ms=${sinceSendMs}`,
+              "color: #f59e0b; font-weight: bold"
+            );
+          }
+        }
         
         if (percentCompleted !== lastProgressRef.current) {
           lastProgressRef.current = percentCompleted;
@@ -95,6 +121,18 @@ export const useAnalysis = (apiKey) => {
       
       const elapsed = ((Date.now() - startTime) / 1000).toFixed(2);
       console.log("%c[完成] 收到後端響應, 總耗時:", "color: #8b5cf6; font-weight: bold", elapsed, "秒");
+      console.log(
+        "%c[LATENCY] 前端時間軸摘要 — 請搭配後端 docker logs 中 [LATENCY] 行對照 req_id",
+        "color: #3b82f6; font-weight: bold"
+      );
+      console.table({
+        "T0 client_send": "見 [LATENCY] client_send_timestamp",
+        "T1 upload_progress": "見 upload_progress_10 ~ _100",
+        "T2 client_upload_complete": "見 [LATENCY] client_upload_complete",
+        "T3 server_receive": "後端 [LATENCY] server_receive_timestamp",
+        "T4 server_file_ready": "後端 [LATENCY] server_file_ready_timestamp",
+        "T5 client_response": "見 [LATENCY] client_response_received",
+      });
       
       setAnalysisData(data);
       onSuccess?.(data);

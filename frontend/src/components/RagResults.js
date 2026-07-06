@@ -85,10 +85,36 @@ const RagResults = ({ data, apiKey }) => {
       )}
 
       {hits.map((h, i) => {
-        const events =
-          (h.events_true || [])
-            .map((e) => EVENT_MAP[e] || e)
-            .join("、") || "無事件";
+        const eventsTrue = Array.isArray(h.events_true) ? h.events_true : [];
+        const eventsFromArray = eventsTrue.map((e) => EVENT_MAP[e] || e);
+
+        // rag/search 新版回傳為 events 布林物件（鍵名可能與 EVENT_MAP 不同）
+        const eventAliasMap = {
+          fire: "fire",
+          water_flood: "water_flood",
+          person_fallen: "person_fallen_unmoving",
+          double_parking: "double_parking_lane_block",
+          smoking: "smoking_outside_zone",
+          crowd: "crowd_loitering",
+          security_door: "security_door_tamper",
+          abnormal_attire: "abnormal_attire_face_cover_at_entry",
+        };
+        const eventsObj = h.events && typeof h.events === "object" ? h.events : {};
+        const eventsFromObject = Object.entries(eventsObj)
+          .filter(([, v]) => Boolean(v))
+          .map(([k]) => eventAliasMap[k] || k)
+          .map((k) => EVENT_MAP[k] || k);
+
+        // 若沒有布林事件，退而顯示 event_reason（取冒號前標籤）
+        let eventReasonLabel = "";
+        if (typeof h.event_reason === "string" && h.event_reason.trim()) {
+          const reason = h.event_reason.trim();
+          const idx = reason.indexOf("：");
+          eventReasonLabel = idx > 0 ? reason.slice(0, idx).trim() : reason;
+        }
+
+        const mergedEvents = [...new Set([...eventsFromArray, ...eventsFromObject])];
+        const events = mergedEvents.join("、") || eventReasonLabel || "無事件";
         const videoPath = h.video || "";
         const segment = h.segment || "";
         // 後端歷史資料有些 video 會帶路徑分隔（例如 人員追蹤_20260528/K8-22），

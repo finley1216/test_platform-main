@@ -249,6 +249,7 @@ async def rag_search(
     # 1. 解析查詢中的過濾條件（日期、事件類型、關鍵字）
     query_filters = _parse_query_filters(query)
     message_keywords = query_filters.get("message_keywords", [])
+    event_reason_keywords = query_filters.get("event_reason_keywords", [])
     
     # 2. 生成查詢向量
     try:
@@ -291,7 +292,7 @@ async def rag_search(
                 t1 = time_end
             stmt = stmt.filter(Summary.start_timestamp < t1)
             
-        # 事件類型過濾
+        # 事件類型過濾（結構化 boolean 欄位）
         event_types = query_filters.get("event_types", [])
         if event_types:
             event_filters = []
@@ -300,13 +301,26 @@ async def rag_search(
                     event_filters.append(getattr(Summary, event) == True)
             if event_filters:
                 stmt = stmt.filter(or_(*event_filters))
+
+        # [NEW] event_reason_keywords：改為 soft boost，不做 hard filter
+        # 原因：hard filter 會讓向量命中但文字沒有關鍵詞的筆數全部砍掉
+        # 改成：只降低門檻讓更多候選進來，加分邏輯在後面的迴圈處理
+        event_reason_keywords = query_filters.get("event_reason_keywords", [])
+
+        # 語義搜尋分數門檻（候選階段）：
+        # 先放寬，避免「加分後應該達標」的結果在 SQL 階段被提前排除。
+        # 最終門檻會在 Python 端用 final_score 再做一次嚴格過濾。
+        effective_threshold = max(score_threshold - 0.6, 0.0)
+        stmt = stmt.filter(similarity >= effective_threshold)
         
-        # 4. 關鍵字模糊匹配（如果有的話，與語義搜尋並行）
-        # 語義搜尋分數門檻
-        stmt = stmt.filter(similarity >= score_threshold)
+        print(f"--- [DEBUG] event_reason_keywords (soft boost only): {event_reason_keywords} ---")
         
         # 排序與限制數量
-        stmt = stmt.order_by(similarity.desc()).limit(top_k * 2) # 多取一點以便後續排序
+        # 當有 event_reason_keywords 時，先擴大候選池，避免「有效命中」在前段被噪音摘要擠掉
+        candidate_limit = top_k * 2
+        if event_reason_keywords:
+            candidate_limit = max(top_k * 80, 200)
+        stmt = stmt.order_by(similarity.desc()).limit(candidate_limit)
         
         results = db.execute(stmt).all()
         
@@ -315,18 +329,36 @@ async def rag_search(
         for summary, score in results:
             final_score = float(score)
             
-            # [加分邏輯] 如果摘要中包含搜尋關鍵字，給予加分
+            # [加分邏輯 1] message 關鍵字命中
             if message_keywords:
                 msg_lower = (summary.message or "").lower()
                 bonus = 0.0
                 for kw in message_keywords:
                     if kw.lower() in msg_lower:
-                        bonus += 0.2
+                        bonus += 0.15
                 final_score = min(1.0, final_score + bonus)
+
+            # [加分邏輯 2] event_reason 關鍵字命中（比 message 更高權重）
+            if event_reason_keywords:
+                er_lower = (summary.event_reason or "").lower()
+                msg_lower = (summary.message or "").lower()
+                er_bonus = 0.0
+                for kw in event_reason_keywords:
+                    kw_lower = kw.lower()
+                    if kw_lower in er_lower:
+                        # event_reason 精確命中提高權重，確保動態事件查詢（如赤膊）在高門檻下仍可命中
+                        er_bonus += 0.45
+                    elif kw_lower in msg_lower:
+                        er_bonus += 0.15
+                final_score = min(1.0, final_score + er_bonus)
             
             # [加分邏輯] 如果日期範圍精準匹配（代表日期過濾生效），給予基礎加分
             if time_start:
                 final_score = min(1.0, final_score + 0.3)
+
+            # 最終門檻判斷：以「最終顯示分數」為準
+            if final_score < score_threshold:
+                continue
 
             normalized_summary = _normalize_summary_text(summary.message)
             if _should_skip_summary(summary.message, normalized_summary):
@@ -339,6 +371,7 @@ async def rag_search(
                 "time_range": summary.time_range,
                 "summary": normalized_summary,
                 "score": final_score,
+                "event_reason": summary.event_reason,
                 "timestamp": summary.start_timestamp.isoformat() if summary.start_timestamp else None,
                 "events": {
                     "fire": summary.fire,

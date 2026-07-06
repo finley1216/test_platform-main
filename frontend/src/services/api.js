@@ -158,7 +158,8 @@ class ApiService {
     return new Promise((resolve, reject) => {
       const xhr = new XMLHttpRequest();
       const url = `${this.baseUrl}/v1/segment_pipeline_multipart`;
-      
+      const tsMs = () => new Date().toISOString();
+
       xhr.open("POST", url);
       xhr.setRequestHeader("X-API-Key", apiKey);
       xhr.timeout = 600000; // 10 分鐘，配合後端長時間分析
@@ -167,11 +168,22 @@ class ApiService {
         xhr.upload.onprogress = onUploadProgress;
       }
 
+      xhr.upload.onload = () => {
+        console.log(
+          `%c[LATENCY] client_upload_complete=${tsMs()}`,
+          "color: #10b981; font-weight: bold"
+        );
+      };
+
       xhr.ontimeout = () => {
         reject(new Error("請求逾時（分析時間過長），請檢查後端是否完成；結果可於稍後由日誌輪詢顯示。"));
       };
 
       xhr.onload = () => {
+        console.log(
+          `%c[LATENCY] client_response_received=${tsMs()} | status=${xhr.status}`,
+          "color: #8b5cf6; font-weight: bold"
+        );
         if (xhr.status >= 200 && xhr.status < 300) {
           try {
             resolve(JSON.parse(xhr.responseText));
@@ -208,6 +220,10 @@ class ApiService {
         reject(new Error("Network Failure during upload."));
       };
 
+      console.log(
+        `%c[LATENCY] client_send_timestamp=${tsMs()} | url=${url}`,
+        "color: #3b82f6; font-weight: bold"
+      );
       xhr.send(formData);
     });
   }

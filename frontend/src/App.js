@@ -80,7 +80,7 @@ function App() {
   const [showRTSPModal, setShowRTSPModal] = useState(false);
 
   // Analysis
-  const { isAnalyzing, analysisData, analysisError, runAnalysis } =
+  const { isAnalyzing, analysisData, analysisError, uploadProgress, runAnalysis } =
     useAnalysis(apiKey);
 
   // RAG
@@ -591,7 +591,12 @@ function App() {
             <div className="output-panel">
               {isAnalyzing && (
                 <div className="loading">
-                  <span className="spinner"></span>Processing request...
+                  <span className="spinner"></span>
+                  {uploadProgress > 0 && uploadProgress < 100
+                    ? `Uploading ${uploadProgress}%...`
+                    : uploadProgress >= 100
+                      ? "Upload complete, waiting for backend..."
+                      : "Preparing upload..."}
                 </div>
               )}
               {analysisError && (

@@ -51,6 +51,17 @@ def _yolo_batch_frame_indices(
     return list(range(0, total_frames, interval))
 
 
+_SEGMENT_STEM_RE = re.compile(r"^segment_(\d+)$", re.IGNORECASE)
+
+
+def _global_segment_number(seg_path: str, batch_index: int) -> int:
+    """從 segment_033.mp4 解析全域段號 33，供 crop 檔名使用（避免 batch 內 0~29 重複覆写）。"""
+    m = _SEGMENT_STEM_RE.match(Path(seg_path).stem)
+    if m:
+        return int(m.group(1))
+    return batch_index
+
+
 def resolve_vllm_video_direct_num_frames(
     segment_duration: float,
     request_num_frames: Optional[int] = None,
@@ -1393,6 +1404,7 @@ class AnalysisService:
             seg_dir = Path(p).parent
             crops_dir = seg_dir / "yolo_output" / "object_crops"
             crops_dir.mkdir(parents=True, exist_ok=True)
+            crop_seg_num = _global_segment_number(p, seg_idx)
 
             cap = cv2.VideoCapture(p)
             if not cap.isOpened():
@@ -1409,8 +1421,8 @@ class AnalysisService:
                 ok, frame = cap.read()
                 if ok:
                     wall_time = None
-                    # (段索引, 影格索引, 影像陣列, FPS, 儲存目錄, 畫面絕對時間)
-                    flat_frames.append((seg_idx, fi, frame.copy(), fps, crops_dir, wall_time))
+                    # (batch 索引, 全域段號, 影格索引, 影像, FPS, crops 目錄, wall_time)
+                    flat_frames.append((seg_idx, crop_seg_num, fi, frame.copy(), fps, crops_dir, wall_time))
 
             frames_per_seg[seg_idx] = len(frame_indices)
             cap.release()
@@ -1452,7 +1464,7 @@ class AnalysisService:
         for start in range(0, len(flat_frames), batch_size):
             chunk_idx = (start // batch_size) + 1
             chunk = flat_frames[start : start + batch_size]
-            batch_frames = [x[2] for x in chunk]
+            batch_frames = [x[3] for x in chunk]
 
             batch_predict_res: List[Any] = []
             t_chunk = time.time()
@@ -1476,7 +1488,7 @@ class AnalysisService:
                         else:
                             batch_predict_res.append(None)
                     except Exception as e2:
-                        fi_hint = chunk[j][1] if j < len(chunk) else None
+                        fi_hint = chunk[j][3] if j < len(chunk) else None
                         print(
                             f"--- [YOLO Batch] 單幀略過 start={start} j={j} fi={fi_hint}: "
                             f"{type(e2).__name__}: {e2} ---",
@@ -1503,7 +1515,7 @@ class AnalysisService:
                     print(f"--- [YOLO Batch] 結果物件無效 idx={idx}: {type(e_parse).__name__}: {e_parse} ---", flush=True)
                     continue
 
-                seg_idx, fi, frame, fps, crops_dir, wall_time = chunk[idx]
+                seg_idx, crop_seg_num, fi, frame, fps, crops_dir, wall_time = chunk[idx]
                 timestamp = round(fi / fps, 2)
                 temp_detections = []
                 crops_imgs = []
@@ -1517,7 +1529,7 @@ class AnalysisService:
                     # 裁切物件影像
                     crop = frame[xyxy[1]:xyxy[3], xyxy[0]:xyxy[2]]
                     if crop.size > 0:
-                        crop_filename = f"crop_s{seg_idx:03d}_{fi}_{b_idx}_{label}.jpg"
+                        crop_filename = f"crop_s{crop_seg_num:03d}_{fi}_{b_idx}_{label}.jpg"
                         crop_path = crops_dir / crop_filename
                         cv2.imwrite(str(crop_path), crop)
                         

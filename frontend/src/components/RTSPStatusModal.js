@@ -1,13 +1,13 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
 import apiService from '../services/api';
 
-const LOCAL_VIDEO_FILENAME = 'Video_衛哨端出入口.mp4';
+const LOCAL_VIDEO_FILENAME = 'CCTV_手持刀_YT_1 00_00_04-00_00_41.mp4';
 
 // 指向前端的 public 資料夾，讓瀏覽器能直接讀取影片。
-const LOCAL_VIDEO_STATIC_URL = `${process.env.PUBLIC_URL || ''}/video/${LOCAL_VIDEO_FILENAME}`;
+const LOCAL_VIDEO_STATIC_URL = `${process.env.PUBLIC_URL || ''}/video/${encodeURIComponent(LOCAL_VIDEO_FILENAME)}`;
 
 // 是給後端使用的路徑標記，通常對應伺服器上的某個分析路徑。
-const LOCAL_VIDEO_ID = '門禁遮臉入場/Video_衛哨端出入口';
+const LOCAL_VIDEO_ID = 'CCTV_手持刀_YT_1 00_00_04-00_00_41/CCTV_手持刀_YT_1 00_00_04-00_00_41';
 
 const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
 
@@ -44,6 +44,7 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   const [localVideoReady, setLocalVideoReady] = useState(false);
   const [isLocalAnalyzing, setIsLocalAnalyzing] = useState(false);
   const [localAnalysisResult, setLocalAnalysisResult] = useState(null);
+  const [vlmProfile, setVlmProfile] = useState(null);
   const localVideoUrl = LOCAL_VIDEO_STATIC_URL;
 
   useEffect(() => {
@@ -114,6 +115,15 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
   useEffect(() => {
     if (isOpen) autoAnalysisTriggeredRef.current = false;
   }, [isOpen]);
+
+  // 讀取後端目前選定的 VLM profile（即時分析與整支分析皆對齊主平台設定）
+  useEffect(() => {
+    if (!isOpen || !apiKey) return;
+    apiService.getVlmStatus(apiKey).then((vlm) => {
+      const p = vlm?.profiles?.find((x) => x.id === vlm.selected_profile_id);
+      if (p) setVlmProfile(p);
+    }).catch(() => setVlmProfile(null));
+  }, [isOpen, apiKey]);
 
   // 移除 HLS manifest 檢查，直接顯示畫面
   // 因為 MediaMTX 的 HLS 播放器頁面在 /live/，不需要檢查 manifest
@@ -360,11 +370,11 @@ const RTSPStatusModal = ({ isOpen, onClose, apiKey }) => {
 
     try {
       const formData = new FormData();
-      formData.append('model_type', 'qwen');
+      formData.append('model_type', vlmProfile?.model_type || 'vllm_qwen');
       formData.append('segment_duration', 10);
       formData.append('overlap', 0);
-      formData.append('qwen_model', 'qwen2.5vl:latest');
-      formData.append('frames_per_segment', 8);
+      formData.append('qwen_model', vlmProfile?.qwen_model || 'Qwen/Qwen3-VL-8B-Instruct-AWQ');
+      formData.append('frames_per_segment', vlmProfile?.model_type === 'vllm_qwen' ? 3 : 5);
       formData.append('target_short', 720);
       formData.append('video_id', LOCAL_VIDEO_ID);
 

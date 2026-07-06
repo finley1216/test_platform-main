@@ -11,7 +11,7 @@ import tempfile
 import uuid
 import traceback
 import threading
-from datetime import timedelta
+from datetime import timedelta, datetime
 from pathlib import Path
 from typing import Optional, List
 from fastapi import APIRouter, Request, UploadFile, File, Form, Depends, HTTPException, Body
@@ -23,6 +23,7 @@ import logging
 import torch
 
 from src.config import config
+from src.services.vlm_profile_service import read_selected_profile_id, VLM_PROFILES
 from src.services.video_service import VideoService
 from src.services.analysis_service import AnalysisService, resolve_vllm_video_direct_num_frames
 from src.utils.video_utils import _fmt_hms
@@ -95,6 +96,9 @@ class AnalyzeSingleSegmentBody(BaseModel):
     video_id: str
     start_time: float  # 秒
     duration: float = 10.0  # 秒
+    model_type: Optional[str] = None
+    qwen_model: Optional[str] = None
+    frames_per_segment: Optional[int] = None
 
 
 @router.post("/v1/analyze_single_segment")
@@ -112,6 +116,21 @@ def analyze_single_segment(
     duration = float(body.duration)
     if duration <= 0 or duration > 60:
         raise HTTPException(status_code=400, detail="duration 需介於 0～60 秒")
+
+    selected_profile = read_selected_profile_id()
+    selected_spec = VLM_PROFILES.get(selected_profile) or VLM_PROFILES.get("vllm_qwen3_awq", {})
+    model_type = (body.model_type or selected_spec.get("model_type") or "vllm_qwen").strip()
+    qwen_model = (body.qwen_model or selected_spec.get("qwen_model") or "Qwen/Qwen3-VL-8B-Instruct-AWQ").strip()
+    frames_per_segment = body.frames_per_segment
+    if frames_per_segment is None:
+        frames_per_segment = 3 if model_type == "vllm_qwen" else 5
+    target_short = 720
+    print(
+        f"--- [analyze_single_segment] profile={selected_profile} model_type={model_type} "
+        f"qwen_model={qwen_model} frames_per_segment={frames_per_segment} ---",
+        flush=True,
+    )
+
     # 1. 解析 video_id 取得原始影片路徑（與 VideoService.prepare_segments 一致）
     source_path = None
     if "/" in video_id:
@@ -134,10 +153,14 @@ def analyze_single_segment(
         cmd = [
             "ffmpeg", "-y", "-hide_banner", "-loglevel", "error",
             "-ss", f"{start_time:.3f}", "-t", f"{duration:.3f}", "-i", source_path,
+        ]
+        if model_type == "vllm_qwen":
+            cmd.extend(["-vf", f"scale='min({target_short},iw)':-2"])
+        cmd.extend([
             "-c:v", "libx264", "-preset", "veryfast", "-crf", "23",
             "-c:a", "aac", "-strict", "experimental",
             tmp_path,
-        ]
+        ])
         proc = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         if proc.returncode != 0:
             try:
@@ -153,10 +176,10 @@ def analyze_single_segment(
             segment_index=0,
             start_time=start_time,
             end_time=end_time,
-            model_type="qwen",
-            qwen_model="qwen2.5vl:latest",
-            frames_per_segment=5,
-            target_short=432,
+            model_type=model_type,
+            qwen_model=qwen_model,
+            frames_per_segment=frames_per_segment,
+            target_short=target_short,
             event_detection_prompt=get_event_prompt(),
             summary_prompt=get_summary_prompt(),
             yolo_labels="person,car",
@@ -210,9 +233,14 @@ def segment_pipeline_multipart(
     except Exception:
         vm_pct = -1.0
 
+    _server_receive_ts = datetime.now().isoformat(timespec="milliseconds")
     print(
         f"--- [API] 收到 POST /v1/segment_pipeline_multipart | req_id={req_id} | active_same_worker={active_requests_counter} "
         f"| client={client_host} | python_threads≈{threading.active_count()} | rss_mb={mem_before:.1f} | vm_pct={vm_pct} ---",
+        flush=True,
+    )
+    print(
+        f"--- [LATENCY] server_receive_timestamp={_server_receive_ts} | req_id={req_id} ---",
         flush=True,
     )
     print(
@@ -242,6 +270,11 @@ def segment_pipeline_multipart(
                 logger.error(f"--- [Upload Error] File is empty (0 bytes). Upload blocked by firewall? ---")
                 raise HTTPException(status_code=400, detail="File is empty (0 bytes). Upload blocked by firewall?")
             print(f"--- [API] 已收到上傳檔案: {file.filename or 'video.mp4'}, 大小: {file_size} bytes ---")
+            print(
+                f"--- [LATENCY] server_file_ready_timestamp={datetime.now().isoformat(timespec='milliseconds')} "
+                f"| req_id={req_id} | filename={file.filename or 'video.mp4'} | size={file_size} ---",
+                flush=True,
+            )
             target_filename = file.filename or "video.mp4"
             fd, tmp = tempfile.mkstemp(prefix="upload_", suffix=Path(target_filename).suffix)
             with os.fdopen(fd, "wb") as f:

@@ -7,7 +7,7 @@ const Navbar = ({ authenticated, isAdmin, onEventTagClick, onDetectionItemsClick
         <div className="nav-brand">
           <div className="nav-logo">
             <span>⬡</span>
-            <span>日月光測試平台</span>
+            <span>智慧影像分析平台</span>
           </div>
           <div className="nav-version">v2.4 (Backend Filter)</div>
         </div>

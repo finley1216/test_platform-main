@@ -116,6 +116,83 @@ def get_embedding_model():
             raise RuntimeError(f"無法載入 SentenceTransformer 模型: {e}")
     return _embedding_model
 
+# ================== RAG Embedding 文字建構 ==================
+
+# 結構化 boolean 欄位 -> 中文標籤對照表
+_BOOL_EVENT_LABELS = {
+    "fire": "火災",
+    "water_flood": "水災 淹水 積水",
+    "abnormal_attire_face_cover_at_entry": "異常著裝 遮臉入場",
+    "person_fallen_unmoving": "人員倒地不起",
+    "double_parking_lane_block": "併排停車 車道阻塞",
+    "smoking_outside_zone": "非管制區吸菸 抽菸",
+    "crowd_loitering": "聚眾逗留 群聚 徘徊",
+    "security_door_tamper": "突破安全門 闖入",
+    "violence": "暴力行為 打架",
+    "dangerous_items": "危險物品 武器",
+}
+
+
+def _extract_event_reason_labels(event_reason: str) -> List[str]:
+    """
+    從 event_reason 文字中拆出事件標籤（冒號前的部分）。
+    支援兩種格式：
+      格式A: "赤膊：畫面中..."
+      格式B: "人員徘徊（逃生門）：描述；person_loitering_exit：描述"
+    """
+    if not event_reason:
+        return []
+    labels = []
+    for segment in re.split(r"[；;\n]", event_reason):
+        segment = segment.strip()
+        if not segment:
+            continue
+        m = re.match(r"^([^：:]+)[：:]", segment)
+        if m:
+            label = m.group(1).strip()
+            # 過濾英文 key（如 person_loitering_exit），只保留中文/括號標籤
+            if re.search(r"[\u4e00-\u9fff（）]", label):
+                labels.append(label)
+    return labels
+
+
+def build_embed_text(
+    message: str,
+    event_reason: Optional[str] = None,
+    events: Optional[Dict[str, Any]] = None,
+) -> str:
+    """
+    將 message、event_reason、boolean 事件欄位合成一段用於 embedding 的文字。
+    組合順序：
+    1) 偵測到的事件標籤（boolean + event_reason）
+    2) message 原文
+    """
+    parts = []
+    active_labels: List[str] = []
+
+    if events:
+        for field, labels_str in _BOOL_EVENT_LABELS.items():
+            if events.get(field):
+                active_labels.extend(labels_str.split())
+
+    active_labels.extend(_extract_event_reason_labels(event_reason or ""))
+
+    # 去重保序
+    seen = set()
+    deduped = []
+    for label in active_labels:
+        if label not in seen:
+            seen.add(label)
+            deduped.append(label)
+
+    if deduped:
+        parts.append("偵測事件：" + " | ".join(deduped))
+
+    if message and message.strip():
+        parts.append(message.strip())
+
+    return "\n".join(parts) if parts else (message or "")
+
 # CLIP 模型已移至 model_loader.py
 # 使用 from src.core.model_loader import get_clip_model
 
@@ -3244,8 +3321,13 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 try:
                     embedding_model = get_embedding_model()
                     if embedding_model:
+                        embed_text = build_embed_text(
+                            message=summary_text.strip(),
+                            event_reason=events.get("reason", "") if events else None,
+                            events=events,
+                        )
                         existing.embedding = embedding_model.encode(
-                            summary_text.strip(),
+                            embed_text,
                             normalize_embeddings=True
                         ).tolist()
                 except Exception as e:
@@ -3265,8 +3347,13 @@ def _save_results_to_postgres(db: Session, results: List[Dict[str, Any]], video_
                 try:
                     embedding_model = get_embedding_model()
                     if embedding_model:
+                        embed_text = build_embed_text(
+                            message=summary_text.strip(),
+                            event_reason=events.get("reason", "") if events else None,
+                            events=events,
+                        )
                         embedding = embedding_model.encode(
-                            summary_text.strip(),
+                            embed_text,
                             normalize_embeddings=True
                         ).tolist()
                 except Exception as e:
@@ -3636,6 +3723,8 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
     event_mapping = {
         "火災": "fire",
         "火": "fire",
+        "冒煙": "fire",
+        "濃煙": "fire",
         "水災": "water_flood",
         "水": "water_flood",
         "淹水": "water_flood",
@@ -3645,12 +3734,15 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         "安全門": "security_door_tamper",
         "暴力": "violence",
         "打架": "violence",
+        "鬥毆": "violence",
         "危險物品": "dangerous_items",
         "武器": "dangerous_items",
         "遮臉": "abnormal_attire_face_cover_at_entry",
         "異常著裝": "abnormal_attire_face_cover_at_entry",
         "倒地": "person_fallen_unmoving",
         "倒地不起": "person_fallen_unmoving",
+        "昏倒": "person_fallen_unmoving",
+        "倒下": "person_fallen_unmoving",
         "併排": "double_parking_lane_block",
         "停車": "double_parking_lane_block",
         "阻塞": "double_parking_lane_block",
@@ -3659,6 +3751,19 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         "群聚": "crowd_loitering",
         "聚眾": "crowd_loitering",
         "逗留": "crowd_loitering",
+    }
+
+    # event_reason 關鍵字：這些詞可能只出現在 event_reason 欄位（新增動態事件）
+    DYNAMIC_EVENT_KEYWORDS = {
+        "赤膊": ["赤膊", "上空", "裸上身", "未穿衣", "裸體"],
+        "裸上身": ["赤膊", "上空", "裸上身", "未穿衣"],
+        "上空": ["赤膊", "上空", "裸上身"],
+        "徘徊": ["徘徊", "逗留", "無目的停留", "停留觀察"],
+        "逗留": ["徘徊", "逗留", "無目的"],
+        "可疑": ["可疑", "觀察四周", "張望", "徘徊"],
+        "跌倒": ["跌倒", "倒地", "摔倒"],
+        "奔跑": ["奔跑", "跑步", "追逐"],
+        "爭執": ["爭執", "口角", "衝突"],
     }
     
     # [NEW] message 關鍵字過濾：如果查詢中包含事件相關關鍵字，也在 message 中搜尋
@@ -3669,28 +3774,34 @@ def _parse_query_filters(question: str) -> Dict[str, Any]:
         if keyword in question:
             message_keywords_found.append(keyword)
     
-    # [NEW] 添加描述性關鍵字（顏色、衣服、車輛等）
+    # [NEW] event_reason 動態事件關鍵字命中：加入 event_reason_keywords
+    event_reason_keywords_found = []
+    for user_word, synonyms in DYNAMIC_EVENT_KEYWORDS.items():
+        if user_word in question:
+            event_reason_keywords_found.extend(synonyms)
+    event_reason_keywords_found = list(dict.fromkeys(event_reason_keywords_found))
+    if event_reason_keywords_found:
+        filters["event_reason_keywords"] = event_reason_keywords_found
+        print(f"--- [DEBUG] 找到 event_reason 關鍵字: {event_reason_keywords_found} ---")
+
+    # [NEW] 描述性關鍵字（顏色、衣服、車輛等）
     descriptive_keywords = [
-        # 顏色 + 衣服
+        "赤膊", "裸上身", "上空", "未穿衣",
         "黃色衣服", "黑色衣服", "白色衣服", "紅色衣服", "藍色衣服", "綠色衣服",
         "深色衣服", "淺色衣服", "灰色衣服",
-        "黃色制服", "黑色制服", "白色制服", "紅色制服", "藍色制服", "綠色制服",
-        "深色制服", "淺色制服", "灰色制服",
-        # 顏色 + 車輛
-        "藍色貨車", "白色貨車", "紅色貨車", "黑色貨車", "綠色貨車", "黃色貨車",
+        "黃色上衣", "黑色上衣", "白色上衣", "紅色上衣", "藍色上衣",
+        "深色上衣", "淺色上衣",
+        "黃色制服", "黑色制服", "白色制服", "紅色制服", "藍色制服",
+        "藍色貨車", "白色貨車", "紅色貨車", "黑色貨車", "黃色貨車",
         "藍色卡車", "白色卡車", "紅色卡車", "黑色卡車",
         "藍色汽車", "白色汽車", "紅色汽車", "黑色汽車",
         "藍色機車", "白色機車", "紅色機車", "黑色機車",
         "藍色車", "白色車", "紅色車", "黑色車", "黃色車",
-        # 單獨的顏色（用於匹配摘要中的顏色描述）
         "黃色", "黑色", "白色", "紅色", "藍色", "綠色", "灰色", "深色", "淺色",
-        # 衣服相關
-        "衣服", "上衣", "褲子", "帽子",
-        # 車輛相關
-        "貨車", "卡車", "汽車", "機車", "車"
+        "衣服", "上衣", "褲子", "帽子", "口罩", "背包",
+        "貨車", "卡車", "汽車", "機車", "車輛",
     ]
-    
-    # 先檢查完整的多字關鍵字（如「黃色衣服」、「藍色貨車」）
+
     for keyword in descriptive_keywords:
         if keyword in question and keyword not in message_keywords_found:
             message_keywords_found.append(keyword)
