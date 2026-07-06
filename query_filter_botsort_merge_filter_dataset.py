@@ -2,17 +2,17 @@
 """
 一鍵執行 query 篩選完整流程（兩段合併）：
 
-  Step 1  query_filter_botsort_merge_dataset.py
+  Step 1  BoT-SORT/query_filter_botsort_merge_dataset.py
           crop≥0.8 → BoT-SORT → tracklet≥0.9 → gap → merge
 
-  Step 2  batch_filter_merged_tracks.py
+  Step 2  BoT-SORT/batch_filter_merged_tracks.py
           每條 merged track 做 combined intra-filter（α + combined thresh）
 
 範例：
+  cd test_platform-main
   python3 query_filter_botsort_merge_filter_dataset.py \\
     --dataset 人員追蹤_20260528 \\
     --merge-rule triple \\
-    --query-image ../CLIP-ReID-embed-test/data/p9.jpg \\
     --force
 """
 
@@ -24,12 +24,19 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
-ASE_ROOT = HERE.parent
-CLIP_EMBED_ROOT = ASE_ROOT / "CLIP-ReID-embed-test"
-DEFAULT_OUTPUT_ROOT = HERE / "output" / "query_filter_merge"
+sys.path.insert(0, str(HERE))
 
-STEP1 = HERE / "query_filter_botsort_merge_dataset.py"
-STEP2 = HERE / "batch_filter_merged_tracks.py"
+from repo_paths import (  # noqa: E402
+    BOTSORT_ROOT,
+    DEFAULT_PERSON_QUERY,
+    DEFAULT_VEHICLE_QUERY_0507,
+    DEFAULT_VEHICLE_QUERY_0528,
+    OUTPUT_ROOT,
+    QUERY_FILTER_OUTPUT_ROOT,
+)
+
+STEP1 = BOTSORT_ROOT / "query_filter_botsort_merge_dataset.py"
+STEP2 = BOTSORT_ROOT / "batch_filter_merged_tracks.py"
 
 DATASET_ALIASES = {
     "人員0528": "人員追蹤_20260528",
@@ -45,16 +52,16 @@ def resolve_dataset_key(name: str) -> str:
 
 def default_query_image(dataset_key: str) -> Path:
     if dataset_key.startswith("人員"):
-        return CLIP_EMBED_ROOT / "data" / "p9.jpg"
+        return DEFAULT_PERSON_QUERY
     if dataset_key.startswith("車輛"):
         if "0507" in dataset_key:
-            return CLIP_EMBED_ROOT / "data" / "BSH-5613.jpg"
-        return CLIP_EMBED_ROOT / "data" / "wc.png"
+            return DEFAULT_VEHICLE_QUERY_0507
+        return DEFAULT_VEHICLE_QUERY_0528
     raise SystemExit(f"無法判斷資料集類型：{dataset_key}")
 
 
-def default_mapping_json(dataset_key: str) -> Path:
-    path = CLIP_EMBED_ROOT / "data" / f"{dataset_key}_crop_time_mapping.json"
+def default_mapping_json(dataset_key: str, data_dir: Path) -> Path:
+    path = data_dir / f"{dataset_key}_crop_time_mapping.json"
     if not path.is_file():
         raise SystemExit(f"找不到 mapping：{path}")
     return path
@@ -71,10 +78,16 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--query-image", type=Path, default=None)
     p.add_argument(
+        "--data-dir",
+        type=Path,
+        default=None,
+        help=f"mapping + crop 根目錄（預設 {OUTPUT_ROOT}）",
+    )
+    p.add_argument(
         "--output-dir",
         type=Path,
         default=None,
-        help="預設 output/query_filter_merge/{dataset}/",
+        help=f"merge/filter 結果目錄（預設 {QUERY_FILTER_OUTPUT_ROOT}/{{dataset}}/）",
     )
 
     # Step 1
@@ -104,9 +117,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--alpha", type=float, default=0.5)
     p.add_argument("--combined-thresh", type=float, default=0.90)
     p.add_argument("--top-k", type=int, default=3)
-    p.add_argument("--mapping-json", type=Path, default=None)
+    p.add_argument(
+        "--mapping-json",
+        type=Path,
+        default=None,
+        help="覆寫 mapping 路徑（預設 {data-dir}/{dataset}_crop_time_mapping.json）",
+    )
 
-    # 分段控制
     p.add_argument("--skip-step1", action="store_true", help="略過 merge，只跑 intra-filter")
     p.add_argument("--skip-step2", action="store_true", help="略過 intra-filter，只跑 merge")
 
@@ -119,13 +136,20 @@ def _append_opt(cmd: list[str], flag: str, value) -> None:
     cmd.extend([flag, str(value)])
 
 
-def build_step1_cmd(args: argparse.Namespace, dataset_key: str, output_dir: Path) -> list[str]:
+def build_step1_cmd(
+    args: argparse.Namespace,
+    dataset_key: str,
+    data_dir: Path,
+    output_dir: Path,
+) -> list[str]:
     query_image = (args.query_image or default_query_image(dataset_key)).resolve()
     cmd = [
         sys.executable,
         str(STEP1),
         "--dataset",
         dataset_key,
+        "--data-dir",
+        str(data_dir),
         "--query-image",
         str(query_image),
         "--output-dir",
@@ -176,10 +200,11 @@ def build_step1_cmd(args: argparse.Namespace, dataset_key: str, output_dir: Path
 def build_step2_cmd(
     args: argparse.Namespace,
     dataset_key: str,
+    data_dir: Path,
     output_dir: Path,
 ) -> list[str]:
     query_image = (args.query_image or default_query_image(dataset_key)).resolve()
-    mapping_json = (args.mapping_json or default_mapping_json(dataset_key)).resolve()
+    mapping_json = (args.mapping_json or default_mapping_json(dataset_key, data_dir)).resolve()
     return [
         sys.executable,
         str(STEP2),
@@ -198,18 +223,19 @@ def build_step2_cmd(
     ]
 
 
-def run_cmd(label: str, cmd: list[str]) -> None:
+def run_cmd(label: str, cmd: list[str], *, cwd: Path) -> None:
     print("\n" + "=" * 60)
     print(f"{label}")
     print(" ".join(cmd))
     print("=" * 60)
-    subprocess.run(cmd, check=True, cwd=str(HERE))
+    subprocess.run(cmd, check=True, cwd=str(cwd))
 
 
 def main() -> None:
     args = parse_args()
     dataset_key = resolve_dataset_key(args.dataset)
-    output_dir = (args.output_dir or (DEFAULT_OUTPUT_ROOT / dataset_key)).resolve()
+    data_dir = (args.data_dir or OUTPUT_ROOT).resolve()
+    output_dir = (args.output_dir or (QUERY_FILTER_OUTPUT_ROOT / dataset_key)).resolve()
 
     if args.skip_step1 and args.skip_step2:
         raise SystemExit("不能同時 --skip-step1 與 --skip-step2")
@@ -220,10 +246,15 @@ def main() -> None:
         raise SystemExit(f"找不到 Step2 腳本：{STEP2}")
 
     print(f"資料集：{dataset_key}")
-    print(f"輸出目錄：{output_dir}")
+    print(f"data_dir（mapping + crop）：{data_dir}")
+    print(f"輸出目錄（merge/filter）：{output_dir}")
 
     if not args.skip_step1:
-        run_cmd("Step 1/2：query 篩選 + BoT-SORT + merge", build_step1_cmd(args, dataset_key, output_dir))
+        run_cmd(
+            "Step 1/2：query 篩選 + BoT-SORT + merge",
+            build_step1_cmd(args, dataset_key, data_dir, output_dir),
+            cwd=BOTSORT_ROOT,
+        )
     else:
         print("\n[SKIP] Step 1（merge）")
 
@@ -233,7 +264,8 @@ def main() -> None:
         else:
             run_cmd(
                 "Step 2/2：combined intra-filter",
-                build_step2_cmd(args, dataset_key, output_dir),
+                build_step2_cmd(args, dataset_key, data_dir, output_dir),
+                cwd=BOTSORT_ROOT,
             )
     else:
         print("\n[SKIP] Step 2（intra-filter）")

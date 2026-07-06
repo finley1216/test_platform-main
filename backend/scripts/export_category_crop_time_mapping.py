@@ -2,7 +2,7 @@
 """Export dated category crop_time_mapping (e.g. 人員追蹤_20260528_K8-*).
 
 預設會將 mapping 內引用的 crop 圖同步至 output_dir/{video_id}/（扁平檔名），
-供 BoT-SORT-K809 / CLIP-ReID-embed-test 後續流程直接讀取。
+供 BoT-SORT / CLIP-ReID 後續流程直接讀取。
 """
 from __future__ import annotations
 
@@ -15,8 +15,9 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
-ASE_ROOT = Path(__file__).resolve().parents[3]
-CLIP_DIR = ASE_ROOT / "CLIP-ReID-embed-test"
+REPO_ROOT = Path(__file__).resolve().parents[2]
+CLIP_DIR = REPO_ROOT / "CLIP-ReID"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
 if str(CLIP_DIR) not in sys.path:
     sys.path.insert(0, str(CLIP_DIR))
 
@@ -33,11 +34,11 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--category", required=True, help="e.g. 人員追蹤_20260528")
     p.add_argument(
         "--segment_root",
-        default="/home/M133040024/ASE/test_platform-main/backend/segment",
+        default=str(REPO_ROOT / "backend" / "segment"),
     )
     p.add_argument(
         "--output_dir",
-        default="/home/M133040024/ASE/CLIP-ReID-embed-test/data",
+        default=str(OUTPUT_ROOT),
     )
     p.add_argument("--base_date", required=True, help="e.g. 2026-05-28")
     p.add_argument("--labels", default="person", help="Comma-separated labels to keep")
