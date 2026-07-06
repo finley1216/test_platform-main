@@ -42,7 +42,8 @@ venv/
 
 # --- project data (do not upload) ---
 backend/rag_store/
-backend/segment/
+backend/segment/*
+!backend/segment/.gitkeep
 # optional: all videos / big media
 *.avi
 *.mp4

@@ -228,15 +228,18 @@ def _require_segment_root(segment_root: Path, category: str) -> None:
     if not segment_root.is_dir():
         raise SystemExit(
             f"segment 目錄不存在：{segment_root}\n"
-            "此目錄不在 git 內（見 .gitignore）。請先將 backend/segment/{category}_K8-* 放入，"
-            "或從既有環境複製 / 建立 symlink。\n"
+            "此目錄不在 git 內（僅 .gitkeep）。請先執行 segment API 產生資料，"
+            "見 docs/追蹤流程快速開始.md Step 3；或手動放入 segment。\n"
             "詳見 docs/追蹤流程快速開始.md"
         )
     stems = list(_iter_category_stems(segment_root, category))
     if not stems:
         raise SystemExit(
             f"在 {segment_root} 找不到符合 {category}_K8-* 的目錄。\n"
-            f"請確認 --category 是否正確（例如 人員追蹤_20260507）。"
+            f"請確認 --category 是否正確，並先執行：\n"
+            f"  python3 scripts/download_tracking_videos.py --dataset {category}\n"
+            f"  python3 backend/scripts/rerun_segment_cameras.py --category {category} --cameras K8-08 ...\n"
+            f"詳見 docs/追蹤流程快速開始.md"
         )
 
 
