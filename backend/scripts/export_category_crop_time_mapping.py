@@ -1,10 +1,15 @@
 #!/usr/bin/env python3
-"""Export dated category crop_time_mapping (e.g. 人員追蹤_20260528_K8-*)."""
+"""Export dated category crop_time_mapping (e.g. 人員追蹤_20260528_K8-*).
+
+預設會將 mapping 內引用的 crop 圖同步至 output_dir/{video_id}/（扁平檔名），
+供 BoT-SORT-K809 / CLIP-ReID-embed-test 後續流程直接讀取。
+"""
 from __future__ import annotations
 
 import argparse
 import json
 import re
+import shutil
 import sys
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -37,7 +42,70 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--base_date", required=True, help="e.g. 2026-05-28")
     p.add_argument("--labels", default="person", help="Comma-separated labels to keep")
     p.add_argument("--mode", default="", help="mode field in output json")
+    p.add_argument(
+        "--no-sync-crops",
+        action="store_true",
+        help="只寫 mapping JSON，不同步 crop 圖到 output_dir/{video_id}/",
+    )
     return p.parse_args()
+
+
+def _resolve_crop_source(stem_dir: Path, crop_name: str) -> Optional[Path]:
+    """與 export_crop_time_mapping._crop_file_exists 相同解析順序，回傳實際檔案路徑。"""
+    rel = Path(crop_name)
+    checks = [
+        stem_dir / rel,
+        stem_dir / "yolo_output" / "object_crops" / rel.name,
+        stem_dir / rel.name,
+    ]
+    for c in checks:
+        if c.is_file():
+            return c
+    return None
+
+
+def sync_crops_to_data_dir(
+    payload: Dict[str, Any],
+    *,
+    segment_root: Path,
+    output_dir: Path,
+) -> Dict[str, int]:
+    """將 mapping 內 crop 複製到 output_dir/{video_id}/{crop_path}。"""
+    seen: Set[Tuple[str, str]] = set()
+    stats = {"copied": 0, "skipped": 0, "missing": 0, "videos": 0}
+
+    for seg in payload.get("segments", []):
+        video_id = str(seg.get("video_id") or "")
+        if not video_id:
+            continue
+        stem_dir = segment_root / video_id
+        dest_dir = output_dir / video_id
+        dest_dir.mkdir(parents=True, exist_ok=True)
+
+        for crop in seg.get("crops", []):
+            name = str(crop.get("crop_path") or "").strip()
+            if not name:
+                continue
+            key = (video_id, name)
+            if key in seen:
+                continue
+            seen.add(key)
+
+            src = _resolve_crop_source(stem_dir, name)
+            if src is None:
+                stats["missing"] += 1
+                print(f"[Sync Skip] {video_id}/{name}: source not found", flush=True)
+                continue
+
+            dst = dest_dir / name
+            if dst.is_file() and dst.stat().st_mtime >= src.stat().st_mtime:
+                stats["skipped"] += 1
+                continue
+            shutil.copy2(src, dst)
+            stats["copied"] += 1
+
+    stats["videos"] = len({vid for vid, _ in seen})
+    return stats
 
 
 def _iter_category_stems(segment_root: Path, category: str) -> Iterator[Path]:
@@ -174,6 +242,18 @@ def main() -> None:
         f"missing_files={stats['missing_files']}",
         flush=True,
     )
+
+    if not args.no_sync_crops:
+        sync_stats = sync_crops_to_data_dir(
+            payload,
+            segment_root=segment_root,
+            output_dir=output_dir,
+        )
+        print(
+            f"[Sync Done] videos={sync_stats['videos']} copied={sync_stats['copied']} "
+            f"skipped={sync_stats['skipped']} missing={sync_stats['missing']} -> {output_dir}",
+            flush=True,
+        )
 
 
 if __name__ == "__main__":
