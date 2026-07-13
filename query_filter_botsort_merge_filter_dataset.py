@@ -93,7 +93,7 @@ def parse_args() -> argparse.Namespace:
     # Step 1
     p.add_argument("--video-ids", nargs="*", default=None)
     p.add_argument("--crop-sim-thresh", type=float, default=0.80)
-    p.add_argument("--tracklet-sim-thresh", type=float, default=0.90)
+    p.add_argument("--tracklet-sim-thresh", type=float, default=0.85)
     p.add_argument("--max-adjacent-gap-sec", type=float, default=1.33)
     p.add_argument("--skip-existing", action="store_true", default=True)
     p.add_argument("--no-skip-existing", action="store_false", dest="skip_existing")
@@ -267,21 +267,18 @@ def main() -> None:
         print("\n[SKIP] Step 1（merge）")
 
     if not args.skip_step2:
-        if not dataset_key.startswith("人員"):
-            print("\n[WARN] Step 2（combined intra-filter）目前僅支援人員資料集，已略過。")
-        else:
-            run_cmd(
-                "Step 2/2：combined intra-filter",
-                build_step2_cmd(args, dataset_key, data_dir, output_dir),
-                cwd=BOTSORT_ROOT,
-            )
+        run_cmd(
+            "Step 2/2：combined intra-filter",
+            build_step2_cmd(args, dataset_key, data_dir, output_dir),
+            cwd=BOTSORT_ROOT,
+        )
     else:
         print("\n[SKIP] Step 2（intra-filter）")
 
     print("\n" + "=" * 60)
     print("全部完成")
     print(f"  merged 結果：{output_dir}/*_merged.json")
-    if not args.skip_step2 and dataset_key.startswith("人員"):
+    if not args.skip_step2:
         print(f"  filter 結果：{output_dir}/filter_results/")
         print(f"  總覽拼圖：{output_dir}/*_filtered_merged.png")
     print("=" * 60)
