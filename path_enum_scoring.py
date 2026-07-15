@@ -44,6 +44,8 @@ from PIL import Image, ImageDraw, ImageFont
 # 鏡頭拓撲：相鄰鏡頭對（雙向）。依資料夾自動選人員／車輛圖。
 # 人員：cross_camera_chain_test/run_cross_camera_chain.py DEFAULT_ADJACENCY
 # 車輛：run_layered_cluster_v3_vehicle_clean.py VEHICLE_ADJACENCY
+# 人員鏡頭相鄰。2026-07-15 依使用者提供之場地配置補登
+# K8-09↔K8-10、K8-10↔K8-12、K8-12↔K8-30（線形走廊；適用所有後續資料集）。
 PERSON_ADJACENT = {
     ("K8-01", "K8-05"),
     ("K8-01", "K8-08"),
@@ -56,6 +58,9 @@ PERSON_ADJACENT = {
     ("K8-07", "K8-08"),
     ("K8-07", "K8-09"),
     ("K8-08", "K8-09"),
+    ("K8-09", "K8-10"),  # 2026-07-15 場地配置
+    ("K8-10", "K8-12"),  # 2026-07-15 場地配置
+    ("K8-12", "K8-30"),  # 2026-07-15 場地配置
     ("K8-22", "K8-23"),
     ("K8-20", "K8-21"),
 }
@@ -91,8 +96,11 @@ def _pairs_from_adj(raw: dict) -> set:
 PERSON_ADJACENT = {tuple(sorted(p)) for p in PERSON_ADJACENT}
 VEHICLE_ADJACENT = _pairs_from_adj(VEHICLE_ADJACENT_RAW)
 
+# 人員視野重疊容許。2026-07-15 依場地配置補登 K8-09↔K8-10（tol=3s，無 H）：
+# 實際小面積重疊，同物件會共存；適用所有後續資料集。
 PERSON_OVERLAP_PAIRS = {
     ("K8-22", "K8-23"): 20.0,
+    ("K8-09", "K8-10"): 3.0,  # 2026-07-15 場地配置；無 Homography
 }
 VEHICLE_OVERLAP_PAIRS = {
     ("K8-05", "K8-07"): 20.0,
@@ -132,7 +140,11 @@ H_MATRICES = {}         # (cam_a, cam_b) -> 3x3 ndarray（a 投影到 b）
 MIN_TRANSIT = {
     # ("K8-22", "K8-23"): 2.0,
 }
-DEFAULT_MIN_TRANSIT_HOP1 = 2.0     # 相鄰鏡頭最短通行（人員）
+# 2026-07-15：hop1 DEFAULT 改 0.0。
+# 依據：相鄰鏡頭視野可能邊界相接，通行下界無法辯護；舊值 2.0s 為無實測佔位，
+# 已誤殺真轉移（例：0528 的 09_3→{08_17,01_8} 聯集 dt=0.72s）。
+# hop2 維持 6.0s（需橫穿中間鏡頭視野的底線常識）。
+DEFAULT_MIN_TRANSIT_HOP1 = 0.0     # 相鄰鏡頭：無辯護下界 → 0
 DEFAULT_MIN_TRANSIT_HOP2 = 6.0     # 跳一支鏡頭最短通行（人員）
 # 車輛在 configure_for_input 改為接近 0（車速快、相鄰幾乎同時）
 
@@ -244,12 +256,47 @@ def configure_for_input(input_dir: str) -> str:
     ADJACENT = set(PERSON_ADJACENT)
     OVERLAP_PAIRS = dict(PERSON_OVERLAP_PAIRS)
     MODE = "person"
-    DEFAULT_MIN_TRANSIT_HOP1 = 2.0
+    DEFAULT_MIN_TRANSIT_HOP1 = 0.0  # 2026-07-15：見上方註記
     DEFAULT_MIN_TRANSIT_HOP2 = 6.0
     DEFAULT_TAU_HOP1 = 8.0
     DEFAULT_TAU_HOP2 = 20.0
     _load_h_matrices()
     return "person"
+
+
+# 拓撲敏感度消融（預設空＝不移除任何邊）。
+# 2026-07-15：僅供診斷；最終採用與否待場地圖確認。不改 PERSON_ADJACENT 預設。
+PERSON_ADJACENT_EXCLUDE: set = set()  # frozenset of sorted pairs to remove at runtime
+
+
+def apply_person_adjacent_exclusions(exclude: set | None = None) -> dict:
+    """
+    在 configure_for_input() 之後呼叫：從現行 ADJACENT 移除指定鏡頭對。
+    exclude=None 時使用模組級 PERSON_ADJACENT_EXCLUDE。
+    回傳生效摘要。預設不移除任何邊。
+    """
+    global ADJACENT, PERSON_ADJACENT_EXCLUDE
+    if exclude is not None:
+        PERSON_ADJACENT_EXCLUDE = {tuple(sorted(p)) for p in exclude}
+    else:
+        PERSON_ADJACENT_EXCLUDE = {tuple(sorted(p)) for p in PERSON_ADJACENT_EXCLUDE}
+    before = set(ADJACENT)
+    ADJACENT = set(before) - PERSON_ADJACENT_EXCLUDE
+    removed = sorted(before - ADJACENT)
+    return {
+        "excluded_requested": sorted(PERSON_ADJACENT_EXCLUDE),
+        "removed_from_ADJACENT": [list(p) for p in removed],
+        "n_adjacent_before": len(before),
+        "n_adjacent_after": len(ADJACENT),
+    }
+
+
+def reset_person_adjacent_exclusions() -> None:
+    """還原排除旗標，並把 ADJACENT 重置為 PERSON 全量（需已是 person 模式）。"""
+    global ADJACENT, PERSON_ADJACENT_EXCLUDE
+    PERSON_ADJACENT_EXCLUDE = set()
+    if MODE == "person":
+        ADJACENT = set(PERSON_ADJACENT)
 
 
 def _parse_box(box):
