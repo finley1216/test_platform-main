@@ -15,6 +15,8 @@ DEFAULT_VEHICLE_QUERY_0528 = REPO_ROOT / "wc.png"
 DEFAULT_VEHICLE_QUERY_0507 = REPO_ROOT / "BSH-5613.jpg"
 
 QUERY_FILTER_OUTPUT_ROOT = OUTPUT_ROOT / "query_filter_merge"
+V1_OUTPUT_ROOT = OUTPUT_ROOT / "v1.0"
+ARCHIVE_PATH_ENUM_LLR = OUTPUT_ROOT / "path_enum_llr"  # freeze archive only
 
 
 def embed_cache_dir(data_root: Path, video_id: str) -> Path:
