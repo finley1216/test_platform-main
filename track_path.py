@@ -239,6 +239,10 @@ SUPER_DH_MAX = 95.0
 # 同批樣本重擬合幾何計分 dH|same ~ HalfNormal(σ=37.557)，n=13。
 DH_SAME_SIGMA = 37.557
 DH_SAME_N = 13
+# 2026-07-20：名單制共存合併（OVERLAP_PAIRS 且無 H）加 emb 底線。
+# emb|same μ−3σ = 0.917 − 3×0.023 = 0.848（calibration_gt0507，全系統 3σ 原則）。
+# 幾何制（H 投影 <95px）刻意不驗外觀——位置排他性。
+COEXISTENCE_OVERLAP_EMB_MIN = 0.848
 
 # 每個鏡頭對的最短通行時間（秒）：拿碼表現場走出來的下界。
 # 沒填的鏡頭對用 DEFAULT_MIN_TRANSIT。同鏡頭再入預設 0。
@@ -891,6 +895,164 @@ def render_top1_collage(
     return out_png
 
 
+def write_suspect_coexistence_txt(path: Path, suspects: list[dict]) -> Path | None:
+    if not suspects:
+        return None
+    lines = [
+        "# suspect_coexistence — 名單制 OVERLAP 候選，emb 低於 COEXISTENCE_OVERLAP_EMB_MIN",
+        f"# threshold={COEXISTENCE_OVERLAP_EMB_MIN} (emb|same μ−3σ = 0.917−3×0.023)",
+        "",
+    ]
+    for s in suspects:
+        lines.append(
+            f"{s['a']} <-> {s['b']}  emb={s['emb_ab']:.6f}  "
+            f"overlap={s['overlap_sec']:.3f}s  cams={s.get('cams','')}  ({s.get('note','')})"
+        )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    return path
+
+
+def supernode_member_pairs(super_report: dict, by_tid: dict[str, Track]) -> list[dict]:
+    rows = []
+    for sn in super_report.get("supernodes") or []:
+        members = sn.get("members") or []
+        if len(members) < 2:
+            continue
+        ts = [by_tid[t] for t in members if t in by_tid]
+        for i in range(len(ts)):
+            for j in range(i + 1, len(ts)):
+                u, v = ts[i], ts[j]
+                rows.append(
+                    {
+                        "supernode": sn.get("sid"),
+                        "members": members,
+                        "a": u.tid,
+                        "b": v.tid,
+                        "emb_ab": float(emb_sim(u, v)),
+                        "path": classify_coexistence_merge_path(u, v),
+                        "h_dist": _h_projection_dist(u, v),
+                        "overlap_sec": float(max(_time_overlap_sec(u, v), 0.0)),
+                    }
+                )
+    return rows
+
+
+def build_supernode_comparison_table(
+    before_report: dict,
+    after_report: dict,
+    by_tid: dict[str, Track],
+) -> list[dict]:
+    before_pairs = {
+        tuple(sorted((r["a"], r["b"]))): r
+        for r in supernode_member_pairs(before_report, by_tid)
+    }
+    after_pairs = {
+        tuple(sorted((r["a"], r["b"]))): r
+        for r in supernode_member_pairs(after_report, by_tid)
+    }
+    keys = sorted(set(before_pairs) | set(after_pairs))
+    rows = []
+    for key in keys:
+        b = before_pairs.get(key)
+        a = after_pairs.get(key)
+        ref = a or b
+        affected = False
+        if b and not a:
+            affected = True
+            status = "removed"
+        elif a and not b:
+            affected = True
+            status = "added"
+        elif b and a and (
+            b.get("supernode") != a.get("supernode")
+            or set(b.get("members") or []) != set(a.get("members") or [])
+        ):
+            affected = True
+            status = "changed"
+        else:
+            status = "same"
+        rows.append(
+            {
+                "status": status,
+                "a": ref["a"],
+                "b": ref["b"],
+                "emb_ab": ref["emb_ab"],
+                "path": ref["path"],
+                "before_supernode": b.get("supernode") if b else "—",
+                "after_supernode": a.get("supernode") if a else "—",
+                "before_members": b.get("members") if b else [],
+                "after_members": a.get("members") if a else [],
+                "affected_this_round": affected,
+            }
+        )
+    return rows
+
+
+def render_supernodes_collage(
+    merge_dir: Path,
+    super_report: dict,
+    by_tid: dict[str, Track],
+    out_png: Path,
+    *,
+    title: str,
+) -> Path | None:
+    multi = [s for s in (super_report.get("supernodes") or []) if len(s.get("members") or []) > 1]
+    if not multi:
+        return None
+    tw, th = 120, 160
+    cell_w, cell_h = 280, th + 72
+    margin, title_h, gap = 16, 36, 12
+    width = margin * 2 + cell_w
+    height = margin * 2 + title_h + len(multi) * (cell_h + gap) - gap
+    img = Image.new("RGB", (width, height), (255, 255, 255))
+    draw = ImageDraw.Draw(img)
+    font_t = _font(16)
+    font_s = _font(11)
+    draw.text((margin, 8), title, fill=(20, 20, 20), font=font_t)
+    y = title_h
+    for sn in multi:
+        members = sn.get("members") or []
+        ts = [by_tid[t] for t in members if t in by_tid]
+        x = margin
+        nmem = max(len(ts), 1)
+        sub_w = (cell_w - 8 * (nmem - 1)) // nmem if nmem else cell_w
+        for idx, t in enumerate(ts):
+            cam, tid_s = t.tid.rsplit("_", 1)
+            try:
+                _, crops = _crop_paths_for_track(merge_dir, cam, int(tid_s))
+                crop = _pick_rep_crop(crops)
+            except Exception:
+                crop = None
+            thumb = _thumb(crop, (sub_w - 8, th)) if crop else Image.new("RGB", (sub_w - 8, th), (220, 220, 220))
+            img.paste(thumb, (x + 4, y + 4))
+            draw.text(
+                (x + 4, y + th + 6),
+                f"{t.tid}\n{t.cam} {t.t_start:.1f}-{t.t_end:.1f}s",
+                fill=(30, 30, 30),
+                font=font_s,
+            )
+            x += sub_w + 8
+        if len(ts) >= 2:
+            emb_lines = []
+            path_lines = []
+            for i in range(len(ts)):
+                for j in range(i + 1, len(ts)):
+                    u, v = ts[i], ts[j]
+                    emb_lines.append(f"{u.tid}<->{v.tid} emb={emb_sim(u,v):.3f}")
+                    path_lines.append(classify_coexistence_merge_path(u, v))
+            draw.text(
+                (margin + 4, y + th + 34),
+                " | ".join(emb_lines) + f"  path={','.join(sorted(set(path_lines)))}",
+                fill=(60, 60, 60),
+                font=font_s,
+            )
+        y += cell_h + gap
+    out_png.parent.mkdir(parents=True, exist_ok=True)
+    img.save(out_png)
+    return out_png
+
+
 
 # ============================================================
 # LLR / 分段排名（原 track_path.py）
@@ -1177,23 +1339,72 @@ def _coexistence_time_ok(u: Track, v: Track) -> tuple[bool, float, str]:
     return False, ov, f"overlap={ov:.2f}s"
 
 
-def coexistence_merge(u: Track, v: Track) -> tuple[bool, str]:
-    """同鏡跳過；時間共存且（OVERLAP 或 H×dH<80）。"""
+def _h_projection_dist(u: Track, v: Track) -> float | None:
+    """回傳 H 投影最小距離；無 H 矩陣或無 foot 則 None。"""
+    d1 = h_min_dist(u, v)
+    d2 = h_min_dist(v, u)
+    cands = [d for d in (d1, d2) if d is not None]
+    return float(min(cands)) if cands else None
+
+
+def classify_coexistence_merge_path(u: Track, v: Track) -> str:
+    """回報判定路徑：幾何制 / 名單制 / 無。"""
+    key = tuple(sorted((u.cam, v.cam)))
+    d = _h_projection_dist(u, v)
+    if d is not None and float(d) < SUPER_DH_MAX:
+        return "幾何制"
+    if key in OVERLAP_PAIRS and d is None:
+        return "名單制"
+    return "—"
+
+
+def coexistence_merge(
+    u: Track,
+    v: Track,
+    *,
+    overlap_emb_min: float | None = COEXISTENCE_OVERLAP_EMB_MIN,
+) -> tuple[bool, str, dict | None]:
+    """
+    同鏡跳過；時間共存且（幾何制 H×dH<95 或 名單制 OVERLAP+emb 底線）。
+    第三項：名單制 emb 不足時的 suspect 紀錄（供 suspect_coexistence.txt）。
+    """
     if u.cam == v.cam:
-        return False, "same_cam_skip"
+        return False, "same_cam_skip", None
     tok, ov, tnote = _coexistence_time_ok(u, v)
     if not tok:
-        return False, f"no_coexist_time ({tnote})"
+        return False, f"no_coexist_time ({tnote})", None
     key = tuple(sorted((u.cam, v.cam)))
-    if key in OVERLAP_PAIRS:
-        return True, f"OVERLAP_PAIRS {tnote}"
-    ok_h, d = same_object_h(u, v)
-    if ok_h and d is not None and float(d) < SUPER_DH_MAX:
-        return True, f"H dH={d:.1f}px {tnote}"
-    return False, f"no_overlap_or_H ({tnote})"
+    d = _h_projection_dist(u, v)
+    # 幾何制：位置排他性，刻意不驗外觀（2026-07-20 註記維持）。
+    if d is not None and float(d) < SUPER_DH_MAX:
+        return True, f"H dH={d:.1f}px {tnote}", None
+    # 名單制：OVERLAP_PAIRS 且無 H 可用 → emb 底線。
+    if key in OVERLAP_PAIRS and d is None:
+        emb = emb_sim(u, v)
+        if overlap_emb_min is not None and emb + 1e-12 < float(overlap_emb_min):
+            suspect = {
+                "a": u.tid,
+                "b": v.tid,
+                "emb_ab": float(emb),
+                "overlap_sec": float(max(ov, 0.0)),
+                "cams": f"{u.cam}↔{v.cam}",
+                "threshold": float(overlap_emb_min),
+                "note": tnote,
+            }
+            return (
+                False,
+                f"OVERLAP_emb_low emb={emb:.3f}<{overlap_emb_min:.3f} ({tnote})",
+                suspect,
+            )
+        return True, f"OVERLAP_PAIRS {tnote}", None
+    return False, f"no_overlap_or_H ({tnote})", None
 
 
-def build_supernodes(tracks: list) -> tuple[list[SuperNode], dict]:
+def build_supernodes(
+    tracks: list,
+    *,
+    overlap_emb_min: float | None = COEXISTENCE_OVERLAP_EMB_MIN,
+) -> tuple[list[SuperNode], dict]:
     n = len(tracks)
     parent = list(range(n))
 
@@ -1209,8 +1420,13 @@ def build_supernodes(tracks: list) -> tuple[list[SuperNode], dict]:
             parent[rb] = ra
 
     merge_log = []
+    suspect_coexistence = []
     for i, j in itertools.combinations(range(n), 2):
-        ok, reason = coexistence_merge(tracks[i], tracks[j])
+        ok, reason, suspect = coexistence_merge(
+            tracks[i], tracks[j], overlap_emb_min=overlap_emb_min
+        )
+        if suspect is not None:
+            suspect_coexistence.append(suspect)
         if ok:
             union(i, j)
             merge_log.append(
@@ -1218,6 +1434,7 @@ def build_supernodes(tracks: list) -> tuple[list[SuperNode], dict]:
                     "a": tracks[i].tid,
                     "b": tracks[j].tid,
                     "reason": reason,
+                    "path": classify_coexistence_merge_path(tracks[i], tracks[j]),
                 }
             )
 
@@ -1247,6 +1464,8 @@ def build_supernodes(tracks: list) -> tuple[list[SuperNode], dict]:
         "n_supernodes": len(supers),
         "n_merged_pairs": len(merge_log),
         "merge_log": merge_log,
+        "suspect_coexistence": suspect_coexistence,
+        "coexistence_overlap_emb_min": overlap_emb_min,
         "supernodes": [
             {
                 "sid": s.sid,
@@ -2659,6 +2878,7 @@ def cmd_run(argv=None):
     out_json = out_dir / f"{short}_top1.json"
     out_png = out_dir / f"{short}_top1_collage.png"
     out_super = out_dir / f"{short}_supernodes.json"
+    out_suspect = out_dir / f"{short}_suspect_coexistence.txt"
 
     write_txt_report(
         out_txt,
@@ -2689,10 +2909,15 @@ def cmd_run(argv=None):
     )
     out_json.write_text(json.dumps(summary, ensure_ascii=False, indent=2), encoding="utf-8")
     out_super.write_text(json.dumps(super_report, ensure_ascii=False, indent=2), encoding="utf-8")
+    suspect_path = write_suspect_coexistence_txt(
+        out_suspect, super_report.get("suspect_coexistence") or []
+    )
 
     print(f"文字報告：{out_txt}")
     print(f"JSON：{out_json}")
     print(f"超節點：{out_super}")
+    if suspect_path:
+        print(f"共存 suspect：{suspect_path}")
     if collage:
         print(f"拼圖：{collage}")
     return summary
