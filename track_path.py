@@ -228,10 +228,17 @@ OVERLAP_PAIRS = dict(PERSON_OVERLAP_PAIRS)
 MODE = "person"
 
 # Homography（Homography/）同物件腳底投影
-H_DIST_GATE = 150.0     # 與既有 cross-cam 匹配一致
+H_DIST_GATE = 150.0     # cross-cam 邊合法性門檻（非 supernode 合併門檻）
 H_TIME_WINDOW = 15.0    # 對齊兩 track 腳底點的最大時間差（秒）
 H_MATRICES = {}         # (cam_a, cam_b) -> 3x3 ndarray（a 投影到 b）
 # HOMOGRAPHY_DIR 見下方路徑常數區塊
+
+# 2026-07-16 實驗採納：exp1_h_projection_distance（N=13）
+# H 合併門檻 = μ+3σ = 94.427...，四捨五入到 5px → 95px。
+SUPER_DH_MAX = 95.0
+# 同批樣本重擬合幾何計分 dH|same ~ HalfNormal(σ=37.557)，n=13。
+DH_SAME_SIGMA = 37.557
+DH_SAME_N = 13
 
 # 每個鏡頭對的最短通行時間（秒）：拿碼表現場走出來的下界。
 # 沒填的鏡頭對用 DEFAULT_MIN_TRANSIT。同鏡頭再入預設 0。
@@ -241,9 +248,9 @@ MIN_TRANSIT = {
 # 2026-07-15：hop1 DEFAULT 改 0.0。
 # 依據：相鄰鏡頭視野可能邊界相接，通行下界無法辯護；舊值 2.0s 為無實測佔位，
 # 已誤殺真轉移（例：0528 的 09_3→{08_17,01_8} 聯集 dt=0.72s）。
-# hop2 維持 6.0s（需橫穿中間鏡頭視野的底線常識）。
 DEFAULT_MIN_TRANSIT_HOP1 = 0.0     # 相鄰鏡頭：無辯護下界 → 0
-DEFAULT_MIN_TRANSIT_HOP2 = 6.0     # 跳一支鏡頭最短通行（人員）
+# 2026-07-16：exp2 消融證明 hop2 下界冗餘；系統不再含任何手寫秒數下界。
+DEFAULT_MIN_TRANSIT_HOP2 = 0.0
 # 車輛在 configure_for_input 改為接近 0（車速快、相鄰幾乎同時）
 
 # 預期通行時間 TAU（秒）：正常步行的典型值，超過的部分開始扣分
@@ -256,7 +263,9 @@ DEFAULT_TAU_HOP2 = 20.0
 
 TOL      = 2.0      # 一般鏡頭對容許的時間重疊（秒）
 # OVERLAP_PAIRS 由 configure_for_input() 設定
-DT_MAX   = 120.0    # 斷開超過這個秒數不強行連（先寬鬆，診斷後再收）
+# 2026-07-16：exp3 採納，DT_MAX = max(GT true transition dt)×1.5。
+# max=84.25s → 126.375s，取 130s；敏感度穩定區間 120–180。
+DT_MAX   = 130.0
 
 # ---- 外觀一致性（「原本就很像」+「歷史都很像」）----
 SIM_MIN       = 0.90   # 對 query 低於此者不進候選（原本就要夠像）
@@ -342,8 +351,8 @@ def configure_for_input(input_dir: str) -> str:
     ADJACENT = set(PERSON_ADJACENT)
     OVERLAP_PAIRS = dict(PERSON_OVERLAP_PAIRS)
     MODE = "person"
-    DEFAULT_MIN_TRANSIT_HOP1 = 0.0  # 2026-07-15：見上方註記
-    DEFAULT_MIN_TRANSIT_HOP2 = 6.0
+    DEFAULT_MIN_TRANSIT_HOP1 = 0.0
+    DEFAULT_MIN_TRANSIT_HOP2 = 0.0
     DEFAULT_TAU_HOP1 = 8.0
     DEFAULT_TAU_HOP2 = 20.0
     _load_h_matrices()
@@ -891,7 +900,6 @@ PDF_FLOOR = 1e-12
 SHRINK_K = 10.0
 HANDOFF_DT_MAX = 2.0
 SUPER_OVERLAP_MIN = 0.5
-SUPER_DH_MAX = 80.0
 PRIOR_DT_SIGMA = 1.0  # PRIOR-WEAK（原 0.5）
 
 NODE_EVIDENCE_NOTE = (
@@ -917,7 +925,20 @@ DEFAULT_MAX_HYP_SEGMENTS = 8
 
 def load_calibration(path: Path) -> dict:
     with path.open("rb") as f:
-        return pickle.load(f)
+        calib = pickle.load(f)
+    # 2026-07-16：exp1 採納（N=13），固定幾何分數 dH|same 的統計出身。
+    dh_same = dict(calib.get("dh_same") or {})
+    dh_same.update(
+        {
+            "family": "halfnorm",
+            "sigma": float(DH_SAME_SIGMA),
+            "n": int(DH_SAME_N),
+            "source": "exp1_h_projection_distance_2026-07-16",
+        }
+    )
+    dh_same["shrink_w"] = float(shrink_weight(dh_same.get("n")))
+    calib["dh_same"] = dh_same
+    return calib
 
 
 def _pdf(dist: dict, x: float) -> float:
