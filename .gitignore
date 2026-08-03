@@ -29,9 +29,10 @@ __pycache__/
 venv/
 
 ####################
-# Docker
+# Docker / logs
 ####################
 *.log
+backend.log
 
 ####################
 # OS / Editor
@@ -44,18 +45,36 @@ venv/
 backend/rag_store/
 backend/segment/*
 !backend/segment/.gitkeep
+rag_store/
+segment/
+logs/
+
 # optional: all videos / big media
 *.avi
 *.mp4
 *.mov
 *.mkv
 
+# root-level scratch images（保留交付用 query 圖）
+/*.jpg
+/*.jpeg
+/*.png
+/*.webp
+!/p9.jpg
+!/BSH-5613.jpg
+!/wc.png
 
 # === model weights / cache ===
 *.pt
 *.pth
 *.onnx
 *.safetensors
+*.pkl
 backend/clip_cache/
 backend/models/
 models/
+yolo_weights/
+
+# local experiment outputs (outside repo or accidental copies)
+output/
+**/calibration*.pkl

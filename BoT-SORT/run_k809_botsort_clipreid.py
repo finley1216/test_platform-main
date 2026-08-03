@@ -42,8 +42,10 @@ if not hasattr(np, "int_"):
 # ---------------------------------------------------------------------------
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+BOTSORT_ROOT = REPO_ROOT / "BoT-SORT"
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
 sys.path.insert(0, str(REPO_ROOT))
-from repo_paths import BOTSORT_ROOT, CLIP_REID_ROOT, OUTPUT_ROOT  # noqa: E402
 
 sys.path.insert(0, str(BOTSORT_ROOT))
 sys.path.insert(0, str(CLIP_REID_ROOT))

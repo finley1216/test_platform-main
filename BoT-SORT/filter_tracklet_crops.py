@@ -47,12 +47,13 @@ from PIL import Image, ImageDraw, ImageFont, ImageOps
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
 WORKSPACE_ROOT = REPO_ROOT.parent
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "CLIP-ReID"))
 sys.path.insert(0, str(HERE))
 
-from repo_paths import CLIP_REID_ROOT, OUTPUT_ROOT  # noqa: E402
 
 CLIP_EMBED_ROOT = CLIP_REID_ROOT
 ASE_ROOT = WORKSPACE_ROOT

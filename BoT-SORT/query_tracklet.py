@@ -42,11 +42,13 @@ from typing import Any, Dict, List, Tuple
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+DEFAULT_PERSON_QUERY = REPO_ROOT / "p9.jpg"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "CLIP-ReID"))
 sys.path.insert(0, str(HERE))
 
-from repo_paths import CLIP_REID_ROOT, DEFAULT_PERSON_QUERY, OUTPUT_ROOT  # noqa: E402
 
 # 必須先安裝 stub 才能 import 原始腳本
 import numpy as np

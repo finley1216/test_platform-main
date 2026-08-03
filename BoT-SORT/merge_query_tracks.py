@@ -42,11 +42,11 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "CLIP-ReID"))
 sys.path.insert(0, str(HERE))
 
-from repo_paths import OUTPUT_ROOT  # noqa: E402
 
 CLIP_EMBED_ROOT = OUTPUT_ROOT
 

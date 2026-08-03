@@ -12,11 +12,14 @@ from typing import Any, Dict, List
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+DEFAULT_PERSON_QUERY = REPO_ROOT / "p9.jpg"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
+QUERY_FILTER_OUTPUT_ROOT = OUTPUT_ROOT / "query_filter_merge"
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "CLIP-ReID"))
 sys.path.insert(0, str(HERE))
 
-from repo_paths import CLIP_REID_ROOT, DEFAULT_PERSON_QUERY, OUTPUT_ROOT, QUERY_FILTER_OUTPUT_ROOT  # noqa: E402
 
 CLIP_EMBED_ROOT = OUTPUT_ROOT
 ASE_ROOT = REPO_ROOT.parent

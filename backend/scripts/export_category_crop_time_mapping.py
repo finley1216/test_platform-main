@@ -16,13 +16,14 @@ from pathlib import Path
 from typing import Any, Dict, Iterator, List, Optional, Set, Tuple
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
+SEGMENT_ROOT = REPO_ROOT / "backend" / "segment"
 CLIP_DIR = REPO_ROOT / "CLIP-ReID"
 if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(CLIP_DIR) not in sys.path:
     sys.path.insert(0, str(CLIP_DIR))
 
-from repo_paths import OUTPUT_ROOT, SEGMENT_ROOT  # noqa: E402
 
 from export_crop_time_mapping import (  # noqa: E402
     _box_json,

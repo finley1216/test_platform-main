@@ -10,7 +10,7 @@
 
 範例：
   cd test_platform-main
-  python3 query_filter_botsort_merge_filter_dataset.py \\
+  python3 query_filter.py \\
     --dataset 人員追蹤_20260528 \\
     --merge-rule triple \\
     --force
@@ -26,14 +26,17 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 
-from repo_paths import (  # noqa: E402
-    BOTSORT_ROOT,
-    DEFAULT_PERSON_QUERY,
-    DEFAULT_VEHICLE_QUERY_0507,
-    DEFAULT_VEHICLE_QUERY_0528,
-    OUTPUT_ROOT,
-    QUERY_FILTER_OUTPUT_ROOT,
-)
+# 路徑常數（原 repo_paths.py，併入本檔）
+REPO_ROOT = HERE
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
+BOTSORT_ROOT = REPO_ROOT / "BoT-SORT"
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+SEGMENT_ROOT = REPO_ROOT / "backend" / "segment"
+DEFAULT_PERSON_QUERY = REPO_ROOT / "p9.jpg"
+DEFAULT_VEHICLE_QUERY_0528 = REPO_ROOT / "wc.png"
+DEFAULT_VEHICLE_QUERY_0507 = REPO_ROOT / "BSH-5613.jpg"
+QUERY_FILTER_OUTPUT_ROOT = OUTPUT_ROOT / "query_filter_merge"
+V1_OUTPUT_ROOT = OUTPUT_ROOT / "v1.0"
 
 STEP1 = BOTSORT_ROOT / "query_filter_botsort_merge_dataset.py"
 STEP2 = BOTSORT_ROOT / "batch_filter_merged_tracks.py"

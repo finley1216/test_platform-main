@@ -38,20 +38,28 @@ import numpy as np
 
 HERE = Path(__file__).resolve().parent
 REPO_ROOT = HERE.parent
+CLIP_REID_ROOT = REPO_ROOT / "CLIP-ReID"
+DEFAULT_PERSON_QUERY = REPO_ROOT / "p9.jpg"
+DEFAULT_VEHICLE_QUERY_0507 = REPO_ROOT / "BSH-5613.jpg"
+DEFAULT_VEHICLE_QUERY_0528 = REPO_ROOT / "wc.png"
+OUTPUT_ROOT = REPO_ROOT.parent / "output"
+QUERY_FILTER_OUTPUT_ROOT = OUTPUT_ROOT / "query_filter_merge"
+
+def embed_cache_dir(data_root: Path, video_id: str) -> Path:
+    slug = video_id.lower().replace("-", "")
+    return data_root / "embed_cache" / slug
+
+
+def person_embed_cache_path(data_root: Path, video_id: str) -> Path:
+    return embed_cache_dir(data_root, video_id) / "person_clipreid_embeddings_cache.pkl"
+
+
+def vehicle_embed_cache_path(data_root: Path, video_id: str) -> Path:
+    return embed_cache_dir(data_root, video_id) / "vehicle_clipreid_embeddings_cache.pkl"
+
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "CLIP-ReID"))
 sys.path.insert(0, str(HERE))
-
-from repo_paths import (  # noqa: E402
-    CLIP_REID_ROOT,
-    DEFAULT_PERSON_QUERY,
-    DEFAULT_VEHICLE_QUERY_0507,
-    DEFAULT_VEHICLE_QUERY_0528,
-    OUTPUT_ROOT,
-    QUERY_FILTER_OUTPUT_ROOT,
-    person_embed_cache_path,
-    vehicle_embed_cache_path,
-)
 
 if not hasattr(np, "float"):
     np.float = float  # type: ignore[attr-defined]
